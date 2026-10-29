@@ -2,7 +2,7 @@ import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
 import { constants } from 'zlib';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import { Features } from 'lightningcss';
 import { THEME_BOOT_FILE } from 'librechat-data-provider';
 import { createRequire } from 'module';
@@ -33,15 +33,6 @@ const NODE_POLYFILL_SHIMS: Record<string, string> = {
   ),
 };
 
-// https://vitejs.dev/config/
-const backendPort = (process.env.BACKEND_PORT && Number(process.env.BACKEND_PORT)) || 3080;
-/** IPv6 hosts arrive unbracketed (valid for the listen address) but must be
- *  bracketed inside a URL, or the proxy target parses as host `:` port soup. */
-const backendHost = process.env.HOST?.includes(':') ? `[${process.env.HOST}]` : process.env.HOST;
-const backendURL = backendHost
-  ? `http://${backendHost}:${backendPort}`
-  : `http://localhost:${backendPort}`;
-const buildSourceMap = process.env.NODE_ENV === 'development';
 const QUERY_DEVTOOLS_CHUNK_MODULES = [
   '@tanstack/react-query-devtools',
   '@tanstack/match-sorter-utils',
@@ -50,13 +41,36 @@ const QUERY_DEVTOOLS_CHUNK_MODULES = [
   'node_modules/is-what',
 ];
 
+// https://vitejs.dev/config/
+// Vite's envDir exposes variables to import.meta.env, but does not populate
+// process.env while this config is evaluated. Load the root env explicitly so
+// the dev proxy cannot silently fall back to an unrelated service on port 3080.
+const viteMode = process.env.NODE_ENV === 'production' ? 'production' : 'development';
+const env = loadEnv(viteMode, path.resolve(import.meta.dirname, '..'), '');
+const backendPort = (env.BACKEND_PORT && Number(env.BACKEND_PORT)) || 3080;
+/** IPv6 hosts arrive unbracketed (valid for the listen address) but must be
+ *  bracketed inside a URL, or the proxy target parses as host `:` port soup. */
+const backendHostValue = env.BACKEND_HOST || env.HOST;
+const backendHost = backendHostValue?.includes(':') ? `[${backendHostValue}]` : backendHostValue;
+const backendURL = backendHost
+  ? `http://${backendHost}:${backendPort}`
+  : `http://localhost:${backendPort}`;
+const buildSourceMap = (env.NODE_ENV || process.env.NODE_ENV) === 'development';
+const desktopPort =
+  (process.env.PORT && Number(process.env.PORT)) ||
+  (env.DESKTOP_PORT && Number(env.DESKTOP_PORT)) ||
+  3090;
+const desktopHost =
+  process.env.DESKTOP_HOST || env.DESKTOP_HOST || process.env.HOST || env.HOST || 'localhost';
+
 export default defineConfig(({ command }) => ({
   base: '',
   server: {
-    allowedHosts:
-      (process.env.VITE_ALLOWED_HOSTS && process.env.VITE_ALLOWED_HOSTS.split(',')) || [],
-    host: process.env.HOST || 'localhost',
-    port: (process.env.PORT && Number(process.env.PORT)) || 3090,
+    allowedHosts: (env.VITE_ALLOWED_HOSTS && env.VITE_ALLOWED_HOSTS.split(',')) || [],
+    host: desktopHost,
+    // PORT belongs to the backend in the shared root .env; use DESKTOP_PORT
+    // for a configured renderer port and keep 3090 as the local default.
+    port: desktopPort,
     strictPort: false,
     proxy: {
       '/api': {

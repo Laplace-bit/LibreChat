@@ -9,6 +9,7 @@
   "workspaces": [
     "api",
     "client",
+    "desktop",
     "packages/*"
   ],
   "scripts": {

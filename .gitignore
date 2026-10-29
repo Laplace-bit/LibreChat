@@ -43,6 +43,15 @@ client/public/main.js
 client/public/main.js.map
 client/public/main.js.LICENSE.txt
 
+# Product-owned desktop client generated files
+desktop/node_modules/
+desktop/dist/
+desktop/public/images/
+desktop/public/main.js
+desktop/public/main.js.map
+desktop/public/main.js.LICENSE.txt
+desktop/vite-output.log
+
 # Azure Blob Storage Emulator (Azurite)
 __azurite**
 __blobstorage__/**/*

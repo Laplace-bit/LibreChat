@@ -6,6 +6,21 @@ Shared API types and services live in `packages/data-provider`, and the React ap
 `client` with shared primitives in `packages/client`. Chat state, transport and message components
 are moving into `packages/chat` (`@librechat/chat`), which never imports the app.
 
+## Project purpose and local ownership
+
+This fork is the starting point for an internal factory AI client. The target is a Mac and Windows desktop client that connects to the customer's on-premises LibreChat server. Agent execution remains server-side. The server is the source of truth for authentication, roles, agent definitions, memory, knowledge, model access, business connectors, permissions, and audit records. The first product slice is read-only MES, ERP, and WMS queries with cross-system analysis. Do not add a local agent runtime or offline execution as part of this work.
+
+The repository has two frontend ownership zones:
+
+- `client/` is the upstream-aligned LibreChat web client. Keep it close to the matching upstream release so the fork can be synchronized without carrying product-specific desktop changes through every merge.
+- `desktop/` is the product-owned copy of `client/`. It is the renderer baseline for the Mac and Windows shell and may diverge. Do not copy changes from `desktop/` back into `client/`; port only deliberate, reusable fixes.
+
+The shared packages `packages/client`, `packages/chat`, and `packages/data-provider` remain dependencies of both renderers. Changes there can affect both applications and require focused checks for both. `api/`, `packages/api`, `packages/data-schemas`, and server configuration are out of scope for the initial client work. Change backend behavior only after a separate decision is recorded in `docs/agent-platform/`.
+
+Project decisions, architecture notes, and client rollout documents live in `docs/agent-platform/`. Keep product-specific notes in that directory instead of modifying upstream documentation files.
+
+When synchronizing from `upstream`, update `client/` from the matching release first, review changes in the shared packages, and then port the required changes into `desktop/`. Keep desktop shell code, server URL and authentication integration, and platform behavior under `desktop/` or a future shell directory. Never resolve an upstream conflict by replacing `desktop/` with `client/`.
+
 ## Branching and pull requests
 
 Normally branch off `dev` and target `dev`; `gh pr create` defaults to `main`, so pass `--base dev`

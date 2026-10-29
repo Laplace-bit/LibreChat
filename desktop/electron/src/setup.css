@@ -1,0 +1,133 @@
+:root {
+  color-scheme: light dark;
+  font:
+    14px/1.5 -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  color: CanvasText;
+  background: Canvas;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 360px;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  margin: 0;
+  padding: 36px;
+  background: color-mix(in srgb, Canvas 92%, #77839a 8%);
+}
+
+.setup-card {
+  width: min(100%, 480px);
+  padding: 42px;
+  border: 1px solid color-mix(in srgb, CanvasText 12%, transparent);
+  border-radius: 18px;
+  background: Canvas;
+  box-shadow: 0 22px 70px rgb(0 0 0 / 10%);
+}
+
+.app-symbol {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border-radius: 13px;
+  background: #4f6bed;
+  color: white;
+  font-size: 22px;
+  font-weight: 650;
+}
+
+.eyebrow {
+  margin: 28px 0 8px;
+  color: color-mix(in srgb, CanvasText 56%, transparent);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+}
+
+h1 {
+  margin: 0;
+  font-size: 27px;
+  font-weight: 620;
+  letter-spacing: -0.035em;
+}
+
+.description {
+  margin: 12px 0 28px;
+  color: color-mix(in srgb, CanvasText 68%, transparent);
+}
+
+label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 590;
+}
+
+input {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+  border-radius: 9px;
+  background: Canvas;
+  color: CanvasText;
+  font: inherit;
+}
+
+input:focus-visible,
+button:focus-visible {
+  outline: 3px solid color-mix(in srgb, #4f6bed 55%, transparent);
+  outline-offset: 2px;
+}
+
+.message {
+  min-height: 22px;
+  margin: 8px 0 14px;
+  color: #a43832;
+}
+
+.message[data-state='success'] {
+  color: #23734b;
+}
+
+button {
+  width: 100%;
+  min-height: 42px;
+  border: 0;
+  border-radius: 9px;
+  background: #4f6bed;
+  color: white;
+  font: inherit;
+  font-weight: 600;
+  cursor: default;
+}
+
+button:hover:not(:disabled) {
+  background: #405cda;
+}
+
+button:disabled {
+  opacity: 0.58;
+}
+
+footer {
+  margin-top: 24px;
+  color: color-mix(in srgb, CanvasText 52%, transparent);
+  font-size: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .app-symbol,
+  button {
+    background: #7589ff;
+  }
+}

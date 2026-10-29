@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'"
+    />
+    <title>Connect to a server · Agent Platform</title>
+    <link rel="stylesheet" href="/setup.css" />
+    <script defer src="/setup.js"></script>
+  </head>
+  <body>
+    <main class="setup-card">
+      <div class="app-symbol" aria-hidden="true">A</div>
+      <p class="eyebrow">AGENT PLATFORM</p>
+      <h1>Connect to your server</h1>
+      <p class="description">
+        Connect this desktop app to your organization's LibreChat server. Your account and AI
+        services stay on that server.
+      </p>
+      <form id="connection-form">
+        <label for="server-url">Server address</label>
+        <input
+          id="server-url"
+          name="server-url"
+          type="url"
+          placeholder="https://ai.example.com"
+          autocomplete="url"
+          spellcheck="false"
+          required
+        />
+        <p id="connection-message" class="message" role="status" aria-live="polite"></p>
+        <button id="connect-button" type="submit">Connect</button>
+      </form>
+      <footer>Use the address provided by your organization.</footer>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "name": "@laplace/agent-platform-electron",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native Electron shell for the Agent Platform desktop client",
+  "main": "dist/main.cjs",
+  "type": "commonjs",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "package": "electron-forge package",
+    "make": "electron-forge make"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^8.0.1",
+    "@electron-forge/maker-dmg": "^8.0.1",
+    "@electron-forge/maker-zip": "^8.0.1",
+    "electron": "^45.1.0",
+    "esbuild": "^0.27.0"
+  }
+}

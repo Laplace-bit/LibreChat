@@ -40,9 +40,11 @@ modelSpecs:
 
 如果用户仍需直接选择部分端点模型，保持 `modelSelect: true`，并用 `modelSpecs.addedEndpoints` 只列出要公开的端点名。该设置控制端点范围；各端点下显示哪些模型由 `endpoints.custom[].models.default` 控制。
 
-## 服务端凭据
+## 用户密钥与共享密钥
 
-共享供应商密钥保存在 LibreChat API 服务的环境中，不能放在桌面客户端。首批模板的密钥变量只允许出现在自定义端点的 `apiKey` 字段；百炼工作区 ID 只允许出现在自定义端点的 `baseURL` 字段。管理员环境状态只报告变量是否已设置，不返回值。未收录的环境变量仍可由运维人员配置到 `CONFIG_OVERRIDE_ENV_ALLOWLIST`，或直接在 `librechat.yaml` 中引用。
+中国厂商模板默认使用 `apiKey: user_provided`，管理员不必在 Docker `.env` 或管理端填入真实密钥。用户在客户端首次使用该端点时按提示填写，也可以在设置里的供应商密钥页面添加；密钥会按用户账号加密保存在 LibreChat 服务端数据库，并由服务端在请求模型时读取。它不会只保存在当前桌面设备上。
+
+企业若使用统一采购的共享密钥，可把端点的 `apiKey` 改为 `${PROVIDER_API_KEY}`，再将密钥配置到 API 服务的环境中。首批模板的密钥变量只允许出现在自定义端点的 `apiKey` 字段；百炼工作区 ID 只允许出现在自定义端点的 `baseURL` 字段。管理员环境状态只报告变量是否已设置，不返回值。未收录的环境变量仍可由运维人员配置到 `CONFIG_OVERRIDE_ENV_ALLOWLIST`，或直接在 `librechat.yaml` 中引用。
 
 百炼模板默认使用中国（北京）兼容 API 域名，API Key 需要来自同一地域。企业部署可把 URL 换成工作区专属域名；此时工作区 ID 与 API Key 也必须属于同一区域。
 

@@ -19,10 +19,10 @@ file records the product decisions for `desktop/` and `desktop/electron/`.
 
 ## Cross-platform experience
 
-- Use macOS as the design reference. Keep one shared interface and interaction model across macOS
-  and Windows. Add a platform-specific adjustment only when the operating system requires it.
-- Follow macOS conventions for windows, menus, shortcuts, dialogs, keyboard navigation, and
-  accessibility. Keep the same product experience on Windows.
+- Keep a shared product visual direction while following each host platform's conventions for
+  windows, menus, shortcuts, dialogs, keyboard navigation, and accessibility.
+- Retain the Electron shell and make platform-specific interaction adjustments when they improve
+  consistency with the host system.
 - Before changing Electron shell interactions, check current Electron documentation and open-source
   examples. Apply the `native-feel-cross-platform-desktop` skill to desktop UX work.
 

@@ -1,15 +1,13 @@
-# Mac-first desktop experience
+# Cross-platform native desktop experience
 
 ## Product decision
 
-Build one desktop renderer in `desktop/`, with macOS as the design reference and Windows supported
-through the same React interface. Keep operating-system differences in Electron's native shell,
-keyboard bindings and system integrations; do not maintain separate Mac and Windows layouts.
+Build one desktop renderer in `desktop/` with a shared product visual direction. Follow the host
+platform's conventions on macOS and Windows, adapting interactions and layouts where appropriate.
 
 Electron provides native windows and menus, while the React interface is still rendered by Chromium.
-The target is a coherent Mac-first desktop experience, not a claim that HTML controls are AppKit
-controls. Prefer system behavior where it is available and keep explicit platform differences
-small and understandable.
+The target is a coherent native-feeling experience on each platform. Prefer system behavior where
+available and keep platform differences understandable.
 
 ## Ownership boundaries
 
@@ -24,8 +22,8 @@ small and understandable.
 - Let the browser and OS draw scrollbars. Measure their actual gutter for aligned chat content.
 - Use native window frames and application menus. Put Mac shortcuts in the application menu and
   Windows shortcuts in the File menu.
-- Keep the same component structure and behavior on both platforms. Use `Command` on macOS and
-  `Control` on Windows for shared keyboard actions.
+- Adapt interaction to each platform's conventions. Use `Command` on macOS and `Control` on
+  Windows for shared keyboard actions where those are the native conventions.
 - Preserve keyboard focus, reduced-motion and high-contrast behavior while adapting controls.
 - Build settings windows from the existing settings components; do not duplicate settings content.
 

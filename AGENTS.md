@@ -1,5 +1,7 @@
 # LibreChat contributor and agent guidance
 
+> 本项目自有的产品决策与**当前工作队列**见 `@docs/agent-platform/current-work.md`。本文件是开发约束与上游贡献者指南。
+
 `AGENTS.md` is the repository's contributor guidance. Backend code lives in `packages/api`
 (TypeScript) and `packages/data-schemas` (database methods); `api` is legacy Express wiring.
 Shared API types and services live in `packages/data-provider`, and the React app lives in

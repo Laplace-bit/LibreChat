@@ -37,6 +37,12 @@ import type { GetAppConfigOptions } from '~/app/service';
 import type { ManifestTool } from '~/tools/available';
 import type { ServerRequest } from '~/types/http';
 import {
+  CUSTOM_ENDPOINT_TEMPLATE_ENV_PATHS,
+  collectDefaultEnvReferenceSections,
+  collectEnvReferenceSections,
+  parseEnvAllowlist,
+} from '~/app/allowlist';
+import {
   canReadSection,
   getCapabilityUser,
   validatePrincipalType,
@@ -44,11 +50,6 @@ import {
   authRequiredResponse,
   principalNotFoundResponse,
 } from './config';
-import {
-  parseEnvAllowlist,
-  collectEnvReferenceSections,
-  collectDefaultEnvReferenceSections,
-} from '~/app/allowlist';
 import { resolveServedCustomEndpoints } from '~/endpoints/custom/config';
 import { getConfigPartition, getActivePartition } from './partition';
 import { listAvailableTools } from '~/tools/available';
@@ -607,11 +608,11 @@ export function createAdminConfigCatalogHandlers(deps: AdminConfigCatalogDeps): 
   /**
    * GET /env-status — whether each env name the deployment's config uses is set on this server,
    * never its value: the names librechat.yaml references, the defaults it fills in (web search,
-   * OCR), the built-in endpoints' credentials, `CONFIG_OVERRIDE_ENV_ALLOWLIST`, and, for broad
-   * `manage:configs` holders outside strict tenant isolation, the names stored profiles
-   * reference. A name used only in sections the caller cannot read is left out, as are the names
-   * the allowlist and profiles add for a caller without broad read access, and infrastructure
-   * secrets (`CREDS_KEY`, ...) whatever references them.
+   * OCR), the built-in endpoints' credentials, the supported custom-endpoint template variables,
+   * `CONFIG_OVERRIDE_ENV_ALLOWLIST`, and, for broad `manage:configs` holders outside strict tenant
+   * isolation, the names stored profiles reference. A name used only in sections the caller
+   * cannot read is left out, as are the names the allowlist and profiles add for a caller without
+   * broad read access, and infrastructure secrets (`CREDS_KEY`, ...) whatever references them.
    */
   async function getEnvStatus(req: ServerRequest, res: Response): Promise<Response> {
     try {
@@ -646,6 +647,9 @@ export function createAdminConfigCatalogHandlers(deps: AdminConfigCatalogDeps): 
         add(name, 'default', sections);
       }
       for (const name of Object.values(BUILT_IN_ENDPOINT_ENV).flat()) {
+        add(name, 'endpoint', ['endpoints']);
+      }
+      for (const name of CUSTOM_ENDPOINT_TEMPLATE_ENV_PATHS.keys()) {
         add(name, 'endpoint', ['endpoints']);
       }
       for (const name of envAllowlist) {

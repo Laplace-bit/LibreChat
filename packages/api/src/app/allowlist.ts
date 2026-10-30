@@ -39,6 +39,22 @@ export const ENDPOINT_CREDENTIAL_ENV_NAMES: readonly string[] = [
 ];
 
 /**
+ * Environment references supplied by the built-in custom endpoint templates. Keep them scoped
+ * to the credential field (and Qwen's workspace id to its URL) rather than making them general
+ * admin-override variables. This keeps a template saveable without allowing a profile to expand
+ * these names in prompts, headers, or unrelated settings.
+ */
+export const CUSTOM_ENDPOINT_TEMPLATE_ENV_PATHS: ReadonlyMap<string, readonly string[]> = new Map([
+  ['DEEPSEEK_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+  ['DASHSCOPE_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+  ['DASHSCOPE_WORKSPACE_ID', ['endpoints', 'custom', '*', 'baseURL']],
+  ['MOONSHOT_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+  ['ZAI_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+  ['ARK_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+  ['QIANFAN_API_KEY', ['endpoints', 'custom', '*', 'apiKey']],
+]);
+
+/**
  * Which `${NAME}` references a value from a database override layer may resolve. librechat.yaml
  * is the operator's own file and resolves any name; override layers are written through the
  * admin API, so their references are limited to names the deployment already uses for config,
@@ -361,7 +377,12 @@ export function createEnvReferencePolicy(options: {
         vertex.settings.has(name) || (isVertexKeyFilePath(segments) && vertex.keyFile.has(name))
       );
     }
-    return names.has(name) || loaded.get(locationKey(segments))?.has(name) === true;
+    const templatePath = CUSTOM_ENDPOINT_TEMPLATE_ENV_PATHS.get(name);
+    return (
+      names.has(name) ||
+      (templatePath != null && matchesPath(segments, templatePath)) ||
+      loaded.get(locationKey(segments))?.has(name) === true
+    );
   };
   return {
     allows: (name, segments) => !isSensitiveEnvVar(name) && allowsAt(name, segments),

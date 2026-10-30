@@ -1,3 +1,5 @@
+import type { TAgentRuntimeRollout } from 'librechat-data-provider';
+
 export const LEGACY_AGENT_RUNTIME: Readonly<{ engine: 'legacy' }> = Object.freeze({
   engine: 'legacy',
 });
@@ -13,6 +15,33 @@ export type StoredAgentRuntimeResolution =
 export type ResumableAgentRuntimeResolution =
   | { status: 'available'; selection: typeof LEGACY_AGENT_RUNTIME }
   | { status: 'unavailable' };
+
+/** Selects a canary only from the server-owned allowlist and an admitted agent identifier. */
+export function selectAgentRuntimeForAgent(input: {
+  agentId: unknown;
+  rollout?: TAgentRuntimeRollout;
+}): AgentRuntimeSelection {
+  if (
+    typeof input.agentId === 'string' &&
+    input.agentId.length > 0 &&
+    input.rollout?.piAgentIds.includes(input.agentId)
+  ) {
+    return PINNED_PI_AGENT_RUNTIME;
+  }
+  return LEGACY_AGENT_RUNTIME;
+}
+
+/** Typed boundary error used while the Pi execution dispatcher is not yet available. */
+export class AgentRuntimeUnavailableError extends Error {
+  readonly code = 'AGENT_RUNTIME_UNAVAILABLE';
+  readonly status = 503;
+  readonly statusCode = 503;
+
+  constructor() {
+    super('The selected agent runtime is not available on this server.');
+    this.name = 'AgentRuntimeUnavailableError';
+  }
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

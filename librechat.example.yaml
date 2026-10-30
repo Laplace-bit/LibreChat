@@ -771,6 +771,10 @@ endpoints:
   #   # (optional) Assistant Capabilities available to all users. Omit the ones you wish to exclude. Defaults to list below.
   #   capabilities: ["code_interpreter", "retrieval", "actions", "tools", "image_vision"]
   # agents:
+  #   runtime:
+  #     # Operator-owned Pi canary allowlist. Empty keeps every agent on the legacy engine.
+  #     # Until Pi dispatch is connected to AgentClient, listed agents fail closed with HTTP 503.
+  #     piAgentIds: []
   #   # Maximum provider response-body inactivity for Agent model calls. Defaults to 15 minutes;
   #   # each received chunk resets the timer. Set to 0 to disable the idle timeout.
   #   modelResponseBodyTimeoutMs: 900000

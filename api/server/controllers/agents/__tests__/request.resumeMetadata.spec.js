@@ -257,6 +257,12 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('@librechat/api', () => ({
   LEGACY_AGENT_RUNTIME: jest.requireActual('@librechat/api').LEGACY_AGENT_RUNTIME,
+  AgentRuntimeUnavailableError: jest.requireActual(
+    '../../../../../packages/api/src/agents/runtime/selection',
+  ).AgentRuntimeUnavailableError,
+  selectAgentRuntimeForAgent: jest.requireActual(
+    '../../../../../packages/api/src/agents/runtime/selection',
+  ).selectAgentRuntimeForAgent,
   getPreliminaryResponseMessageId: jest.requireActual(
     '../../../../../packages/api/src/utils/message',
   ).getPreliminaryResponseMessageId,
@@ -955,6 +961,7 @@ describe('ResumableAgentController resume metadata', () => {
         parentMessageId: 'original-response',
         conversationId,
         isTemporary: true,
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
         endpointOption: {
           endpoint: 'agents',
           iconURL: 'https://example.com/spec-icon.png',
@@ -1028,6 +1035,44 @@ describe('ResumableAgentController resume metadata', () => {
     );
     expect(mockAcceptAgentStartupTelemetry).toHaveBeenCalledWith(req, conversationId);
     expect(mockStartupTelemetry.end).toHaveBeenCalledWith('error', expect.any(Error));
+  });
+
+  it('fails closed for a Pi canary before creating a generation or entering the legacy engine', async () => {
+    const conversationId = 'conversation-123';
+    const initializeClient = jest.fn();
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Use the canary agent.',
+        messageId: 'user-message',
+        conversationId,
+        agentRuntime: { engine: 'legacy' },
+        endpointOption: {
+          endpoint: 'agents',
+          agent_id: 'agent-pi-canary',
+          modelOptions: { model: 'gpt-4.1' },
+        },
+      },
+      config: {
+        endpoints: {
+          agents: { runtime: { piAgentIds: ['agent-pi-canary'] } },
+        },
+      },
+    };
+    const res = createResumableResponse();
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        code: 'AGENT_RUNTIME_UNAVAILABLE',
+        error: 'The selected agent runtime is not available on this server.',
+      }),
+    );
+    expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
+    expect(initializeClient).not.toHaveBeenCalled();
+    expect(mockDecrementPendingRequest).toHaveBeenCalledWith('user-123');
   });
 
   it('records a forced-temporary run as temporary, with a deadline, whatever the client sent', async () => {

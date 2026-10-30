@@ -177,6 +177,7 @@ export const DEPLOYMENT_ONLY_CONFIG_PATHS: Readonly<Record<string, DeploymentOnl
   'registration.oauthStateTtlMs': 'startup',
   'endpoints.agents.subagentActivity': 'startup',
   'endpoints.agents.eventDriven': 'startup',
+  'endpoints.agents.runtime': 'operator',
   'endpoints.agents.backgroundTasks.shutdownInterruptGraceMs': 'startup',
   'endpoints.agents.backgroundTasks.completionResultBatchSize': 'startup',
   'endpoints.agents.backgroundTasks.completionReceiptBatching': 'startup',
@@ -1654,11 +1655,33 @@ export const subagentActivityConfigSchema = z.object({
 
 export type TSubagentActivityConfig = z.infer<typeof subagentActivityConfigSchema>;
 
+/** Server-managed canary agents for the Pi migration. The list is deployment-only so a
+ * tenant or user config document cannot move an agent onto a different execution engine. */
+export const agentRuntimeRolloutSchema = z
+  .object({
+    piAgentIds: z
+      .array(z.string().trim().min(1).max(128))
+      .max(1_000)
+      .superRefine((agentIds, context) => {
+        if (new Set(agentIds).size !== agentIds.length) {
+          context.addIssue({ code: 'custom', message: 'Pi agent IDs must be unique.' });
+        }
+      })
+      .default([]),
+  })
+  .strict()
+  .default(() => ({ piAgentIds: [] }));
+
+export type TAgentRuntimeRollout = z.infer<typeof agentRuntimeRolloutSchema>;
+
 export const agentsEndpointSchema = baseEndpointSchema
   .omit({ baseURL: true })
   .merge(
     z.object({
       /* agents specific */
+      /** Per-agent Pi canary allowlist. Pi remains unavailable until its execution dispatcher
+       * is wired; selecting an allowlisted agent currently fails closed with HTTP 503. */
+      runtime: agentRuntimeRolloutSchema,
       hostFileEdits: hostFileEditLimitsSchema.optional(),
       /** Maximum provider error characters retained in unprotected terminal failures. */
       maxProviderErrorChars: z

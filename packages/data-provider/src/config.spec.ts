@@ -3231,6 +3231,39 @@ describe('agent recursion limits', () => {
   );
 });
 
+describe('Pi agent runtime rollout config', () => {
+  it('defaults to no Pi agents and accepts a bounded, normalized operator allowlist', () => {
+    const defaults = configSchema.parse({
+      version: '1.0',
+      endpoints: { agents: {} },
+    });
+    expect(defaults.endpoints?.agents?.runtime).toEqual({ piAgentIds: [] });
+
+    const configured = configSchema.parse({
+      version: '1.0',
+      endpoints: { agents: { runtime: { piAgentIds: [' agent-canary '] } } },
+    });
+    expect(configured.endpoints?.agents?.runtime).toEqual({ piAgentIds: ['agent-canary'] });
+  });
+
+  it('rejects duplicate, empty, oversized and unknown rollout configuration', () => {
+    for (const runtime of [
+      { piAgentIds: ['agent-a', 'agent-a'] },
+      { piAgentIds: [''] },
+      { piAgentIds: ['a'.repeat(129)] },
+      { piAgentIds: Array.from({ length: 1_001 }, (_, index) => `agent-${index}`) },
+      { piAgentIds: [], defaultEngine: 'pi' },
+    ]) {
+      expect(
+        configSchema.safeParse({
+          version: '1.0',
+          endpoints: { agents: { runtime } },
+        }).success,
+      ).toBe(false);
+    }
+  });
+});
+
 describe('DEPLOYMENT_ONLY_CONFIG_PATHS', () => {
   type Node = { _def: { typeName?: string; innerType?: Node; schema?: Node }; shape?: unknown };
 
@@ -3267,6 +3300,7 @@ describe('DEPLOYMENT_ONLY_CONFIG_PATHS', () => {
     expect(DEPLOYMENT_ONLY_CONFIG_PATHS).toMatchObject({
       includedTools: 'operator',
       filteredTools: 'operator',
+      'endpoints.agents.runtime': 'operator',
       'endpoints.agents.toolApproval.hooks': 'operator',
       cache: 'unused',
     });

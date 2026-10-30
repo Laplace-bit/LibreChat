@@ -1,8 +1,14 @@
 import { AuthType, EModelEndpoint } from 'librechat-data-provider';
 import type { BaseInitializeParams } from '~/types';
+import {
+  getAgentPiModelBindingFactory,
+  getInitializeResultPiModelBindingFactory,
+  transferPiModelBindingFactory,
+} from '~/agents/pi/modelBindingFactory';
 
 const mockValidateEndpointURL = jest.fn();
 jest.mock('~/auth', () => ({
+  ...jest.requireActual('~/auth'),
   validateEndpointURL: (...args: unknown[]) => mockValidateEndpointURL(...args),
 }));
 
@@ -24,6 +30,9 @@ jest.mock('~/utils', () => ({
 
 import { getAzureCredentials } from '~/utils';
 import { initializeOpenAI } from './initialize';
+
+const realGetOpenAIConfig =
+  jest.requireActual<typeof import('./config')>('./config').getOpenAIConfig;
 
 function createParams(env: Record<string, string | undefined>): BaseInitializeParams {
   const savedEnv: Record<string, string | undefined> = {};
@@ -318,5 +327,221 @@ describe('initializeOpenAI – custom headers', () => {
     const options = mockGetOpenAIConfig.mock.calls[0][1] as { headers?: Record<string, string> };
     // Left unresolved here; request-time resolveConfigHeaders resolves it once
     expect(options.headers).toEqual({ 'X-Global': '{{LIBRECHAT_USER_ID}}' });
+  });
+});
+
+describe('initializeOpenAI – Pi provider authorization', () => {
+  const isolatedEnvKeys = [
+    'OPENAI_REVERSE_PROXY',
+    'OPENAI_ORGANIZATION',
+    'PROXY',
+    'proxy',
+    'HTTP_PROXY',
+    'http_proxy',
+    'HTTPS_PROXY',
+    'https_proxy',
+    'NO_PROXY',
+    'no_proxy',
+  ];
+
+  function isolateProviderEnvironment(): () => void {
+    const saved = new Map(isolatedEnvKeys.map((key) => [key, process.env[key]]));
+    for (const key of isolatedEnvKeys) {
+      delete process.env[key];
+    }
+    return () => {
+      for (const [key, value] of saved) {
+        if (value === undefined) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    };
+  }
+
+  function setRealOpenAIConfig(): void {
+    mockGetOpenAIConfig.mockImplementation(realGetOpenAIConfig);
+  }
+
+  beforeEach(() => {
+    setRealOpenAIConfig();
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('creates a request-scoped admin-key factory and keeps it off enumerable state', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: true };
+
+    try {
+      const options = await initializeOpenAI(params);
+      const factory = getInitializeResultPiModelBindingFactory(options);
+
+      expect(factory).toBeDefined();
+      expect(Object.keys(options)).not.toContain('createPiModelBinding');
+      if (factory === undefined) {
+        throw new Error('Expected the authorized OpenAI provider binding factory');
+      }
+
+      const binding = await factory();
+      expect(binding.model).toMatchObject({
+        id: 'gpt-4o',
+        api: 'openai-responses',
+        baseUrl: 'https://api.openai.com/v1',
+        samplingParams: { user: 'user-1' },
+      });
+      await binding.dispose();
+
+      const initializedAgent = { id: 'agent-1' };
+      transferPiModelBindingFactory(options, initializedAgent);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+      expect(getAgentPiModelBindingFactory(initializedAgent)).toBe(factory);
+      expect(Object.keys(initializedAgent)).toEqual(['id']);
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it.each([
+    ['user-provided API key', { OPENAI_API_KEY: AuthType.USER_PROVIDED }, undefined],
+    [
+      'user-provided base URL',
+      { OPENAI_API_KEY: 'sk-server-admin', OPENAI_REVERSE_PROXY: AuthType.USER_PROVIDED },
+      undefined,
+    ],
+    [
+      'reverse proxy URL',
+      { OPENAI_API_KEY: 'sk-server-admin', OPENAI_REVERSE_PROXY: 'https://gateway.example/v1' },
+      undefined,
+    ],
+    ['organization mode', { OPENAI_API_KEY: 'sk-server-admin' }, 'organization'],
+  ])('does not issue a factory for %s', async (_name, env, outputMode) => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams(env as Record<string, string | undefined>);
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: true };
+    if (outputMode === 'organization') {
+      process.env.OPENAI_ORGANIZATION = 'org-1';
+    }
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it.each([
+    ['configured PROXY', 'PROXY', 'http://proxy.example:8080'],
+    ['HTTPS_PROXY environment route', 'HTTPS_PROXY', 'http://env-proxy.example:8080'],
+  ])('preserves the %s only with its matching dispatcher', async (_name, variable, proxyURL) => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: true };
+    process.env[variable] = proxyURL;
+
+    try {
+      const options = await initializeOpenAI(params);
+      const factory = getInitializeResultPiModelBindingFactory(options);
+      expect(factory).toBeDefined();
+      if (factory === undefined) {
+        throw new Error('Expected a request-scoped factory for the configured transport');
+      }
+
+      const binding = await factory();
+      expect(binding.model.id).toBe('gpt-4o');
+      await binding.dispose();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it.each([
+    ['endpoints.all headers', { all: { headers: { 'X-Route': 'admin' } } }],
+    ['OpenAI endpoint headers', { openAI: { headers: { 'X-Route': 'admin' } } }],
+  ])('does not issue a factory for %s', async (_name, endpoints) => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.req.config = { endpoints } as unknown as BaseInitializeParams['req']['config'];
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: true };
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it.each([
+    [
+      'native web-search tools',
+      { model: 'gpt-4o', useResponsesApi: true, web_search: true },
+      undefined,
+    ],
+    [
+      'unsupported model parameter',
+      { model: 'gpt-4o', useResponsesApi: true, presence_penalty: 0.5 },
+      undefined,
+    ],
+    ['Chat Completions mode', { model: 'gpt-4o', useResponsesApi: false }, undefined],
+    ['provider-native OpenRouter mode', { model: 'gpt-4o', useResponsesApi: true }, 'openrouter'],
+    ['default query override', { model: 'gpt-4o', useResponsesApi: true }, 'defaultQuery'],
+    ['custom dispatcher', { model: 'gpt-4o', useResponsesApi: true }, 'dispatcher'],
+  ])('does not issue a factory for %s', async (_name, modelParameters, outputMode) => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = modelParameters as Record<string, unknown>;
+    if (outputMode != null) {
+      const configOptions: Record<string, unknown> = {};
+      if (outputMode === 'defaultQuery') {
+        configOptions.defaultQuery = { custom: 'value' };
+      } else if (outputMode === 'dispatcher') {
+        configOptions.fetchOptions = { dispatcher: {} };
+      }
+      const serverOptions = {
+        llmConfig: {
+          apiKey: 'sk-server-admin',
+          model: 'gpt-4o',
+          user: 'user-1',
+          streaming: true,
+          useResponsesApi: true,
+          firstPartyEndpoint: true,
+        },
+        configOptions,
+        ...(outputMode === 'openrouter' ? { provider: 'openrouter' } : {}),
+      };
+      mockGetOpenAIConfig.mockReturnValueOnce(serverOptions);
+    }
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it('leaves legacy initialization usable when the Responses API is not selected', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(options.llmConfig.model).toBe('gpt-4');
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
   });
 });

@@ -5,6 +5,7 @@ import type {
   ProviderInitializeParams,
   UserKeyValues,
 } from '~/types';
+import type { AuthorizedPiOpenAIModelCandidate } from '~/agents/pi/model';
 import {
   mergeHeaders,
   resolveHeaders,
@@ -12,11 +13,261 @@ import {
   checkUserKeyExpiry,
   getAzureCredentials,
 } from '~/utils';
+import { setInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
+import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
 import { resolveModelTransportTimeouts } from '~/agents/config';
+import { OPENAI_API, OPENAI_BASE_URL } from '~/agents/pi/model';
+import { createPiOpenAIModelBinding } from '~/agents/pi/model';
 import { getOpenAIEndpointParameters } from './parameters';
 import { resolveEndpointRuntime } from '~/types';
 import { validateEndpointURL } from '~/auth';
 import { getOpenAIConfig } from './config';
+
+const PI_SUPPORTED_MODEL_PARAMETER_KEYS = new Set([
+  'model',
+  'useResponsesApi',
+  'temperature',
+  'top_p',
+  'topP',
+  'max_tokens',
+  'maxTokens',
+]);
+
+const PI_SUPPORTED_LLM_CONFIG_KEYS = new Set([
+  'apiKey',
+  'model',
+  'user',
+  'streaming',
+  'useResponsesApi',
+  'temperature',
+  'topP',
+  'maxTokens',
+  'firstPartyEndpoint',
+]);
+
+function readProperty(value: object, key: string): unknown {
+  return Object.entries(value).find(([entryKey]) => entryKey === key)?.[1];
+}
+
+function hasOnlySupportedParameters(parameters: Readonly<Record<string, unknown>>): boolean {
+  return Object.entries(parameters).every(
+    ([key, value]) =>
+      PI_SUPPORTED_MODEL_PARAMETER_KEYS.has(key) && (key !== 'useResponsesApi' || value === true),
+  );
+}
+
+function isValidPiSamplingValue(
+  key: 'temperature' | 'top_p' | 'topP' | 'max_tokens' | 'maxTokens',
+  value: unknown,
+): value is number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return false;
+  }
+  if (key === 'temperature') {
+    return value >= 0 && value <= 2;
+  }
+  if (key === 'top_p' || key === 'topP') {
+    return value > 0 && value <= 1;
+  }
+  return Number.isSafeInteger(value) && value >= 1 && value <= 1_000_000;
+}
+
+function getPiSampling(
+  parameters: Readonly<Record<string, unknown>>,
+): AuthorizedPiOpenAIModelCandidate['sampling'] | undefined {
+  const temperature = parameters.temperature;
+  const topP = parameters.top_p ?? parameters.topP;
+  const maxTokens = parameters.max_tokens ?? parameters.maxTokens;
+  if (
+    (temperature != null && !isValidPiSamplingValue('temperature', temperature)) ||
+    (topP != null && !isValidPiSamplingValue('top_p', topP)) ||
+    (maxTokens != null && !isValidPiSamplingValue('max_tokens', maxTokens)) ||
+    (parameters.top_p != null && parameters.topP != null) ||
+    (parameters.max_tokens != null && parameters.maxTokens != null)
+  ) {
+    return undefined;
+  }
+  const sampling = {
+    ...(temperature == null ? {} : { temperature }),
+    ...(topP == null ? {} : { topP }),
+    ...(maxTokens == null ? {} : { maxTokens }),
+  };
+  return Object.keys(sampling).length > 0 ? sampling : undefined;
+}
+
+function hasEntries(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && Object.keys(value).length > 0;
+}
+
+function hasConfiguredProperty(value: object, key: string): boolean {
+  const property = readProperty(value, key);
+  return property !== undefined && property !== null;
+}
+
+function containsControlCharacter(value: string): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint !== undefined && (codePoint < 0x20 || codePoint === 0x7f);
+  });
+}
+
+function isPiModelTransportCompatible(
+  clientOptions: OpenAIConfigOptions,
+  configOptions: object | undefined,
+  proxy: string | undefined,
+  organization: string | undefined,
+): boolean {
+  const transportTimeouts = clientOptions.transportTimeouts;
+  if (
+    transportTimeouts == null ||
+    !Number.isSafeInteger(transportTimeouts.bodyTimeout) ||
+    transportTimeouts.bodyTimeout < 0 ||
+    transportTimeouts.bodyTimeout > 86_400_000 ||
+    !Number.isSafeInteger(transportTimeouts.headersTimeout) ||
+    transportTimeouts.headersTimeout < 0 ||
+    transportTimeouts.headersTimeout > 86_400_000
+  ) {
+    return false;
+  }
+  const proxyDispatcher = getProxyDispatcher(proxy, transportTimeouts);
+  const expectedDispatcher = proxyDispatcher ?? getDirectDispatcher(transportTimeouts);
+  if (
+    clientOptions.directEndpoint === true ||
+    hasEntries(clientOptions.defaultQuery) ||
+    hasEntries(clientOptions.addParams) ||
+    hasEntries(clientOptions.dropParams) ||
+    hasEntries(clientOptions.customParams) ||
+    (organization != null && organization.trim() !== '') ||
+    hasConfiguredProperty(clientOptions, 'fetch') ||
+    hasConfiguredProperty(configOptions ?? {}, 'fetch') ||
+    hasConfiguredProperty(configOptions ?? {}, 'baseURL') ||
+    hasEntries(readProperty(configOptions ?? {}, 'defaultQuery')) ||
+    hasEntries(readProperty(configOptions ?? {}, 'defaultHeaders')) ||
+    hasConfiguredProperty(configOptions ?? {}, 'organization')
+  ) {
+    return false;
+  }
+
+  const fetchOptions = readProperty(configOptions ?? {}, 'fetchOptions');
+  if (fetchOptions == null) {
+    return false;
+  }
+  if (typeof fetchOptions !== 'object' || Array.isArray(fetchOptions)) {
+    return false;
+  }
+  return (
+    Object.keys(fetchOptions).every((key) => key === 'dispatcher') &&
+    readProperty(fetchOptions, 'dispatcher') === expectedDispatcher
+  );
+}
+
+function createAuthorizedPiOpenAIModelCandidate({
+  endpoint,
+  adminApiKey,
+  resolvedApiKey,
+  userProvidesKey,
+  userProvidesURL,
+  configuredBaseURL,
+  proxy,
+  openAIConfig,
+  allConfig,
+  clientOptions,
+  options,
+  modelParameters,
+  modelName,
+  requestUserId,
+}: {
+  endpoint: string;
+  adminApiKey: string | undefined;
+  resolvedApiKey: string | undefined;
+  userProvidesKey: boolean;
+  userProvidesURL: boolean;
+  configuredBaseURL: string | undefined;
+  proxy: string | undefined;
+  openAIConfig: object | undefined;
+  allConfig: object | undefined;
+  clientOptions: OpenAIConfigOptions;
+  options: InitializeResultBase;
+  modelParameters: Record<string, unknown> | undefined;
+  modelName: string | undefined;
+  requestUserId: string | undefined;
+}): AuthorizedPiOpenAIModelCandidate | undefined {
+  if (
+    endpoint !== EModelEndpoint.openAI ||
+    typeof adminApiKey !== 'string' ||
+    adminApiKey.trim().length === 0 ||
+    userProvidesKey ||
+    userProvidesURL ||
+    configuredBaseURL !== undefined ||
+    resolvedApiKey !== adminApiKey ||
+    requestUserId == null ||
+    requestUserId.trim().length === 0 ||
+    requestUserId.length > 256 ||
+    containsControlCharacter(requestUserId) ||
+    typeof modelName !== 'string' ||
+    modelName.length === 0 ||
+    modelName.length > 128 ||
+    !/^[A-Za-z0-9._-]+$/u.test(modelName) ||
+    modelParameters == null ||
+    modelParameters.model !== modelName ||
+    !hasOnlySupportedParameters(modelParameters) ||
+    hasEntries(options.tools) ||
+    options.provider != null ||
+    hasEntries(readProperty(options.llmConfig, 'modelKwargs')) ||
+    !Object.keys(options.llmConfig).every((key) => PI_SUPPORTED_LLM_CONFIG_KEYS.has(key)) ||
+    readProperty(options.llmConfig, 'apiKey') !== adminApiKey ||
+    readProperty(options.llmConfig, 'model') !== modelName ||
+    readProperty(options.llmConfig, 'user') !== requestUserId ||
+    readProperty(options.llmConfig, 'streaming') !== true ||
+    readProperty(options.llmConfig, 'useResponsesApi') !== true ||
+    readProperty(options.llmConfig, 'firstPartyEndpoint') !== true ||
+    hasEntries(readProperty(allConfig ?? {}, 'headers')) ||
+    hasEntries(readProperty(openAIConfig ?? {}, 'headers')) ||
+    hasConfiguredProperty(allConfig ?? {}, 'baseURL') ||
+    hasConfiguredProperty(openAIConfig ?? {}, 'baseURL') ||
+    hasEntries(readProperty(openAIConfig ?? {}, 'customParams')) ||
+    hasEntries(readProperty(allConfig ?? {}, 'customParams')) ||
+    hasEntries(clientOptions.headers) ||
+    !isPiModelTransportCompatible(
+      clientOptions,
+      options.configOptions,
+      proxy,
+      process.env.OPENAI_ORGANIZATION,
+    )
+  ) {
+    return undefined;
+  }
+
+  const sampling = getPiSampling(modelParameters);
+  if (
+    sampling === undefined &&
+    ['temperature', 'top_p', 'topP', 'max_tokens', 'maxTokens'].some(
+      (key) => modelParameters[key] != null,
+    )
+  ) {
+    return undefined;
+  }
+  const transportTimeouts = clientOptions.transportTimeouts;
+  if (transportTimeouts == null) {
+    return undefined;
+  }
+
+  return {
+    source: 'server-admin-config',
+    provider: 'openai',
+    api: OPENAI_API,
+    baseUrl: OPENAI_BASE_URL,
+    modelId: modelName,
+    serverAdminApiKey: adminApiKey,
+    requestUserId,
+    transport: {
+      bodyTimeout: transportTimeouts.bodyTimeout,
+      headersTimeout: transportTimeouts.headersTimeout,
+      ...(typeof proxy === 'string' && proxy.trim() !== '' ? { proxy: proxy.trim() } : {}),
+    },
+    ...(sampling === undefined ? {} : { sampling }),
+  };
+}
 
 /**
  * Admin-configured base URL for a built-in OpenAI-family endpoint, or `undefined`
@@ -55,7 +306,8 @@ export async function initializeOpenAI(
   const { PROXY, OPENAI_API_KEY, AZURE_API_KEY } = process.env;
 
   const { key: expiresAt } = requestBody;
-  const modelName = model_parameters?.model as string | undefined;
+  const modelName =
+    typeof model_parameters?.model === 'string' ? model_parameters.model : undefined;
 
   const credentials = {
     [EModelEndpoint.openAI]: OPENAI_API_KEY,
@@ -222,6 +474,28 @@ export async function initializeOpenAI(
 
   if (streamRate != null) {
     options.llmConfig._lc_stream_delay = streamRate;
+  }
+
+  const piModelCandidate = createAuthorizedPiOpenAIModelCandidate({
+    endpoint,
+    adminApiKey: OPENAI_API_KEY,
+    resolvedApiKey: apiKey,
+    userProvidesKey,
+    userProvidesURL,
+    configuredBaseURL,
+    proxy: PROXY,
+    openAIConfig,
+    allConfig,
+    clientOptions,
+    options,
+    modelParameters: model_parameters,
+    modelName,
+    requestUserId: typeof user?.id === 'string' ? user.id : undefined,
+  });
+  if (piModelCandidate !== undefined) {
+    setInitializeResultPiModelBindingFactory(options, () =>
+      createPiOpenAIModelBinding(piModelCandidate),
+    );
   }
 
   return options;

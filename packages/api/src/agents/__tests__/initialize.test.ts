@@ -60,6 +60,11 @@ import type { ProjectFileRecord } from '../../projects/resources';
 import { toCanonicalProjectResource } from '../../projects/resources';
 import { DEFAULT_MAX_CONTEXT_TOKENS } from '../initialize';
 import { discoverConnectedAgents, resolveSubagentGraphs } from '../discovery';
+import {
+  getAgentPiModelBindingFactory,
+  setInitializeResultPiModelBindingFactory,
+} from '../pi/modelBindingFactory';
+import type { CreatePiModelBinding } from '../pi/modelBindingFactory';
 
 // Mock logger — `format` must be a callable factory so @librechat/data-schemas
 // dist module-load completes cleanly; see api/test/__mocks__/logger.js.
@@ -408,6 +413,41 @@ describe('initializeAgent — execution context', () => {
     expect(result.azureOptions).toEqual(azureOptions);
     expect(result.model_parameters).not.toHaveProperty('azureOpenAIApiInstanceName');
     expect(agent).not.toHaveProperty('azureOptions');
+  });
+
+  it('transfers a request-scoped Pi binding factory onto the returned agent without adding state fields', async () => {
+    const { agent, req, res, loadTools, db } = createMocks();
+    const factory: CreatePiModelBinding = async () => {
+      throw new Error('The provider binding factory should remain deferred during initialization');
+    };
+    const options: InitializeResultBase = {
+      llmConfig: { model: agent.model ?? 'test-model' },
+    };
+    const getOptions = jest.fn(async () => {
+      setInitializeResultPiModelBindingFactory(options, factory);
+      return options;
+    });
+    mockGetProviderConfig.mockReturnValue({
+      getOptions,
+      overrideProvider: Providers.OPENAI,
+    });
+
+    const initializedAgent = await initializeAgent(
+      {
+        req,
+        res,
+        agent,
+        loadTools,
+        endpointOption: { endpoint: EModelEndpoint.agents },
+        allowedProviders: new Set([Providers.OPENAI]),
+        isInitialAgent: true,
+      },
+      db,
+    );
+
+    expect(getAgentPiModelBindingFactory(initializedAgent)).toBe(factory);
+    expect(Object.keys(initializedAgent)).not.toContain('createPiModelBinding');
+    expect(getOptions).toHaveBeenCalledTimes(1);
   });
 
   it('initializes without Express request or response objects', async () => {

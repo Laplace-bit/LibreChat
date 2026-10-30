@@ -129,6 +129,7 @@ import { createConfiguredContentInspector, inspectContent } from '../protection/
 import { assertAgentAttachmentLimits, isModelBoundAttachmentFile } from './attachments';
 import { assertModelBoundContent } from '../middleware/modelBoundContent';
 import { resolveAttachedWorkspaceReadFileLines } from '~/code/workspace';
+import { transferPiModelBindingFactory } from './pi/modelBindingFactory';
 import { isValidInstructionsPromptLink } from './instructions/linked';
 import { PARTIAL_RESOLVED_CONVERSATION } from './conversationSymbols';
 import { registerMemoryTools, memoryToolUsageGuard } from './memory';
@@ -2935,6 +2936,8 @@ export async function initializeAgent(
   ) {
     params.resolveLinkedInstructions.recordUse(instructionsPromptFacts);
   }
+
+  transferPiModelBindingFactory(options, initializedAgent);
 
   return initializedAgent;
 }

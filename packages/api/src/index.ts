@@ -135,6 +135,8 @@ export * from './shared-links/session';
 /* Stream */
 export * from './stream';
 export * from './agents/pi/session';
+export { getAgentPiModelBindingFactory } from './agents/pi/modelBindingFactory';
+export type { CreatePiModelBinding } from './agents/pi/modelBindingFactory';
 export * from './agents/pi/events';
 export * from './agents/pi/bridge';
 export * from './agents/pi/execution';

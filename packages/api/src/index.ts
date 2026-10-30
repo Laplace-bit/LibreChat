@@ -136,6 +136,7 @@ export * from './shared-links/session';
 export * from './stream';
 export * from './agents/pi/session';
 export * from './agents/pi/events';
+export * from './agents/pi/bridge';
 export * from './agents/pi/history';
 export * from './agents/runtime/selection';
 /* Diagnostics */

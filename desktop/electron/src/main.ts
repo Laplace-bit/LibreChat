@@ -23,6 +23,7 @@ const APP_URL = `${APP_ORIGIN}/`;
 const CONFIG_FILE = 'server-connection.json';
 const WINDOW_FILE = 'window-state.json';
 const DEFAULT_WINDOW = { width: 1440, height: 960 };
+const SETUP_WINDOW = { width: 660, height: 560 };
 const MIN_WINDOW = { width: 980, height: 680 };
 const RENDERER_ROOT = path.join(__dirname, 'renderer');
 const SETUP_FILE = path.join(__dirname, 'setup.html');
@@ -166,7 +167,7 @@ function isServerRoute(pathname: string): boolean {
   if (/^\/oauth\/(success|error)\/?$/.test(pathname)) {
     return false;
   }
-  return ['/api', '/oauth', '/images', '/login', '/logout', '/register', '/health'].some(
+  return ['/api', '/oauth', '/images', '/logout', '/health'].some(
     (prefix) => pathname === prefix || pathname.startsWith(`${prefix}/`),
   );
 }
@@ -305,6 +306,10 @@ function isOAuthLandingPath(pathname: string): boolean {
   return /\/oauth\/(success|error)\/?$/.test(pathname);
 }
 
+function connectionSettingsTitle(): string {
+  return app.getLocale().toLowerCase().startsWith('zh') ? '服务器连接' : 'Server Connection';
+}
+
 async function proxyServerRequest(
   request: Request,
   requestUrl: URL,
@@ -423,8 +428,12 @@ async function handleAppRequest(request: Request): Promise<Response> {
     return new Response('Not found', { status: 404 });
   }
 
-  if (url.pathname === '/__desktop/setup') {
-    return serveSetupPage();
+  if (
+    url.pathname === '/__desktop/setup' ||
+    url.pathname === '/setup.css' ||
+    url.pathname === '/setup.js'
+  ) {
+    return serveRenderer(request, url);
   }
   if (url.pathname.includes('/oauth/')) {
     oauthUntil = Date.now() + 10 * 60 * 1000;
@@ -475,46 +484,58 @@ function registerIpcHandlers(): void {
       throw new Error('Untrusted desktop IPC sender.');
     }
     if (typeof input !== 'string' || input.length > 2048) {
-      return { ok: false, message: 'Enter a valid server address.' };
+      return { ok: false, code: 'invalid-address' };
     }
     let next: Connection;
     try {
       next = parseConnection(input);
-    } catch (error) {
-      return {
-        ok: false,
-        message: error instanceof Error ? error.message : 'Enter a valid server address.',
-      };
+    } catch {
+      return { ok: false, code: 'invalid-address' };
     }
 
+    let response: Response;
     try {
-      const response = await net.fetch(getTargetUrl('/api/config', '', next).href, {
+      response = await net.fetch(getTargetUrl('/api/config', '', next).href, {
         signal: AbortSignal.timeout(10_000),
         headers: { accept: 'application/json' },
       });
-      if (!response.ok) {
-        return {
-          ok: false,
-          message: `The server returned HTTP ${response.status} for /api/config.`,
-        };
-      }
-      const config: unknown = await response.json();
-      if (config === null || typeof config !== 'object') {
-        return { ok: false, message: 'The address did not return a LibreChat server config.' };
-      }
+    } catch {
+      return { ok: false, code: 'unreachable' };
+    }
+    if (!response.ok) {
+      return { ok: false, code: 'server-error' };
+    }
+
+    let config: unknown;
+    try {
+      config = await response.json();
+    } catch {
+      return { ok: false, code: 'not-librechat' };
+    }
+    if (config === null || typeof config !== 'object') {
+      return { ok: false, code: 'not-librechat' };
+    }
+
+    const wasConnected = connection !== null;
+    try {
       await saveConnection(next, event.sender.session ?? defaultSession);
-      const senderWindow = BrowserWindow.fromWebContents(event.sender);
-      if (senderWindow === settingsWindow && mainWindow && !mainWindow.isDestroyed()) {
-        await mainWindow.loadURL(APP_URL);
-        return { ok: true, serverUrl: next.serverUrl, closeSettingsWindow: true };
+    } catch {
+      return { ok: false, code: 'storage-error' };
+    }
+    const senderWindow = BrowserWindow.fromWebContents(event.sender);
+    if (senderWindow === settingsWindow && mainWindow && !mainWindow.isDestroyed()) {
+      await mainWindow.loadURL(APP_URL);
+      return { ok: true, serverUrl: next.serverUrl, closeSettingsWindow: true };
+    }
+    if (senderWindow && senderWindow === mainWindow && !senderWindow.isDestroyed()) {
+      if (!wasConnected) {
+        senderWindow.setMinimumSize(MIN_WINDOW.width, MIN_WINDOW.height);
+        senderWindow.setSize(DEFAULT_WINDOW.width, DEFAULT_WINDOW.height);
+        senderWindow.center();
       }
       return { ok: true, serverUrl: next.serverUrl };
-    } catch {
-      return {
-        ok: false,
-        message: 'Could not reach that server. Check the address and your network, then try again.',
-      };
     }
+    return { ok: true, serverUrl: next.serverUrl };
   });
 }
 
@@ -588,7 +609,7 @@ function isOAuthSuccessPage(url: URL): boolean {
 function bindNavigationPolicy(window: BrowserWindow, contents: WebContents): void {
   contents.on('page-title-updated', (event) => {
     event.preventDefault();
-    window.setTitle(window === settingsWindow ? 'Server Connection' : 'Agent Platform');
+    window.setTitle(window === settingsWindow ? connectionSettingsTitle() : 'Agent Platform');
   });
 
   const handleNavigation = (event: Electron.Event, destination: string): void => {
@@ -716,7 +737,7 @@ function openConnectionSettings(): void {
     minWidth: 520,
     minHeight: 480,
     resizable: true,
-    title: 'Server Connection',
+    title: connectionSettingsTitle(),
     show: false,
     backgroundColor: '#f5f5f5',
     webPreferences: {
@@ -741,16 +762,32 @@ function openConnectionSettings(): void {
 
 function buildApplicationMenu(): void {
   const mac = process.platform === 'darwin';
+  const labels = app.getLocale().toLowerCase().startsWith('zh')
+    ? {
+        connection: '服务器连接…',
+        file: '文件',
+        edit: '编辑',
+        view: '显示',
+        window: '窗口',
+      }
+    : {
+        connection: 'Server Connection…',
+        file: 'File',
+        edit: 'Edit',
+        view: 'View',
+        window: 'Window',
+      };
+  const connectionMenuItem: MenuItemConstructorOptions = {
+    label: labels.connection,
+    accelerator: mac ? 'Command+,' : 'Control+,',
+    click: openConnectionSettings,
+  };
   const appMenu: MenuItemConstructorOptions = {
     label: app.name,
     submenu: [
       { role: 'about' },
       { type: 'separator' },
-      {
-        label: 'Server Connection…',
-        accelerator: mac ? 'Command+,' : 'Control+,',
-        click: openConnectionSettings,
-      },
+      connectionMenuItem,
       { type: 'separator' },
       { role: 'services' },
       { type: 'separator' },
@@ -764,16 +801,15 @@ function buildApplicationMenu(): void {
   const template: MenuItemConstructorOptions[] = [
     ...(mac ? [appMenu] : []),
     {
-      label: 'File',
+      label: labels.file,
       submenu: [
-        { label: 'Server Connection…', accelerator: 'Control+,', click: openConnectionSettings },
-        { type: 'separator' },
+        ...(!mac ? [connectionMenuItem, { type: 'separator' as const }] : []),
         { role: 'close' },
         ...(mac ? [] : [{ role: 'quit' as const }]),
       ],
     },
     {
-      label: 'Edit',
+      label: labels.edit,
       submenu: [
         { role: 'undo' },
         { role: 'redo' },
@@ -785,7 +821,7 @@ function buildApplicationMenu(): void {
       ],
     },
     {
-      label: 'View',
+      label: labels.view,
       submenu: [
         { role: 'reload' },
         ...(app.isPackaged ? [] : [{ role: 'toggleDevTools' as const }]),
@@ -798,7 +834,7 @@ function buildApplicationMenu(): void {
       ],
     },
     {
-      label: 'Window',
+      label: labels.window,
       submenu: [
         { role: 'minimize' },
         { role: 'zoom' },
@@ -816,12 +852,22 @@ async function createWindow(): Promise<void> {
     return;
   }
 
-  const bounds = await readWindowState();
+  connection = await readStoredConnection();
+  if (!connection && process.env.AGENT_PLATFORM_SERVER_URL) {
+    try {
+      connection = parseConnection(process.env.AGENT_PLATFORM_SERVER_URL);
+    } catch (error) {
+      console.warn('[desktop] Ignoring invalid AGENT_PLATFORM_SERVER_URL:', error);
+    }
+  }
+  const isSetupWindow = !connection && !DEV_RENDERER_URL;
+  const windowDefaults = isSetupWindow ? SETUP_WINDOW : DEFAULT_WINDOW;
+  const bounds = isSetupWindow ? { ...SETUP_WINDOW } : await readWindowState();
   const window = new BrowserWindow({
-    ...DEFAULT_WINDOW,
+    ...windowDefaults,
     ...bounds,
-    minWidth: MIN_WINDOW.width,
-    minHeight: MIN_WINDOW.height,
+    minWidth: isSetupWindow ? SETUP_WINDOW.width : MIN_WINDOW.width,
+    minHeight: isSetupWindow ? SETUP_WINDOW.height : MIN_WINDOW.height,
     title: 'Agent Platform',
     show: false,
     backgroundColor: '#f5f5f5',
@@ -873,15 +919,6 @@ async function createWindow(): Promise<void> {
       callback(isAppOrigin && (permission === 'media' || permission === 'notifications'));
     },
   );
-
-  connection = await readStoredConnection();
-  if (!connection && process.env.AGENT_PLATFORM_SERVER_URL) {
-    try {
-      connection = parseConnection(process.env.AGENT_PLATFORM_SERVER_URL);
-    } catch (error) {
-      console.warn('[desktop] Ignoring invalid AGENT_PLATFORM_SERVER_URL:', error);
-    }
-  }
 
   await window.loadURL(connection || DEV_RENDERER_URL ? APP_URL : `${APP_ORIGIN}/__desktop/setup`);
 }

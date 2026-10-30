@@ -4,11 +4,9 @@ export const SCROLLBAR_GUTTER_PROPERTY = '--message-scrollbar-gutter';
 
 /** Publishes the band the message column actually holds back for its scrollbar,
  *  so anything centred against that column reserves the same width instead of
- *  assuming one. `scrollbar-gutter: stable` reserves whatever the browser's own
- *  scrollbar measures, and the app only pins that down through
- *  `::-webkit-scrollbar`, which Blink and WebKit honour but Firefox ignores; an
- *  overlay scrollbar reserves nothing at all. Assuming the token there shifts
- *  the composer and the scroll-to-bottom control off the messages they align to.
+ *  assuming one. `scrollbar-gutter: stable` uses the browser and OS scrollbar
+ *  geometry; overlay scrollbars reserve nothing. Assuming the fallback token
+ *  shifts the composer and scroll-to-bottom control off the messages they align to.
  *
  *  The value is app-wide, so it lives on the document element and outlives any
  *  one thread: a second chat column measures the same band, and dropping the
@@ -43,9 +41,8 @@ export default function useScrollbarGutter(
 /** Publishes the same band before any message column has mounted. The welcome
  *  screen holds it back too — it centres greeting and composer against where the
  *  message column will be — and on a fresh load nothing has measured it, so the
- *  spacer would fall back to the `--scrollbar-size` token: a fixed 8px, right
- *  only where the app's own `::-webkit-scrollbar` width applies and wrong on
- *  every overlay-scrollbar platform, which reserves nothing.
+ *  spacer would fall back to the `--scrollbar-size` token, a fixed 8px that may
+ *  differ from the browser and OS scrollbar width.
  *
  *  A detached probe built like the column — `overflow-y: auto` with
  *  `scrollbar-gutter: stable` — answers the same question the column does, and
@@ -54,17 +51,13 @@ export default function useScrollbarGutter(
  *  exists and never overwrites a published measurement.
  *
  *  It measures in a layout effect, before the browser paints: a passive effect
- *  would let the first frame reserve the token's 8px and then recentre the
- *  welcome screen by 4px once the real band is known, which is the same visible
- *  shift this reservation exists to remove.
+ *  would let the first frame reserve the fallback and then recenter the welcome
+ *  screen once the real band is known, which is the same visible shift this
+ *  reservation exists to remove.
  *
- *  The band is not a constant of the platform either: the contrast modes widen
- *  the app's own scrollbar (`--scrollbar-size` goes to 0.75rem under
- *  `html.high-contrast`), and a reader can turn contrast on — or have the OS
- *  turn it on — while the welcome screen is the only thing mounted, with no
- *  message column to republish. `ThemeProvider` carries every contrast and
- *  scheme decision as a class on the document element, so remeasuring on that
- *  is remeasuring on the thing that changed the band. */
+ *  The band can change when the browser or OS accessibility settings change.
+ *  `ThemeProvider` carries app contrast and scheme decisions as attributes on
+ *  the document element, so remeasure when those attributes change too. */
 export function useScrollbarGutterSeed(): void {
   useLayoutEffect(() => {
     const root = document.documentElement;

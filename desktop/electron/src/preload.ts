@@ -2,7 +2,10 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 export type ConnectionResult =
   | { ok: true; serverUrl: string; closeSettingsWindow?: boolean }
-  | { ok: false; message: string };
+  | {
+      ok: false;
+      code: 'invalid-address' | 'server-error' | 'not-librechat' | 'unreachable' | 'storage-error';
+    };
 
 export interface DesktopShellAPI {
   getServerUrl: () => Promise<string | null>;

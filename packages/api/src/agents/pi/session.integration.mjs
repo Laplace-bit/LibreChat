@@ -5,9 +5,10 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { createContentAggregator, GraphEvents } from '@librechat/agents';
 
 const require = createRequire(import.meta.url);
-const { createHostPiSession } = require('../../../dist/index.cjs');
+const { createHostPiSession, createPiContentEventTranslator } = require('../../../dist/index.cjs');
 
 async function withTimeout(promise, timeoutMs, message) {
   let timeout;
@@ -141,6 +142,21 @@ async function createFakeChatServer({ toolCallOnFirst = false, responseDelayMs =
               object: 'chat.completion.chunk',
               created: 1,
               model: 'echo-test',
+              choices: [
+                {
+                  index: 0,
+                  delta: { reasoning_content: 'provider reasoning' },
+                  finish_reason: null,
+                },
+              ],
+            })}\n\n`,
+          );
+          response.write(
+            `data: ${JSON.stringify({
+              id: 'chatcmpl-pi-test',
+              object: 'chat.completion.chunk',
+              created: 1,
+              model: 'echo-test',
               choices: [{ index: 0, delta: { content: 'Pi adapter stream' }, finish_reason: null }],
             })}\n\n`,
           );
@@ -265,10 +281,84 @@ test('Pi host session releases a model binding if cancellation races session cre
   assert.equal(bindingDisposals, 1, 'the binding is disposed when startup is cancelled');
 });
 
+test('Pi content events close an interrupted host step as cancelled', () => {
+  const translatePiEvent = createPiContentEventTranslator({
+    createStepIdentity: () => ({
+      id: 'interrupted-step',
+      index: 0,
+      messageId: 'librechat-response-2',
+      runId: 'librechat-run-2',
+      agentId: 'host-agent-1',
+    }),
+    now: () => 100,
+  });
+  const assistantMessage = { role: 'assistant' };
+
+  translatePiEvent({ type: 'message_start', message: assistantMessage });
+  const partialEvents = translatePiEvent({
+    type: 'message_update',
+    message: assistantMessage,
+    assistantMessageEvent: {
+      type: 'text_delta',
+      contentIndex: 0,
+      delta: 'partial reply',
+      partial: assistantMessage,
+    },
+  });
+  const lowLevelEndEvents = translatePiEvent({
+    type: 'agent_end',
+    messages: [],
+    willRetry: true,
+  });
+  const cancelledEvents = translatePiEvent({ type: 'agent_settled', aborted: true });
+
+  assert.deepEqual(
+    partialEvents.map(({ event }) => event),
+    [GraphEvents.ON_RUN_STEP, GraphEvents.ON_MESSAGE_DELTA],
+  );
+  assert.deepEqual(
+    lowLevelEndEvents,
+    [],
+    'a low-level run ending does not close host steps while Pi may retry',
+  );
+  assert.deepEqual(cancelledEvents, [
+    {
+      event: GraphEvents.ON_RUN_STEP_CLOSED,
+      data: {
+        id: 'interrupted-step',
+        index: 0,
+        type: 'message_creation',
+        status: 'cancelled',
+        created_at: 100,
+        closed_at: 100,
+        runId: 'librechat-run-2',
+        agentId: 'host-agent-1',
+      },
+    },
+  ]);
+});
+
 test('Pi host session sends a prompt through its bound provider and streams the reply', async () => {
   const fakeProvider = await createFakeChatServer({ toolCallOnFirst: true });
   let bindingDisposals = 0;
   let hostToolCalls = 0;
+  let hostStepIndex = 0;
+  let hostStepId = 0;
+  const contentAggregator = createContentAggregator();
+  const hostEvents = [];
+  const identityRequests = [];
+  const translatePiEvent = createPiContentEventTranslator({
+    createStepIdentity: (identity) => {
+      identityRequests.push(identity);
+      return {
+        id: `pi-step-${hostStepId++}`,
+        index: hostStepIndex++,
+        messageId: 'librechat-response-1',
+        runId: 'librechat-run-1',
+        agentId: 'host-agent-1',
+      };
+    },
+  });
   let session;
 
   try {
@@ -296,6 +386,12 @@ test('Pi host session sends a prompt through its bound provider and streams the 
     const observedEvents = [];
     const observedMessages = [];
     session.subscribe((event) => {
+      for (const hostEvent of translatePiEvent(event)) {
+        hostEvents.push(hostEvent);
+        if (hostEvent.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
+          contentAggregator.aggregateContent(hostEvent);
+        }
+      }
       observedEvents.push(event.type);
       if (event.type === 'message_end') {
         observedMessages.push(event.message);
@@ -326,6 +422,38 @@ test('Pi host session sends a prompt through its bound provider and streams the 
       'the host tool result is sent back to Pi for the next model turn',
     );
     assert.equal(streamedText, 'Pi adapter stream', diagnostics);
+    assert.equal(
+      hostEvents.filter(({ event }) => event === GraphEvents.ON_REASONING_DELTA).length,
+      1,
+      'Pi reasoning deltas map to the host reasoning event',
+    );
+    assert.equal(
+      hostEvents.filter(({ event }) => event === GraphEvents.ON_MESSAGE_DELTA).length,
+      1,
+      'Pi text deltas map to the host message event',
+    );
+    assert.deepEqual(
+      identityRequests.map(({ contentType }) => contentType),
+      ['think', 'text'],
+    );
+    assert.deepEqual(
+      contentAggregator.contentParts.filter(Boolean).map((part) => ({
+        type: part.type,
+        text: part.text,
+        think: part.think,
+      })),
+      [
+        { type: 'think', text: undefined, think: 'provider reasoning' },
+        { type: 'text', text: 'Pi adapter stream', think: undefined },
+      ],
+    );
+    assert.deepEqual(
+      hostEvents
+        .filter(({ event }) => event === GraphEvents.ON_RUN_STEP_CLOSED)
+        .map(({ data }) => data.status),
+      ['completed', 'completed'],
+      'the host sees terminal closure for streamed content steps',
+    );
   } finally {
     try {
       await session?.dispose();

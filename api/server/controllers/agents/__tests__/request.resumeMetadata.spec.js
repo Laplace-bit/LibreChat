@@ -263,6 +263,9 @@ jest.mock('@librechat/api', () => ({
   selectAgentRuntimeForAgent: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).selectAgentRuntimeForAgent,
+  assertLegacyRuntimeCompatibleGraph: jest.requireActual(
+    '../../../../../packages/api/src/agents/runtime/selection',
+  ).assertLegacyRuntimeCompatibleGraph,
   getPreliminaryResponseMessageId: jest.requireActual(
     '../../../../../packages/api/src/utils/message',
   ).getPreliminaryResponseMessageId,
@@ -1073,6 +1076,50 @@ describe('ResumableAgentController resume metadata', () => {
     expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
     expect(initializeClient).not.toHaveBeenCalled();
     expect(mockDecrementPendingRequest).toHaveBeenCalledWith('user-123');
+  });
+
+  it('fails closed when a legacy agent graph contains a Pi-pinned connected agent', async () => {
+    const sendMessage = jest.fn().mockResolvedValue(undefined);
+    const initializeClient = jest.fn().mockResolvedValue({
+      client: {
+        options: { agent: { id: 'agent-root' } },
+        agentConfigs: new Map([['agent-pi-connected', { id: 'agent-pi-connected' }]]),
+        sendMessage,
+      },
+    });
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Use the connected agent.',
+        messageId: 'user-message',
+        conversationId: 'conversation-123',
+        endpointOption: {
+          endpoint: 'agents',
+          agent_id: 'agent-root',
+          modelOptions: { model: 'gpt-4.1' },
+        },
+      },
+      config: {
+        endpoints: {
+          agents: { runtime: { piAgentIds: ['agent-pi-connected'] } },
+        },
+      },
+    };
+    const res = createResumableResponse();
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+    await nextTick();
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(initializeClient).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.createJob).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+      'conversation-123',
+      expect.stringContaining('The selected agent runtime is not available on this server.'),
+      1000,
+      expect.any(Object),
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
   it('records a forced-temporary run as temporary, with a deadline, whatever the client sent', async () => {

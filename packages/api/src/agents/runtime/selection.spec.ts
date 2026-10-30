@@ -3,6 +3,8 @@ import {
   AgentRuntimeUnavailableError,
   LEGACY_AGENT_RUNTIME,
   PINNED_PI_AGENT_RUNTIME,
+  assertLegacyRuntimeCompatibleGraph,
+  findPiAgentInRuntimeGraph,
   selectAgentRuntimeForAgent,
 } from './selection';
 
@@ -27,6 +29,27 @@ describe('selectAgentRuntimeForAgent', () => {
     expect(selectAgentRuntimeForAgent({ agentId: { id: 'agent-canary' }, rollout })).toBe(
       LEGACY_AGENT_RUNTIME,
     );
+  });
+
+  it('finds an allowlisted Pi agent anywhere in a legacy graph', () => {
+    expect(
+      findPiAgentInRuntimeGraph({
+        agentIds: ['agent-root', undefined, 'agent-canary'],
+        rollout,
+      }),
+    ).toBe('agent-canary');
+    expect(
+      findPiAgentInRuntimeGraph({ agentIds: ['agent-root', { id: 'agent-canary' }], rollout }),
+    ).toBeUndefined();
+  });
+
+  it('rejects a legacy graph that contains any allowlisted Pi agent', () => {
+    expect(() =>
+      assertLegacyRuntimeCompatibleGraph({ agentIds: ['agent-root', 'agent-canary'], rollout }),
+    ).toThrow(AgentRuntimeUnavailableError);
+    expect(() =>
+      assertLegacyRuntimeCompatibleGraph({ agentIds: ['agent-root'], rollout }),
+    ).not.toThrow();
   });
 
   it('exposes a safe, stable unavailable-runtime error until dispatch is implemented', () => {

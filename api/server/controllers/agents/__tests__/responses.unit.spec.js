@@ -328,6 +328,9 @@ jest.mock('@librechat/api', () => ({
   resolveAgentTokenConfig: jest.fn(({ agentId, byAgentId, fallback }) =>
     agentId != null && byAgentId?.has(agentId) ? byAgentId.get(agentId) : fallback,
   ),
+  assertLegacyRuntimeCompatibleGraph: jest.fn((...args) =>
+    jest.requireActual('@librechat/api').assertLegacyRuntimeCompatibleGraph(...args),
+  ),
   extractManualSkills: jest.fn().mockReturnValue(undefined),
   injectSkillPrimes: jest.fn().mockReturnValue({
     initialMessages: [],
@@ -929,6 +932,75 @@ describe('createResponse controller', () => {
         user: expect.objectContaining({ id: 'user-123' }),
         traceContext: { endpoint: 'agents' },
       }),
+    );
+  });
+
+  it.each([false, true])(
+    'returns 503 before run creation for an allowlisted primary agent: stream=%s',
+    async (stream) => {
+      const api = require('@librechat/api');
+      const rollout = { piAgentIds: ['agent-123'] };
+      req.config.endpoints.agents.runtime = rollout;
+      api.validateResponseRequest.mockReturnValueOnce({
+        request: { model: 'agent-123', input: 'Hello', stream },
+      });
+
+      await createResponse(req, res);
+
+      expect(api.assertLegacyRuntimeCompatibleGraph).toHaveBeenCalledWith({
+        agentIds: ['agent-123'],
+        rollout,
+      });
+      expect(api.createRun).not.toHaveBeenCalled();
+      expect(api.setupStreamingResponse).not.toHaveBeenCalled();
+      expect(api.sendResponsesErrorResponse).toHaveBeenCalledWith(
+        res,
+        503,
+        'The selected agent runtime is not available on this server.',
+        'server_error',
+        'AGENT_RUNTIME_UNAVAILABLE',
+      );
+    },
+  );
+
+  it('returns 503 before run creation when a connected agent is allowlisted', async () => {
+    const api = require('@librechat/api');
+    const rollout = { piAgentIds: ['agent-connected'] };
+    const connectedAgent = {
+      id: 'agent-connected',
+      model: 'claude-3',
+      model_parameters: {},
+      toolRegistry: {},
+      edges: [],
+      agentContextAttachments: [],
+    };
+    api.validateResponseRequest.mockReturnValueOnce({
+      request: { model: 'agent-123', input: 'Hello', stream: false },
+    });
+    api.initializeAgent.mockResolvedValueOnce({
+      id: 'agent-123',
+      model: 'claude-3',
+      model_parameters: {},
+      toolRegistry: {},
+      edges: [{ source: 'agent-123', target: connectedAgent.id }],
+      agentContextAttachments: [],
+    });
+    mockGlobalDiscoveredAgentConfigs = new Map([[connectedAgent.id, connectedAgent]]);
+    req.config.endpoints.agents.runtime = rollout;
+
+    await createResponse(req, res);
+
+    expect(api.assertLegacyRuntimeCompatibleGraph).toHaveBeenCalledWith({
+      agentIds: ['agent-123', connectedAgent.id],
+      rollout,
+    });
+    expect(api.createRun).not.toHaveBeenCalled();
+    expect(api.sendResponsesErrorResponse).toHaveBeenCalledWith(
+      res,
+      503,
+      'The selected agent runtime is not available on this server.',
+      'server_error',
+      'AGENT_RUNTIME_UNAVAILABLE',
     );
   });
 

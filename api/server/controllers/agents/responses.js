@@ -18,6 +18,7 @@ const {
   createAgentRunEnvelope,
   createAgentExecutionContext,
   createMCPRuntimeRequestBody,
+  assertLegacyRuntimeCompatibleGraph,
   buildAgentScopedContext,
   buildInlineMemoryContext,
   buildAgentContextAttachmentsByAgentId,
@@ -1066,6 +1067,10 @@ const executeResponse = async (envelope, { req, res }) => {
           fallback: primaryConfig.endpointTokenConfig,
         });
       const runAgents = [primaryConfig, ...handoffAgentConfigs.values()];
+      assertLegacyRuntimeCompatibleGraph({
+        agentIds: runAgents.map((runAgent) => runAgent.id),
+        rollout: appConfig?.endpoints?.agents?.runtime,
+      });
       const initialSessions = buildInitialToolSessions({ agents: runAgents });
       const modelBoundAgentsById = new Map();
       const pendingModelBoundAgents = [...runAgents];

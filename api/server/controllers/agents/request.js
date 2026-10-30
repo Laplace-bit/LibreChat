@@ -57,6 +57,7 @@ const {
   shouldPersistCodeWorkspaceInitializationError,
   resolvePersistableCodeEnvironmentDecision,
   AgentRuntimeUnavailableError,
+  assertLegacyRuntimeCompatibleGraph,
   selectAgentRuntimeForAgent,
   getFailedTurnTraceFields,
   resolveFailedTurnContent,
@@ -2031,6 +2032,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     });
     startupTelemetry?.mark('client_initialized');
     client = result.client;
+    assertLegacyRuntimeCompatibleGraph({
+      agentIds: [
+        client?.options?.agent?.id,
+        ...Array.from(client?.agentConfigs?.values?.() ?? [], (agent) => agent?.id),
+      ],
+      rollout: req.config?.endpoints?.[EModelEndpoint.agents]?.runtime,
+    });
     const normalizedMCPRequestBody = createMCPRuntimeRequestBody({
       messageId: mcpRequestBody.messageId,
       conversationId: mcpRequestBody.conversationId,

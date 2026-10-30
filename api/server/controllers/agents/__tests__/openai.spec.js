@@ -183,6 +183,8 @@ jest.mock('@librechat/api', () => ({
   /* Provisioning moved into this package; the controllers build the callback from it. */
   createProvisionFilesCallback: () => async () => {},
   createAgentExecutionContext: (context) => context,
+  assertLegacyRuntimeCompatibleGraph: (...args) =>
+    jest.requireActual('@librechat/api').assertLegacyRuntimeCompatibleGraph(...args),
   resolveApiConversationProject: jest.fn((...args) =>
     jest.requireActual('@librechat/api').resolveApiConversationProject(...args),
   ),
@@ -911,6 +913,71 @@ describe('OpenAIChatCompletionController', () => {
       }),
     );
     expect(createSubagentUsageSink).toHaveBeenCalledWith(expect.any(Array));
+  });
+
+  it('returns an unavailable-runtime error before creating a run for an allowlisted primary agent', async () => {
+    const api = require('@librechat/api');
+    api.createErrorResponse.mockImplementationOnce((message, type, code) => ({
+      error: { message, type, code },
+    }));
+    req.config.endpoints.agents.runtime = { piAgentIds: ['agent-123'] };
+
+    await OpenAIChatCompletionController(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(api.createErrorResponse).toHaveBeenCalledWith(
+      'The selected agent runtime is not available on this server.',
+      'server_error',
+      'AGENT_RUNTIME_UNAVAILABLE',
+    );
+    expect(res.json).toHaveBeenCalledWith({
+      error: {
+        message: 'The selected agent runtime is not available on this server.',
+        type: 'server_error',
+        code: 'AGENT_RUNTIME_UNAVAILABLE',
+      },
+    });
+    expect(api.createRun).not.toHaveBeenCalled();
+    expect(mockProcessStream).not.toHaveBeenCalled();
+  });
+
+  it('rejects a legacy run when any connected agent is allowlisted for Pi', async () => {
+    const api = require('@librechat/api');
+    const connectedAgent = {
+      id: 'agent-pi-connected',
+      model: 'gpt-4',
+      model_parameters: {},
+      toolRegistry: {},
+      edges: [],
+    };
+    api.createErrorResponse.mockImplementationOnce((message, type, code) => ({
+      error: { message, type, code },
+    }));
+    req.config.endpoints.agents.runtime = { piAgentIds: ['agent-pi-connected'] };
+    api.initializeAgent.mockResolvedValueOnce({
+      id: 'agent-123',
+      model: 'gpt-4',
+      model_parameters: {},
+      toolRegistry: {},
+      edges: [{ source: 'agent-123', target: connectedAgent.id }],
+    });
+    api.discoverConnectedAgents.mockResolvedValueOnce({
+      agentConfigs: new Map([[connectedAgent.id, connectedAgent]]),
+      edges: [],
+      skippedAgentIds: new Set(),
+      userMCPAuthMap: undefined,
+    });
+
+    await OpenAIChatCompletionController(req, res);
+
+    expect(res.status).toHaveBeenCalledWith(503);
+    expect(api.createErrorResponse).toHaveBeenCalledWith(
+      'The selected agent runtime is not available on this server.',
+      'server_error',
+      'AGENT_RUNTIME_UNAVAILABLE',
+    );
+    expect(api.createRun).not.toHaveBeenCalled();
+    expect(mockProcessStream).not.toHaveBeenCalled();
   });
 
   it('runs a temporary conversation as temporary for Langfuse', async () => {

@@ -31,6 +31,18 @@ export function selectAgentRuntimeForAgent(input: {
   return LEGACY_AGENT_RUNTIME;
 }
 
+/** Finds any allowlisted Pi agent in a graph that would otherwise run Legacy. */
+export function findPiAgentInRuntimeGraph(input: {
+  agentIds: readonly unknown[];
+  rollout?: TAgentRuntimeRollout;
+}): string | undefined {
+  const allowlistedAgentIds = new Set(input.rollout?.piAgentIds ?? []);
+  return input.agentIds.find(
+    (agentId): agentId is string =>
+      typeof agentId === 'string' && agentId.length > 0 && allowlistedAgentIds.has(agentId),
+  );
+}
+
 /** Typed boundary error used while the Pi execution dispatcher is not yet available. */
 export class AgentRuntimeUnavailableError extends Error {
   readonly code = 'AGENT_RUNTIME_UNAVAILABLE';
@@ -40,6 +52,16 @@ export class AgentRuntimeUnavailableError extends Error {
   constructor() {
     super('The selected agent runtime is not available on this server.');
     this.name = 'AgentRuntimeUnavailableError';
+  }
+}
+
+/** Stop legacy dispatch if a connected agent is independently pinned to Pi. */
+export function assertLegacyRuntimeCompatibleGraph(input: {
+  agentIds: readonly unknown[];
+  rollout?: TAgentRuntimeRollout;
+}): void {
+  if (findPiAgentInRuntimeGraph(input) !== undefined) {
+    throw new AgentRuntimeUnavailableError();
   }
 }
 

@@ -24,6 +24,7 @@ const {
   AgentRunEnvelopeError,
   createAgentRunEnvelope,
   createAgentExecutionContext,
+  assertLegacyRuntimeCompatibleGraph,
   createMCPRuntimeRequestBody,
   loadSkillStates,
   sendFinalChunk,
@@ -801,6 +802,10 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
 
       primaryConfig.edges = discoveredEdges;
       const runAgents = [primaryConfig, ...handoffAgentConfigs.values()];
+      assertLegacyRuntimeCompatibleGraph({
+        agentIds: runAgents.map((runAgent) => runAgent.id),
+        rollout: appConfig?.endpoints?.[EModelEndpoint.agents]?.runtime,
+      });
       const endpointTokenConfigByAgentId = new Map();
       for (const [agentId, context] of agentToolContexts) {
         endpointTokenConfigByAgentId.set(agentId, context.endpointTokenConfig);

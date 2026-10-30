@@ -306,6 +306,24 @@ function isOAuthLandingPath(pathname: string): boolean {
   return /\/oauth\/(success|error)\/?$/.test(pathname);
 }
 
+function describeRequestError(error: unknown): { name: string; code?: string; message: string } {
+  const name = error instanceof Error ? error.name : typeof error;
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined;
+  const message =
+    error instanceof Error
+      ? error.message
+          .replace(/https?:\/\/[^\s)]+/gi, '[url]')
+          .replace(/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/g, '[email]')
+          .replace(/(password|token|authorization|cookie)\s*[:=]\s*[^\s,]+/gi, '$1=[redacted]')
+          .replace(/[\r\n\t]+/g, ' ')
+          .slice(0, 160)
+      : 'Unknown request error';
+  return { name, code, message };
+}
+
 function connectionSettingsTitle(): string {
   return app.getLocale().toLowerCase().startsWith('zh') ? '服务器连接' : 'Server Connection';
 }
@@ -354,14 +372,17 @@ async function proxyServerRequest(
     headers.set('referer', `${server.origin}${upstreamPath}`);
   }
   const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
+  let phase: 'upstream-fetch' | 'response-processing' = 'upstream-fetch';
 
   try {
-    const upstream = await net.fetch(upstreamUrl.href, {
+    const fetchOptions = {
       method: request.method,
       headers,
-      body: hasBody ? request.body : undefined,
+      ...(hasBody ? { body: request.body, duplex: 'half' } : {}),
       redirect: 'manual',
-    });
+    } satisfies RequestInit & { duplex?: 'half' };
+    const upstream = await net.fetch(upstreamUrl.href, fetchOptions);
+    phase = 'response-processing';
 
     const responseHeaders = copyResponseHeaders(upstream, true);
     const location = upstream.headers.get('location');
@@ -411,8 +432,8 @@ async function proxyServerRequest(
       statusText: upstream.statusText,
       headers: responseHeaders,
     });
-  } catch {
-    console.error('[desktop] Server request failed.');
+  } catch (error: unknown) {
+    console.error('[desktop] Server request failed.', { phase, ...describeRequestError(error) });
     return new Response('The configured server could not be reached.', { status: 502 });
   }
 }

@@ -48,6 +48,7 @@ const Registration: React.FC = () => {
 
   const registerUser = useRegisterUserMutation({
     onMutate: () => {
+      setErrorMessage('');
       setIsSubmitting(true);
     },
     onSuccess: () => {
@@ -72,6 +73,12 @@ const Registration: React.FC = () => {
       }
     },
   });
+  let registrationErrorMessage = '';
+  if (errorMessage) {
+    registrationErrorMessage = `${localize('com_auth_error_create')} ${errorMessage}`;
+  } else if (registerUser.isError) {
+    registrationErrorMessage = localize('com_auth_error_create');
+  }
 
   const renderInput = (id: string, label: TranslationKeys, type: string, validation: object) => {
     const fieldLabel = localize(label);
@@ -127,11 +134,7 @@ const Registration: React.FC = () => {
 
   return (
     <>
-      {errorMessage && (
-        <ErrorMessage>
-          {localize('com_auth_error_create')} {errorMessage}
-        </ErrorMessage>
-      )}
+      {registrationErrorMessage && <ErrorMessage>{registrationErrorMessage}</ErrorMessage>}
       {registerUser.isSuccess && countdown > 0 && (
         <div
           className="border-status-success-border bg-status-success-subtle text-text-secondary rounded-md border px-3 py-2 text-sm"

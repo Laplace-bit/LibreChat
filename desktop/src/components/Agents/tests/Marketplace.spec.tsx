@@ -62,6 +62,10 @@ jest.mock('~/data-provider', () => ({
   useGetAgentCategoriesQuery: jest.fn(() => ({ data: mockCategories, isLoading: false })),
 }));
 
+jest.mock('../MarketplaceContext', () => ({
+  useMarketplaceHost: () => ({ resetNewConversation: jest.fn() }),
+}));
+
 jest.mock('librechat-data-provider', () => {
   const actual = jest.requireActual('librechat-data-provider');
   return {
@@ -103,6 +107,9 @@ const response = (agents: t.Agent[]): t.AgentListResponse => ({
   last_id: agents.at(-1)?.id ?? '',
   has_more: false,
 });
+
+const renderedAgentNames = () =>
+  screen.getAllByRole('listitem').map((item) => item.querySelector('span')?.textContent);
 
 const agent = (id: string, name = id): t.Agent => ({
   id,
@@ -177,21 +184,13 @@ describe('Marketplace controls and agent results', () => {
     const second = agent('two', 'Beta');
     renderMarketplace('/agents/productivity?mine=1', [first, second]);
     await screen.findByRole('list');
-    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
-      'Alpha',
-      'Beta',
-    ]);
+    expect(renderedAgentNames()).toEqual(['Alpha', 'Beta']);
 
     marketplace.mockResolvedValue(response([second, first]));
     fireEvent.click(screen.getByRole('combobox'));
     fireEvent.click(await screen.findByRole('option', { name: 'Popular' }));
 
-    await waitFor(() =>
-      expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
-        'Beta',
-        'Alpha',
-      ]),
-    );
+    await waitFor(() => expect(renderedAgentNames()).toEqual(['Beta', 'Alpha']));
   });
 
   it('preserves the selected route when changing sort', async () => {

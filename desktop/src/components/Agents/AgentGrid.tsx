@@ -11,6 +11,7 @@ import GridSkeleton from './GridSkeleton';
 import ErrorDisplay from './ErrorDisplay';
 
 interface AgentGridProps {
+  view?: 'list' | 'grid';
   category: string;
   searchQuery: string;
   onSelectAgent?: (agent: t.Agent) => void;
@@ -31,6 +32,7 @@ const AgentGrid: React.FC<AgentGridProps> = ({
   scrollElementRef,
   sort,
   mine,
+  view = 'grid',
 }) => {
   const localize = useLocalize();
 
@@ -422,6 +424,7 @@ const AgentGrid: React.FC<AgentGridProps> = ({
         onSelectAgent={onSelectAgent}
         placeholder={listPlaceholder}
         placeholderInset={recoveryInset}
+        view={view}
       />
 
       {isFetchingNextPage && (

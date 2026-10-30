@@ -5,6 +5,7 @@ import { AnimatePresence, motion, useReducedMotion } from 'framer-motion';
 import { defaultRangeExtractor, useVirtualizer } from '@tanstack/react-virtual';
 import type { Range } from '@tanstack/react-virtual';
 import type t from 'librechat-data-provider';
+import AgentRow from './AgentRow';
 import {
   BACKDROP_ENTER_TRANSITION,
   BACKDROP_EXIT_TRANSITION,
@@ -33,6 +34,7 @@ const mergeRevalidatedAgent = (agent: t.Agent, revalidatedAgent: t.Agent | undef
   revalidatedAgent == null ? agent : { ...agent, ...revalidatedAgent };
 
 interface VirtualizedAgentGridProps {
+  view?: 'list' | 'grid';
   agents: t.Agent[];
   scrollElementRef: React.RefObject<HTMLElement>;
   label: string;
@@ -76,6 +78,7 @@ export default function VirtualizedAgentGrid({
   onSelectAgent,
   placeholder,
   placeholderInset = 0,
+  view = 'grid',
 }: VirtualizedAgentGridProps) {
   const [listElement, setListElement] = useState<HTMLDivElement | null>(null);
   const [hostElement, setHostElement] = useState<HTMLDivElement | null>(null);
@@ -180,7 +183,8 @@ export default function VirtualizedAgentGrid({
     }
   }, [revalidateSelectedAgent, selectedAgentId, selectedIndex]);
   /** No source card in the list, or reduced motion: the dialog just fades. */
-  const morphing = reducedMotion !== true && selection != null && selectedIndex != null;
+  const morphing =
+    view === 'grid' && reducedMotion !== true && selection != null && selectedIndex != null;
   /**
    * The open dialog reads the row the list holds now, not the one it was opened from: a
    * background refresh can land a newer description, avatar, support contact or
@@ -246,14 +250,15 @@ export default function VirtualizedAgentGrid({
         return;
       }
       const style = getComputedStyle(listElement);
-      const columns = Math.max(1, Math.min(4, style.gridTemplateColumns.split(' ').length));
+      const columns =
+        view === 'list' ? 1 : Math.max(1, Math.min(4, style.gridTemplateColumns.split(' ').length));
       const fontSize = parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
       const next = {
         columns,
         width: rect.width,
         gap: parseFloat(style.rowGap) || 0,
         margin: rect.top - frame.getBoundingClientRect().top - frame.clientTop + frame.scrollTop,
-        estimate: fontSize * 18.75,
+        estimate: fontSize * (view === 'list' ? 5 : 18.75),
       };
       const previous = layoutRef.current;
       if (
@@ -276,7 +281,7 @@ export default function VirtualizedAgentGrid({
     observer.observe(listElement);
     observer.observe(frame);
     return () => observer.disconnect();
-  }, [listElement, scrollElementRef, virtualizer]);
+  }, [listElement, scrollElementRef, virtualizer, view]);
 
   useLayoutEffect(() => {
     const anchor = resizeAnchorRef.current;
@@ -515,21 +520,29 @@ export default function VirtualizedAgentGrid({
                     }
                     style={agent.id === liftedAgentId ? { zIndex: LIFTED_ROW_Z_INDEX } : undefined}
                   >
-                    <AgentCard
-                      agent={agent}
-                      onSelect={handleSelect}
-                      expanded={selected}
-                      morphing={agent.id === liftedAgentId}
-                      surfaceRadius={surfaceRadius}
-                      ref={selected ? selectedTriggerRef : undefined}
-                      descriptionRef={(node) => {
-                        if (node == null) {
-                          descriptionNodes.current.delete(agent.id);
-                        } else {
-                          descriptionNodes.current.set(agent.id, node);
-                        }
-                      }}
-                    />
+                    {view === 'list' ? (
+                      <AgentRow
+                        agent={agent}
+                        onSelect={handleSelect}
+                        ref={selected ? selectedTriggerRef : undefined}
+                      />
+                    ) : (
+                      <AgentCard
+                        agent={agent}
+                        onSelect={handleSelect}
+                        expanded={selected}
+                        morphing={agent.id === liftedAgentId}
+                        surfaceRadius={surfaceRadius}
+                        ref={selected ? selectedTriggerRef : undefined}
+                        descriptionRef={(node) => {
+                          if (node == null) {
+                            descriptionNodes.current.delete(agent.id);
+                          } else {
+                            descriptionNodes.current.set(agent.id, node);
+                          }
+                        }}
+                      />
+                    )}
                   </div>,
                 );
               }

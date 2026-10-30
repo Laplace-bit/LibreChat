@@ -1,6 +1,18 @@
 export const COLLAPSED_WIDTH = 52;
 export const EXPANDED_MIN = 360;
 
+/** Panels that benefit from using the main work area as an editing workspace. */
+export const CONFIG_WORKSPACE_PANEL_IDS = new Set([
+  'agents',
+  'assistants',
+  'parameters',
+  'mcp-builder',
+]);
+
+export const isConfigWorkspacePanel = (panelId: string) => CONFIG_WORKSPACE_PANEL_IDS.has(panelId);
+
+export const isChatRoute = (pathname: string) => pathname === '/c' || pathname.startsWith('/c/');
+
 /**
  * How much of the viewport the mobile drawer covers.
  *

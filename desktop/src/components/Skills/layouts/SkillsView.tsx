@@ -91,21 +91,15 @@ function DetailView({ skillId }: { skillId: string }) {
   const [searchParams] = useSearchParams();
   const activeFile = searchParams.get('file');
   const skillQuery = useGetSkillByIdQuery(skillId, { enabled: !!skillId });
-
-  // Show file content when a file is selected from the sidebar tree
-  if (activeFile) {
-    return (
-      <div className="bg-surface-primary-alt flex h-full w-full flex-col">
-        <MobileSidebarToggle />
-        <SkillFileViewer
-          key={`${skillId}:${activeFile}`}
-          skillId={skillId}
-          relativePath={activeFile}
-          skill={skillQuery.data}
-        />
-      </div>
-    );
-  }
+  const error = skillQuery.error;
+  const unavailable =
+    error != null &&
+    typeof error === 'object' &&
+    'response' in error &&
+    error.response != null &&
+    typeof error.response === 'object' &&
+    'status' in error.response &&
+    (error.response.status === 403 || error.response.status === 404);
 
   if (skillQuery.isLoading) {
     return (
@@ -115,7 +109,22 @@ function DetailView({ skillId }: { skillId: string }) {
     );
   }
 
-  if (skillQuery.isError || !skillQuery.data) {
+  if (skillQuery.isError && !unavailable) {
+    return (
+      <div className="bg-surface-primary-alt flex h-full w-full flex-col">
+        <MobileSidebarToggle />
+        <SkillState
+          variant="error"
+          title={localize('com_ui_error')}
+          description={localize('com_ui_error_connection')}
+          actionLabel={localize('com_ui_retry')}
+          onAction={() => void skillQuery.refetch()}
+        />
+      </div>
+    );
+  }
+
+  if (unavailable || !skillQuery.data) {
     return (
       <div className="bg-surface-primary-alt flex h-full w-full flex-col">
         <MobileSidebarToggle />
@@ -123,6 +132,21 @@ function DetailView({ skillId }: { skillId: string }) {
           variant="error"
           title={localize('com_ui_skill_not_found')}
           description={localize('com_ui_skill_not_found_description')}
+        />
+      </div>
+    );
+  }
+
+  // Show file content only after the parent skill has loaded successfully.
+  if (activeFile) {
+    return (
+      <div className="bg-surface-primary-alt flex h-full w-full flex-col">
+        <MobileSidebarToggle />
+        <SkillFileViewer
+          key={`${skillId}:${activeFile}`}
+          skillId={skillId}
+          relativePath={activeFile}
+          skill={skillQuery.data}
         />
       </div>
     );

@@ -91,6 +91,11 @@ describe('Header stacking', () => {
     expect(backgroundTasks).toHaveBeenCalled();
   });
 
+  test('shows the overflow menu on desktop', () => {
+    render(<Header />);
+    expect(headerMenu.mock.calls[0][0].className).toBeUndefined();
+  });
+
   test('keeps conversation task controls mounted across endpoint switches', () => {
     const { rerender } = render(<Header />);
     mockEndpoint.current = 'openAI';

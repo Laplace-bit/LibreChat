@@ -1,5 +1,5 @@
 import { useCallback, useState, useEffect, useRef, memo } from 'react';
-import { useAtom } from 'jotai';
+import { useAtom, useAtomValue, useSetAtom } from 'jotai';
 import { useForm } from 'react-hook-form';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { pxToRem, useRemScale, useMediaQuery } from '@librechat/client';
@@ -15,13 +15,15 @@ import {
   MOBILE_DRAWER_ID,
   MOBILE_DRAWER_WIDTH,
   DRAWER_UNPAINTED,
+  isConfigWorkspacePanel,
+  isChatRoute,
 } from './constants';
 import { filesDialogTriggerAtom, showFilesDialogAtom } from '~/store/filesDialog';
 import { MobileHeader, MobileBottomBar, MobileShortcutTargets } from './mobile';
 import AgentMarketplaceButton from '~/components/Nav/AgentMarketplaceButton';
 import { MyFilesModal } from '~/components/Chat/Input/Files/MyFilesModal';
 import useUnifiedSidebarLinks from '~/hooks/Nav/useUnifiedSidebarLinks';
-import { ChatFormProvider, ActivePanelProvider } from '~/Providers';
+import { ChatFormProvider, ActivePanelProvider, activePanelAtom, DEFAULT_PANEL } from '~/Providers';
 import useSidebarToggle from '~/hooks/Nav/useSidebarToggle';
 import useSidebarState from '~/hooks/Nav/useSidebarState';
 import SidePanelNav from '~/components/SidePanel/Nav';
@@ -64,6 +66,8 @@ function UnifiedSidebar({
   const location = useLocation();
   const navigate = useNavigate();
   const { isSmallScreen, expanded } = useSidebarState();
+  const activePanel = useAtomValue(activePanelAtom);
+  const setActivePanel = useSetAtom(activePanelAtom);
   const [showFiles, setShowFiles] = useAtom(showFilesDialogAtom);
   const [filesDialogTrigger, setFilesDialogTrigger] = useAtom(filesDialogTriggerAtom);
   const { setSidebarOpen } = useSidebarToggle();
@@ -75,8 +79,16 @@ function UnifiedSidebar({
   const resizeHandlers = useRef<{ move: (e: MouseEvent) => void; up: () => void } | null>(null);
 
   const links = useUnifiedSidebarLinks();
+  const activePanelTitle = links.find((link) => link.id === activePanel)?.title;
   const isInsightsRoute = location.pathname.startsWith('/insights');
   const panelExpanded = expanded && !isInsightsRoute;
+  /** Builder panels need room for real forms. Use the whole desktop work area
+   * while editing, and bring chat back as soon as the user returns to history. */
+  const configWorkspaceActive =
+    !isSmallScreen &&
+    isChatRoute(location.pathname) &&
+    panelExpanded &&
+    isConfigWorkspacePanel(activePanel);
 
   /** The aside's max width is a viewport percentage, so the announced range has to track
    *  the viewport rather than a render-time snapshot of it. */
@@ -114,6 +126,10 @@ function UnifiedSidebar({
     }
     handleExpand();
   }, [handleExpand, handleLeaveInsights, isInsightsRoute]);
+
+  const handleReturnToChat = useCallback(() => {
+    setActivePanel(DEFAULT_PANEL);
+  }, [setActivePanel]);
 
   const handleResizeStart = useCallback(
     (event: React.MouseEvent<HTMLElement>) => {
@@ -212,6 +228,16 @@ function UnifiedSidebar({
     return () => document.removeEventListener('keydown', handler);
   }, [isSmallScreen, expanded, handleCollapse]);
 
+  let desktopMinWidth = pxToRem(COLLAPSED_WIDTH);
+  let desktopMaxWidth = pxToRem(COLLAPSED_WIDTH);
+  if (configWorkspaceActive) {
+    desktopMinWidth = '100%';
+    desktopMaxWidth = '100%';
+  } else if (panelExpanded) {
+    desktopMinWidth = `min(${pxToRem(EXPANDED_MIN)}, 40%)`;
+    desktopMaxWidth = '40%';
+  }
+
   const sidebarContent = isSmallScreen ? (
     <div
       id={MOBILE_DRAWER_ID}
@@ -283,14 +309,15 @@ function UnifiedSidebar({
         <aside
           className="relative flex h-full shrink-0 overflow-hidden"
           style={{
-            width: pxToRem(panelExpanded ? sidebarWidth : COLLAPSED_WIDTH),
-            minWidth: panelExpanded
-              ? `min(${pxToRem(EXPANDED_MIN)}, 40%)`
-              : pxToRem(COLLAPSED_WIDTH),
-            maxWidth: panelExpanded ? '40%' : pxToRem(COLLAPSED_WIDTH),
-            transition: isResizing
-              ? 'none'
-              : `width ${TRANSITION_MS}ms ${EASING}, min-width ${TRANSITION_MS}ms ${EASING}, max-width ${TRANSITION_MS}ms ${EASING}`,
+            width: configWorkspaceActive
+              ? '100%'
+              : pxToRem(panelExpanded ? sidebarWidth : COLLAPSED_WIDTH),
+            minWidth: desktopMinWidth,
+            maxWidth: desktopMaxWidth,
+            transition:
+              configWorkspaceActive || isResizing
+                ? 'none'
+                : `width ${TRANSITION_MS}ms ${EASING}, min-width ${TRANSITION_MS}ms ${EASING}, max-width ${TRANSITION_MS}ms ${EASING}`,
           }}
           aria-label={localize('com_nav_control_panel')}
         >
@@ -303,7 +330,12 @@ function UnifiedSidebar({
             onCollapse={handleCollapse}
             onExpand={handlePanelExpand}
             onLeaveInsights={handleLeaveInsights}
-            switchToHistory={switchToHistory}
+            switchToHistory={switchToHistory || configWorkspaceActive}
+            focusWorkspace={configWorkspaceActive}
+            focusWorkspaceTitle={
+              activePanelTitle ? localize(activePanelTitle) : localize('com_nav_control_panel')
+            }
+            onReturnToChat={handleReturnToChat}
             onResizeStart={handleResizeStart}
             onResizeKeyboard={handleResizeKeyboard}
           />

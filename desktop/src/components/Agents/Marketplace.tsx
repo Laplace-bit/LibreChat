@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { PermissionTypes, Permissions } from 'librechat-data-provider';
 import { useSearchParams, useParams, useNavigate } from 'react-router-dom';
 import type t from 'librechat-data-provider';
@@ -20,6 +20,7 @@ interface AgentMarketplaceProps {
 
 const AgentMarketplace: React.FC<AgentMarketplaceProps> = ({ className = '' }) => {
   const localize = useLocalize();
+  const [view, setView] = useState<'list' | 'grid'>('list');
   const navigate = useNavigate();
   const { category } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -157,6 +158,13 @@ const AgentMarketplace: React.FC<AgentMarketplaceProps> = ({ className = '' }) =
               <div className="ms-auto flex shrink-0 items-center gap-1.5">
                 <MineFilterToggle checked={mine === 1} onCheckedChange={handleMineChange} />
                 <SortDropdown value={sort} onChange={handleSortChange} />
+                <button
+                  type="button"
+                  className="text-text-secondary hover:bg-surface-hover rounded-md px-2 py-1 text-sm"
+                  onClick={() => setView(view === 'list' ? 'grid' : 'list')}
+                >
+                  {localize(view === 'list' ? 'com_agents_grid_view' : 'com_agents_list_view')}
+                </button>
               </div>
             </div>
           </div>
@@ -176,6 +184,7 @@ const AgentMarketplace: React.FC<AgentMarketplaceProps> = ({ className = '' }) =
               scrollElementRef={scrollContainerRef}
               sort={sort}
               mine={mine}
+              view={view}
             />
           </div>
         </main>

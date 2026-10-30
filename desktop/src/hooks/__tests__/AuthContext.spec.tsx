@@ -5,7 +5,7 @@ import React from 'react';
 import { RecoilRoot } from 'recoil';
 import { getDefaultStore } from 'jotai';
 import { MemoryRouter } from 'react-router-dom';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
   FileSources,
@@ -164,6 +164,35 @@ function renderOptionalProvider() {
     </QueryClientProvider>,
   );
 }
+
+describe('desktop session recovery', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    Object.defineProperty(window, 'desktopShell', { configurable: true, value: {} });
+  });
+
+  afterEach(() => {
+    Reflect.deleteProperty(window, 'desktopShell');
+  });
+
+  it('retains session state on a network failure and offers a retry', () => {
+    const view = renderProviderLive();
+    const [, options] = mockRefreshMutate.mock.calls[0];
+    act(() => options.onError(new Error('network')));
+    expect(mockEndPullRequestSession).not.toHaveBeenCalled();
+    expect(mockNavigate).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole('button', { name: /retry/i }));
+    expect(mockRefreshMutate).toHaveBeenCalledTimes(2);
+  });
+
+  it('ends the session when the server rejects authentication', () => {
+    renderProviderLive();
+    const [, options] = mockRefreshMutate.mock.calls[0];
+    act(() => options.onError({ response: { status: 401 } }));
+    expect(mockEndPullRequestSession).toHaveBeenCalled();
+    expect(mockNavigate).toHaveBeenCalled();
+  });
+});
 
 describe('AuthContextProvider: test mode', () => {
   beforeEach(() => {

@@ -13,6 +13,10 @@ jest.mock('../ExpandedPanel', () => ({
   default: () => null,
 }));
 
+jest.mock('~/hooks', () => ({
+  useLocalize: () => (key: string) => key,
+}));
+
 const renderSidebar = (direction: 'ltr' | 'rtl') => {
   const onResizeKeyboard = jest.fn();
   render(
@@ -38,6 +42,35 @@ const renderSidebar = (direction: 'ltr' | 'rtl') => {
 };
 
 describe('Sidebar resize handle keyboard', () => {
+  it('renders a spaced configuration workspace with a direct return action', () => {
+    const onReturnToChat = jest.fn();
+    render(
+      <Sidebar
+        links={[]}
+        expanded
+        width={400}
+        minWidth={360}
+        maxWidth={600}
+        onCollapse={jest.fn()}
+        onExpand={jest.fn()}
+        onLeaveInsights={jest.fn()}
+        switchToHistory={false}
+        focusWorkspace
+        focusWorkspaceTitle="Agent Builder"
+        onReturnToChat={onReturnToChat}
+        onResizeStart={jest.fn()}
+        onResizeKeyboard={jest.fn()}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Agent Builder' })).toBeInTheDocument();
+    expect(screen.getByTestId('configuration-workspace-frame')).toHaveClass('max-w-[88rem]');
+    expect(screen.getByTestId('configuration-workspace-content')).toHaveClass('px-8', 'py-6');
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_back_to_chat' }));
+    expect(onReturnToChat).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('separator')).not.toBeInTheDocument();
+  });
+
   it('grows on ArrowRight and shrinks on ArrowLeft in LTR', () => {
     const { handle, onResizeKeyboard } = renderSidebar('ltr');
     fireEvent.keyDown(handle, { key: 'ArrowRight' });

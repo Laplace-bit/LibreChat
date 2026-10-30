@@ -20,6 +20,7 @@ import { useArchiveConvoMutation, useGetStartupConfig } from '~/data-provider';
 import { mainTextareaId, NotificationSeverity } from '~/common';
 import useSidebarToggle from '~/hooks/Nav/useSidebarToggle';
 import { showFilesDialogAtom } from '~/store/filesDialog';
+import { settingsOpenAtom } from '~/components/Nav/Settings';
 import useNewChat from '~/hooks/Conversations/useNewChat';
 import { useHasAccess, useLocalize } from '~/hooks';
 import { getFocusedChatPane } from '~/utils/pane';
@@ -507,6 +508,7 @@ export function useShortcutActions(): ShortcutAction[] {
   const { setSidebarOpen, toggleSidebar } = useSidebarToggle();
   const setShowShortcutsDialog = useSetRecoilState(store.showShortcutsDialog);
   const setShowFilesDialog = useSetAtom(showFilesDialogAtom);
+  const setSettingsOpen = useSetAtom(settingsOpenAtom);
   const setIsTemporary = useSetRecoilState(store.isTemporary);
   const setDeleteTarget = useSetRecoilState(store.keyboardDeleteTarget);
   const hasAccessToTemporaryChat = useHasAccess({
@@ -690,21 +692,9 @@ export function useShortcutActions(): ShortcutAction[] {
   }, []);
 
   const handleOpenSettings = useCallback(() => {
-    const btn = document.querySelector<HTMLElement>('[data-testid="nav-user"]');
-    if (!btn || isUnavailableElement(btn)) {
-      return false;
-    }
-    const openSettingsItem = () => {
-      const settingsItem = document.querySelector<HTMLElement>('[data-testid="nav-settings"]');
-      return clickTarget(settingsItem);
-    };
-    if (btn.getAttribute('aria-expanded') === 'true') {
-      return openSettingsItem();
-    }
-    btn.click();
-    setTimeout(openSettingsItem, 150);
+    setSettingsOpen(true);
     return true;
-  }, []);
+  }, [setSettingsOpen]);
 
   const handleToggleTemporaryChat = useCallback(() => {
     if (hasAccessToTemporaryChat !== true || isRetentionEnforced) {
@@ -1085,8 +1075,16 @@ export default function useKeyboardShortcuts() {
         map.set(bindingHash(binding), id);
       }
     }
+    const standardSettings = parseBinding(isMac ? 'Meta+,' : 'Control+,');
+    if (
+      standardSettings &&
+      !isOverridden('openSettings', overrides.openSettings) &&
+      !map.has(bindingHash(standardSettings))
+    ) {
+      map.set(bindingHash(standardSettings), 'openSettings');
+    }
     return map;
-  }, [resolvedBindings]);
+  }, [resolvedBindings, overrides.openSettings]);
 
   const handler = useCallback(
     (e: KeyboardEvent) => {

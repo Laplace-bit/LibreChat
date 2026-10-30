@@ -4,7 +4,7 @@ import throttle from 'lodash/throttle';
 import { useRecoilValue } from 'recoil';
 import { Search as SearchIcon, SearchX } from 'lucide-react';
 import { List, CellMeasurer, CellMeasurerCache } from 'react-virtualized';
-import { EmptyState, Spinner, useRemScale, useToastContext } from '@librechat/client';
+import { Button, EmptyState, Spinner, useRemScale } from '@librechat/client';
 import type { Index, ListRowProps } from 'react-virtualized';
 import type { TMessage } from 'librechat-data-provider';
 import { getMessageRowWidthClass } from '~/components/Chat/Messages/ui/width';
@@ -84,7 +84,6 @@ MeasuredRow.displayName = 'SearchMeasuredRow';
 export default function Search() {
   const localize = useLocalize();
   const fileMap = useFileMapContext();
-  const { showToast } = useToastContext();
   const { isAuthenticated } = useAuthContext();
   const search = useRecoilValue(store.search);
   const fontSize = useAtomValue(fontSizeAtom);
@@ -99,6 +98,7 @@ export default function Search() {
     isFetchingNextPage,
     hasNextPage,
     isPreviousData,
+    refetch,
   } = useMessagesInfiniteQuery(
     { search: searchQuery || undefined },
     { enabled: isAuthenticated && !!searchQuery, staleTime: 30000, cacheTime: 300000 },
@@ -268,12 +268,6 @@ export default function Search() {
     [cache, messages.length, remScale],
   );
 
-  useEffect(() => {
-    if (isError && searchQuery) {
-      showToast({ message: 'An error occurred during search', status: 'error' });
-    }
-  }, [isError, searchQuery, showToast]);
-
   const resultsCount = messages.length;
   const resultsAnnouncement = useMemo(() => {
     if (resultsCount === 0) {
@@ -321,8 +315,24 @@ export default function Search() {
    *  results are stale — `showingStale` covers the case where the previous
    *  search was empty and `keepPreviousData` holds those empty pages during the
    *  new request, which would otherwise flash a false "nothing found". */
-  if ((isLoading || showingStale) && !hasResults) {
+  if ((isLoading || (showingStale && !isError)) && !hasResults) {
     return loadingSpinner;
+  }
+
+  const errorNotice = isError && (
+    <div
+      role="alert"
+      className="text-text-secondary flex items-center justify-center gap-3 p-4 text-sm"
+    >
+      <span>{localize('com_ui_error_connection')}</span>
+      <Button variant="outline" onClick={() => void refetch()}>
+        {localize('com_ui_retry')}
+      </Button>
+    </div>
+  );
+
+  if (isError && !hasResults) {
+    return <div className="absolute inset-0 flex items-center justify-center">{errorNotice}</div>;
   }
 
   if (!hasResults) {
@@ -340,6 +350,7 @@ export default function Search() {
 
   return (
     <div className="bg-surface-primary-alt relative flex h-full w-full flex-col pt-4">
+      {errorNotice}
       {/* The count is the page's one heading, and the live region at the same time:
           announced to a screen reader and read by everyone else, rather than said
           twice out of two nodes. Aligned to the column the results sit in. */}

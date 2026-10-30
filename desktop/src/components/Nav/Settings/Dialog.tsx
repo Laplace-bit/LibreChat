@@ -27,6 +27,7 @@ export default function SettingsDialog({ open, onOpenChange }: TDialogProps) {
    *  layout at scales where the scaled sidebar leaves the content pane too narrow. */
   const remScale = useRemScale();
   const isSmallScreen = useMediaQuery(`(max-width: ${767 * remScale}px)`);
+  const reducedMotion = useMediaQuery('(prefers-reduced-motion: reduce)');
   const [activeTab, setActiveTab] = useState<SettingsTab>(SettingsTabValues.GENERAL);
   const [query, setQuery] = useState('');
   const [mobileDetail, setMobileDetail] = useState(!isSmallScreen);
@@ -51,22 +52,22 @@ export default function SettingsDialog({ open, onOpenChange }: TDialogProps) {
     <Transition appear show={open}>
       <Dialog as="div" className="relative z-50" onClose={() => onOpenChange(false)}>
         <TransitionChild
-          enter="ease-out duration-200"
+          enter={reducedMotion ? '' : 'ease-out duration-150'}
           enterFrom="opacity-0"
           enterTo="opacity-100"
-          leave="ease-in duration-200"
+          leave={reducedMotion ? '' : 'ease-in duration-150'}
           leaveFrom="opacity-100"
           leaveTo="opacity-0"
         >
           <div className={cn('fixed inset-0', DIALOG_SCRIM_CLASS)} aria-hidden="true" />
         </TransitionChild>
         <TransitionChild
-          enter="ease-out duration-200"
-          enterFrom="opacity-0 scale-95"
+          enter={reducedMotion ? '' : 'ease-out duration-150'}
+          enterFrom={reducedMotion ? '' : 'opacity-0 scale-95'}
           enterTo="opacity-100 scale-100"
-          leave="ease-in duration-100"
+          leave={reducedMotion ? '' : 'ease-in duration-100'}
           leaveFrom="opacity-100 scale-100"
-          leaveTo="opacity-0 scale-95"
+          leaveTo={reducedMotion ? '' : 'opacity-0 scale-95'}
         >
           <div className="fixed inset-0 flex w-screen items-center justify-center p-4">
             <DialogPanel

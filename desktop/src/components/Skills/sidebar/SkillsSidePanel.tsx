@@ -1,6 +1,6 @@
 import { useState, useMemo } from 'react';
 import { useRecoilValue } from 'recoil';
-import { Spinner } from '@librechat/client';
+import { Button, Spinner } from '@librechat/client';
 import { useParams } from 'react-router-dom';
 import type { TSkillListResponse } from 'librechat-data-provider';
 import { useLocalize, useDebounce, useNavScrolling } from '~/hooks';
@@ -62,12 +62,25 @@ export default function SkillsSidePanel({ className }: SkillsSidePanelProps) {
         skeleton={<SkillListSkeleton />}
         className="px-3 pb-3"
       >
-        <SkillListPanel
-          skills={skills}
-          activeSkillId={activeSkillId}
-          sectionOpen={sectionOpen}
-          onSectionOpenChange={setSectionOpen}
-        />
+        {listQuery.isError && (
+          <div
+            role="alert"
+            className="text-text-secondary flex flex-col items-start gap-2 py-3 text-sm"
+          >
+            <span>{localize('com_ui_error_connection')}</span>
+            <Button variant="outline" onClick={() => void listQuery.refetch()}>
+              {localize('com_ui_retry')}
+            </Button>
+          </div>
+        )}
+        {(!listQuery.isError || skills.length > 0) && (
+          <SkillListPanel
+            skills={skills}
+            activeSkillId={activeSkillId}
+            sectionOpen={sectionOpen}
+            onSectionOpenChange={setSectionOpen}
+          />
+        )}
         {/* Appending the next page, so the loaded rows stay put */}
         {listQuery.isFetchingNextPage && (
           <div className="flex shrink-0 justify-center py-2">

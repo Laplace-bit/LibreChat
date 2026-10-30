@@ -1,9 +1,11 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   ipcMain,
   Menu,
   net,
+  nativeTheme,
   protocol,
   screen,
   shell,
@@ -628,7 +630,10 @@ async function readWindowState(): Promise<WindowBounds> {
 }
 
 async function writeWindowState(window: BrowserWindow): Promise<void> {
-  const bounds = window.getBounds();
+  if (window.isDestroyed()) {
+    return;
+  }
+  const bounds = window.getNormalBounds();
   const state: WindowBounds = {
     ...bounds,
     maximized: window.isMaximized(),
@@ -639,6 +644,37 @@ async function writeWindowState(window: BrowserWindow): Promise<void> {
   } catch (error) {
     console.warn('[desktop] Could not save window state:', error);
   }
+}
+
+function bindContextMenu(contents: WebContents): void {
+  contents.on('context-menu', (_event, params) => {
+    const items: MenuItemConstructorOptions[] = [];
+    if (params.isEditable) {
+      for (const suggestion of params.dictionarySuggestions) {
+        items.push({ label: suggestion, click: () => contents.replaceMisspelling(suggestion) });
+      }
+      if (items.length) {
+        items.push({ type: 'separator' });
+      }
+      items.push({ role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' });
+    } else if (params.selectionText) {
+      items.push({ role: 'copy' }, { role: 'selectAll' });
+    }
+    if (params.linkURL) {
+      if (items.length) {
+        items.push({ type: 'separator' });
+      }
+      items.push({
+        label: shellMessage('Copy Link', '复制链接'),
+        click: () => clipboard.writeText(params.linkURL),
+      });
+    }
+    if (items.length) {
+      Menu.buildFromTemplate(items).popup({
+        window: BrowserWindow.fromWebContents(contents) ?? undefined,
+      });
+    }
+  });
 }
 
 function scheduleWindowStateWrite(window: BrowserWindow): void {
@@ -785,7 +821,7 @@ function openConnectionSettings(): void {
     resizable: true,
     title: connectionSettingsTitle(),
     show: false,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#202020' : '#f5f5f5',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -803,6 +839,7 @@ function openConnectionSettings(): void {
     }
   });
   bindNavigationPolicy(window, window.webContents);
+  bindContextMenu(window.webContents);
   void window.loadURL(`${APP_ORIGIN}/__desktop/setup`);
 }
 
@@ -825,7 +862,6 @@ function buildApplicationMenu(): void {
       };
   const connectionMenuItem: MenuItemConstructorOptions = {
     label: labels.connection,
-    accelerator: mac ? 'Command+,' : 'Control+,',
     click: openConnectionSettings,
   };
   const appMenu: MenuItemConstructorOptions = {
@@ -916,7 +952,7 @@ async function createWindow(): Promise<void> {
     minHeight: isSetupWindow ? SETUP_WINDOW.height : MIN_WINDOW.height,
     title: 'Agent Platform',
     show: false,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: nativeTheme.shouldUseDarkColors ? '#202020' : '#f5f5f5',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -934,13 +970,22 @@ async function createWindow(): Promise<void> {
   window.on('move', () => scheduleWindowStateWrite(window));
   window.on('maximize', () => scheduleWindowStateWrite(window));
   window.on('unmaximize', () => scheduleWindowStateWrite(window));
-  window.on('close', () => void writeWindowState(window));
+  window.on('close', () => {
+    if (writeWindowStateTimer) {
+      clearTimeout(writeWindowStateTimer);
+      writeWindowStateTimer = undefined;
+    }
+    if (connection || DEV_RENDERER_URL) {
+      void writeWindowState(window);
+    }
+  });
   window.on('closed', () => {
     if (mainWindow === window) {
       mainWindow = null;
     }
   });
   bindNavigationPolicy(window, window.webContents);
+  bindContextMenu(window.webContents);
 
   window.webContents.on(
     'did-fail-load',

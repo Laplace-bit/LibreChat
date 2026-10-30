@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, startTransition } from 'react';
+import { useAtomValue } from 'jotai';
 import { useRecoilValue } from 'recoil';
-import { Outlet } from 'react-router-dom';
+import { Outlet, useLocation } from 'react-router-dom';
 import { useMediaQuery } from '@librechat/client';
 import {
   useFileMap,
@@ -22,12 +23,15 @@ import {
   SetConvoProvider,
   FileMapContext,
   MCPAppsPolicyProvider,
+  activePanelAtom,
 } from '~/Providers';
 import {
   UnifiedSidebar,
   MOBILE_DRAWER_WIDTH_VAR,
   MOBILE_DRAWER_STRIP_WIDTH,
   MOBILE_DRAWER_FULL_WIDTH,
+  isConfigWorkspacePanel,
+  isChatRoute,
 } from '~/components/UnifiedSidebar';
 import {
   CodeHighlightThrottleContext,
@@ -78,6 +82,7 @@ function KeyboardShortcutsProvider() {
 }
 
 function RootLayout() {
+  const location = useLocation();
   const [showTerms, setShowTerms] = useState(false);
   const [bannerHeight, setBannerHeight] = useState(0);
   /** Shared with the drawer so the two agree on the breakpoint-transition frame. */
@@ -96,6 +101,12 @@ function RootLayout() {
    *  swipe. Opting in narrows it and gives the strip a dismiss target. */
   const drawerStrip = useRecoilValue(store.mobileDrawerStrip);
   const newChatSwitchToHistory = useRecoilValue(store.newChatSwitchToHistory);
+  const activePanel = useAtomValue(activePanelAtom);
+  const configWorkspaceActive =
+    !isSmallScreen &&
+    isChatRoute(location.pathname) &&
+    sidebarExpanded &&
+    isConfigWorkspacePanel(activePanel);
   const paneRef = useRef<HTMLDivElement>(null);
   /** Keyed off the committed state rather than the scrim's own click, because
    *  the header button, Escape, conversation selection and the bottom bar all
@@ -209,12 +220,18 @@ function RootLayout() {
                        *  route that renders no opener. Not in the tab order. */
                       tabIndex={-1}
                       className="relative isolate flex h-full max-w-full flex-1 flex-col overflow-hidden focus:outline-hidden"
+                      style={{ display: configWorkspaceActive ? 'none' : undefined }}
+                      aria-hidden={configWorkspaceActive}
                       /** Keep the live conversation out of the drawer's compositor animation. */
                       /** Recoil's flip is deferred past the opening frames and
                        *  the closing transition outlives it at the other end, so
                        *  `isSliding` covers the travel `sidebarExpanded` brackets
                        *  too late and drops too early. */
-                      inert={isSmallScreen && (sidebarExpanded || isSliding) ? '' : undefined}
+                      inert={
+                        configWorkspaceActive || (isSmallScreen && (sidebarExpanded || isSliding))
+                          ? ''
+                          : undefined
+                      }
                     >
                       <MCPAppsPolicyProvider
                         startupConfig={config}

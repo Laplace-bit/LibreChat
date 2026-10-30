@@ -10,19 +10,17 @@ import {
   isForcedTemporaryRetention,
 } from 'librechat-data-provider';
 import { OpenSidebar, PresetsMenu, NewChat, HeaderMenu } from './Menus';
-import { TemporaryChat, TemporaryChatIndicator } from './TemporaryChat';
+import { TemporaryChatIndicator } from './TemporaryChat';
 import useDrawerViewport from '~/hooks/Nav/useDrawerViewport';
 import ModelSelector from './Menus/Endpoints/ModelSelector';
 import { BackgroundTasksButton } from './BackgroundTasks';
 import { isCodeConversation } from './PullRequest/code';
-import { TraceButton, useTraceControl } from './Trace';
+import { useTraceControl } from './Trace';
 import { useGetStartupConfig } from '~/data-provider';
-import ExportAndShareMenu from './ExportAndShareMenu';
 import SubagentThreadLink from './SubagentThreadLink';
 import { PullRequestChip } from './PullRequest';
 import BookmarkMenu from './Menus/BookmarkMenu';
 import { useChatContext } from '~/Providers';
-import AddMultiConvo from './AddMultiConvo';
 import { useHasAccess } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
@@ -64,11 +62,6 @@ function Header({
 
   const hasAccessToBookmarks = useHasAccess({
     permissionType: PermissionTypes.BOOKMARKS,
-    permission: Permissions.USE,
-  });
-
-  const hasAccessToMultiConvo = useHasAccess({
-    permissionType: PermissionTypes.MULTI_CONVO,
     permission: Permissions.USE,
   });
 
@@ -114,16 +107,7 @@ function Header({
         {!readOnly && interfaceConfig.presets === true && interfaceConfig.modelSelect === true && (
           <PresetsMenu />
         )}
-        {hasAccessToBookmarks === true && (
-          <div className={cn('items-center', isSmallScreen ? 'hidden' : 'flex')}>
-            <BookmarkMenu />
-          </div>
-        )}
-        {hasAccessToMultiConvo === true && (
-          <div className={cn('items-center', isSmallScreen ? 'hidden' : 'flex')}>
-            <AddMultiConvo />
-          </div>
-        )}
+        {hasAccessToBookmarks === true && !isSmallScreen && <BookmarkMenu />}
         {/* Desktop only: its details open to the right, into the room this cluster leaves free.
             Small screens reach the same card from the overflow menu. */}
         {!isSmallScreen && showPullRequest && (
@@ -146,16 +130,7 @@ function Header({
           trace={trace}
           readOnly={readOnly}
           pullRequestConversationId={showPullRequest ? routeConversationId : undefined}
-          className={isSmallScreen ? undefined : 'hidden'}
         />
-        <div className={cn('items-center gap-2', isSmallScreen ? 'hidden' : 'flex')}>
-          {trace.show && <TraceButton onClick={trace.open} />}
-          <ExportAndShareMenu
-            isSharedButtonEnabled={startupConfig?.sharedLinksEnabled ?? false}
-            readOnly={readOnly}
-          />
-          {showTemporaryChat && <TemporaryChat />}
-        </div>
       </div>
     </div>
   );

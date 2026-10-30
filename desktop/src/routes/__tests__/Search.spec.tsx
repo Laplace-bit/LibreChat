@@ -1,6 +1,6 @@
 import React from 'react';
 import { useRecoilValue } from 'recoil';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { useMessagesInfiniteQuery } from '~/data-provider';
 import Search from '../Search';
 
@@ -53,6 +53,9 @@ jest.mock('recoil', () => ({ useRecoilValue: jest.fn() }));
 jest.mock('~/data-provider', () => ({ useMessagesInfiniteQuery: jest.fn() }));
 jest.mock('~/Providers', () => ({ useFileMapContext: () => ({}) }));
 jest.mock('@librechat/client', () => ({
+  Button: ({ children, onClick }: { children: React.ReactNode; onClick: () => void }) => (
+    <button onClick={onClick}>{children}</button>
+  ),
   Spinner: () => <div data-testid="spinner" />,
   /* The shared panel empty state, with the glyph dropped: what this route's tests
      read is the line it carries. */
@@ -144,6 +147,24 @@ describe('Search route', () => {
     );
     render(<Search />);
     expect(screen.getAllByText('com_ui_nothing_found').length).toBeGreaterThan(0);
+  });
+
+  it('shows a retryable error instead of an empty result when search fails', () => {
+    const refetch = jest.fn();
+    mockUseRecoilValue.mockReturnValue(searchState());
+    mockUseQuery.mockReturnValue(queryResult({ data: undefined, isError: true, refetch }));
+    render(<Search />);
+    expect(screen.queryByText('com_ui_nothing_found')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'com_ui_retry' }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps existing results visible when refreshing fails', () => {
+    mockUseRecoilValue.mockReturnValue(searchState());
+    mockUseQuery.mockReturnValue(queryResult({ isError: true, refetch: jest.fn() }));
+    render(<Search />);
+    expect(screen.getByText('row one')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('com_ui_error_connection');
   });
 
   it('shows the spinner (not a false nothing-found) when stale empty data is held during a refetch', () => {

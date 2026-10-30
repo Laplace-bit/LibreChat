@@ -49,6 +49,7 @@ import { resetChatFilterSessionAtom } from '~/components/Conversations/chatFilte
 import { TAuthConfig, TUserContext, TAuthContext, TResError } from '~/common';
 import { resetFacetsAtom } from '~/components/Conversations/facets';
 import useTimeout from './useTimeout';
+import useLocalize from './useLocalize';
 import store from '~/store';
 
 const AuthContext = (import.meta.hot?.data?.__AuthContext ??
@@ -99,6 +100,8 @@ const AuthContextProvider = ({
   const [error, setError] = useState<string | undefined>(undefined);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isAuthReady, setIsAuthReady] = useState<boolean>(authConfig?.test === true);
+  const [refreshUnavailable, setRefreshUnavailable] = useState(false);
+  const localize = useLocalize();
   const setQueriesEnabled = useSetRecoilState<boolean>(store.queriesEnabled);
 
   const userRoleName = user?.role ?? '';
@@ -321,6 +324,7 @@ const AuthContextProvider = ({
     }
     refreshToken.mutate(undefined, {
       onSuccess: (data: t.TRefreshTokenResponse | undefined) => {
+        setRefreshUnavailable(false);
         if (isExternalRedirectRef.current) {
           return;
         }
@@ -377,6 +381,11 @@ const AuthContextProvider = ({
         if (isExternalRedirectRef.current) {
           return;
         }
+        const status = (error as { response?: { status?: number } })?.response?.status;
+        if ('desktopShell' in window && status !== 401 && status !== 403) {
+          setRefreshUnavailable(true);
+          return;
+        }
         console.log('refreshToken mutation error:', error);
         endSessionClientState();
         setIsAuthReady(true);
@@ -401,6 +410,11 @@ const AuthContextProvider = ({
     if (userQuery.data) {
       setUser(userQuery.data);
     } else if (userQuery.isError) {
+      const status = (userQuery.error as { response?: { status?: number } })?.response?.status;
+      if ('desktopShell' in window && status !== 401 && status !== 403) {
+        setRefreshUnavailable(true);
+        return;
+      }
       endSessionClientState();
       doSetError((userQuery.error as Error).message);
       setIsAuthReady(true);
@@ -498,7 +512,37 @@ const AuthContextProvider = ({
     ],
   );
 
-  return <AuthContext.Provider value={memoedValue}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={memoedValue}>
+      {children}
+      {refreshUnavailable && (
+        <div
+          role="alert"
+          className="bg-surface-dialog text-text-primary fixed inset-x-0 top-0 z-50 flex items-center justify-center gap-3 p-3 shadow-md"
+        >
+          <span>{localize('com_ui_error_connection')}</span>
+          <button
+            type="button"
+            className="border-border-medium rounded-md border px-3 py-1"
+            onClick={() => {
+              setRefreshUnavailable(false);
+              if (token && isAuthenticated) {
+                void userQuery.refetch().then((result) => {
+                  if (result.isError) {
+                    setRefreshUnavailable(true);
+                  }
+                });
+              } else {
+                silentRefresh();
+              }
+            }}
+          >
+            {localize('com_ui_retry')}
+          </button>
+        </div>
+      )}
+    </AuthContext.Provider>
+  );
 };
 
 const useAuthContext = () => {

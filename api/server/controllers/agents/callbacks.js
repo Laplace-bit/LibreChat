@@ -663,6 +663,17 @@ function getDefaultHandlers({
         }
       },
     },
+    [UsageEvents.ON_TOKEN_USAGE]: {
+      /** Pi reports completed model-call usage through its session event stream. */
+      handle: async (_event, data) => {
+        if (data == null || typeof data !== 'object') {
+          throw new Error('Pi usage event is malformed');
+        }
+        const usage = { ...data, usage_type: 'message' };
+        collectedUsage.push(usage);
+        await emitTokenUsage(usage);
+      },
+    },
   };
 
   if (toolExecuteOptions) {

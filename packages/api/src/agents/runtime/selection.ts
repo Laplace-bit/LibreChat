@@ -65,6 +65,37 @@ export function assertLegacyRuntimeCompatibleGraph(input: {
   }
 }
 
+/**
+ * Validate the loaded graph against the runtime pinned to this generation.
+ * Pi's first dispatch slice is limited to one exact root agent; legacy retains
+ * its existing guard against connected agents that are independently pinned to Pi.
+ */
+export function assertAgentRuntimeCompatibleGraph(input: {
+  runtime: unknown;
+  rootAgentId: unknown;
+  agentIds: readonly unknown[];
+  rollout?: TAgentRuntimeRollout;
+}): void {
+  const resolution = resolveStoredAgentRuntime(input.runtime);
+  if (resolution.status !== 'resolved') {
+    throw new AgentRuntimeUnavailableError();
+  }
+
+  if (resolution.selection.engine === 'legacy') {
+    assertLegacyRuntimeCompatibleGraph({ agentIds: input.agentIds, rollout: input.rollout });
+    return;
+  }
+
+  if (
+    typeof input.rootAgentId !== 'string' ||
+    input.rootAgentId.length === 0 ||
+    input.agentIds.length !== 1 ||
+    input.agentIds[0] !== input.rootAgentId
+  ) {
+    throw new AgentRuntimeUnavailableError();
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }

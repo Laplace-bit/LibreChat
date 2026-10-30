@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
 const {
   convertLibreChatHistoryToPi,
   createHostPiSession,
+  executePiGeneration,
   createPiContentEventTranslator,
   LEGACY_AGENT_RUNTIME,
   PINNED_PI_AGENT_RUNTIME,
@@ -535,6 +536,7 @@ test('Pi host session sends a prompt through its bound provider and streams the 
   const contentAggregator = createContentAggregator();
   const hostEvents = [];
   const identityRequests = [];
+  let unsupportedToolCycleRejected = false;
   const translatePiEvent = createPiContentEventTranslator({
     createStepIdentity: (identity) => {
       identityRequests.push(identity);
@@ -574,6 +576,22 @@ test('Pi host session sends a prompt through its bound provider and streams the 
     const observedEvents = [];
     const observedMessages = [];
     session.subscribe((event) => {
+      /** This direct session test exercises Pi's scoped host tool API. The product dispatcher
+       *  currently passes no tools, and its event bridge must reject unrepresented tool cycles. */
+      if (
+        event.type === 'agent_end' &&
+        event.messages.some(
+          (message) =>
+            message.role === 'assistant' &&
+            message.stopReason === 'toolUse' &&
+            message.content.some((part) => part.type === 'toolCall'),
+        )
+      ) {
+        assert.throws(() => translatePiEvent(event), { code: 'PI_RESPONSE_UNSUPPORTED' });
+        unsupportedToolCycleRejected = true;
+        observedEvents.push(event.type);
+        return;
+      }
       for (const hostEvent of translatePiEvent(event)) {
         hostEvents.push(hostEvent);
         if (hostEvent.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
@@ -593,6 +611,7 @@ test('Pi host session sends a prompt through its bound provider and streams the 
     const diagnostics = `events=${observedEvents.join(', ')} messages=${JSON.stringify(observedMessages)}`;
     assert.equal(fakeProvider.getRequestCount(), 2, diagnostics);
     assert.equal(hostToolCalls, 1, 'only the supplied host tool executes');
+    assert.equal(unsupportedToolCycleRejected, true);
     assert.equal(fakeProvider.getAuthorization(), 'Bearer integration-test-key');
     assert.ok(
       JSON.stringify(fakeProvider.getRequestBodies()[0]).includes('Say exactly: Pi adapter stream'),
@@ -650,6 +669,49 @@ test('Pi host session sends a prompt through its bound provider and streams the 
     }
   }
   assert.equal(bindingDisposals, 1);
+});
+
+test('Pi generation dispatcher streams a host-formatted turn and reports provider usage', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  const hostEvents = [];
+  let stepIndex = 0;
+
+  try {
+    const outcome = await executePiGeneration({
+      messages: [
+        new SystemMessage('Use the configured test provider.'),
+        new HumanMessage('Say exactly: Pi adapter stream'),
+      ],
+      createModelBinding: () =>
+        createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+          bindingDisposals += 1;
+        }),
+      createStepIdentity: () => ({
+        id: `dispatch-step-${stepIndex}`,
+        index: stepIndex++,
+        messageId: 'dispatch-message-1',
+        runId: 'dispatch-run-1',
+        agentId: 'dispatch-agent-1',
+      }),
+      usageAttribution: { provider: 'openAI', agentId: 'dispatch-agent-1' },
+      handleHostEvent: (event) => hostEvents.push(event),
+    });
+
+    assert.equal(outcome.status, 'completed');
+    assert.equal(fakeProvider.getRequestCount(), 1);
+    assert.equal(bindingDisposals, 1, 'the dispatched generation disposes its provider binding');
+    assert.equal(outcome.usage.length, 1, 'provider usage is collected once per model call');
+    assert.ok(
+      hostEvents.some(
+        (event) =>
+          event.event === GraphEvents.ON_MESSAGE_DELTA &&
+          event.data.delta.content.some((part) => part.text === 'Pi adapter stream'),
+      ),
+    );
+  } finally {
+    await fakeProvider.close();
+  }
 });
 
 test('Pi host session cancels its active provider request when the job signal aborts', async () => {

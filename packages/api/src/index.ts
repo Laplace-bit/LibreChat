@@ -140,6 +140,8 @@ export type { CreatePiModelBinding } from './agents/pi/modelBindingFactory';
 export * from './agents/pi/events';
 export * from './agents/pi/bridge';
 export * from './agents/pi/execution';
+export * from './agents/pi/dispatch';
+export * from './agents/pi/compatibility';
 export * from './agents/pi/history';
 export * from './agents/runtime/selection';
 /* Diagnostics */

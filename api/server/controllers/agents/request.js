@@ -57,7 +57,7 @@ const {
   shouldPersistCodeWorkspaceInitializationError,
   resolvePersistableCodeEnvironmentDecision,
   AgentRuntimeUnavailableError,
-  assertLegacyRuntimeCompatibleGraph,
+  assertAgentRuntimeCompatibleGraph,
   selectAgentRuntimeForAgent,
   getFailedTurnTraceFields,
   resolveFailedTurnContent,
@@ -1647,9 +1647,20 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       agentId: endpointOption.agent_id ?? req.body?.agent_id,
       rollout: req.config?.endpoints?.[EModelEndpoint.agents]?.runtime,
     });
-    if (selectedAgentRuntime.engine === 'pi') {
-      // Do not let an allowlisted Pi agent fall through to AgentClient while the real dispatcher
-      // and its event/tool lifecycle adapter are still being implemented.
+    if (
+      selectedAgentRuntime.engine === 'pi' &&
+      (isRegenerate ||
+        isCompaction ||
+        isTriggerContinuation ||
+        req.body?.isContinued === true ||
+        scheduleId != null ||
+        req._isScheduledFire === true ||
+        req._isAgentTrigger === true ||
+        req._agentEventBindingParentConversationId != null ||
+        agentEventDelivery != null)
+    ) {
+      // The initial Pi dispatcher is a normal foreground turn. Durable continuations,
+      // schedules, Event Actors, and regeneration still require their own recovery adapter.
       throw new AgentRuntimeUnavailableError();
     }
 
@@ -1707,11 +1718,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         // Recorded HERE because this process owns the generation: the steer
         // route may land on a different replica whose own SDK probe would
         // answer for the wrong process during a rolling deploy.
-        preemptCapable: isSteerPreemptSupported(),
+        preemptCapable: selectedAgentRuntime.engine === 'legacy' && isSteerPreemptSupported(),
         // Same owner-recorded pattern: this build's drain merges queued steer
         // quotes into the injected turn. Admission on another replica must
         // not store/acknowledge quotes an older owner would drop.
-        steerQuotesCapable: true,
+        steerQuotesCapable: selectedAgentRuntime.engine === 'legacy',
         // Persist the originating agent so a HITL resume can refuse to rebuild this
         // paused run on a different agent (see resume.js).
         agent_id: endpointOption.agent_id ?? req.body?.agent_id,
@@ -2026,13 +2037,16 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       // Use the job's abort controller signal - allows abort via GenerationJobManager.abortJob()
       signal: job.abortController.signal,
       jobCreatedAt,
+      agentRuntime: job.metadata?.agentRuntime,
       checkpointNamespace: job.metadata?.checkpointNamespace,
       foregroundRunId: mcpRequestBody.messageId,
       requestBody: mcpRequestBody,
     });
     startupTelemetry?.mark('client_initialized');
     client = result.client;
-    assertLegacyRuntimeCompatibleGraph({
+    assertAgentRuntimeCompatibleGraph({
+      runtime: job.metadata?.agentRuntime,
+      rootAgentId: client?.options?.agent?.id,
       agentIds: [
         client?.options?.agent?.id,
         ...Array.from(client?.agentConfigs?.values?.() ?? [], (agent) => agent?.id),
@@ -3420,7 +3434,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                       errorText: generationError,
                       liveUserMessage: userMessage,
                       liveResponseMessageId,
-                      runCreated: client?.run != null,
+                      runCreated: client?.run != null || client?.executionOutcome?.engine === 'pi',
                       sender: client?.sender,
                       initialAgentId: verifiedInitialAgentId,
                     }),

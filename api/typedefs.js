@@ -1275,6 +1275,7 @@
  * @typedef {Object} AgentClientOptions
  * @property {Agent} agent - The agent configuration object
  * @property {string} endpoint - The endpoint identifier for the agent
+ * @property {import('@librechat/api').AgentRuntimeSelection} [agentRuntime] Generation-pinned runtime selection
  * @property {ServerRequest} req - The request object
  * @property {string} [name] - The username
  * @property {string} [modelLabel] - The label for the model being used

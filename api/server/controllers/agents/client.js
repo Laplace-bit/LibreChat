@@ -1,5 +1,6 @@
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 require('events').EventEmitter.defaultMaxListeners = 100;
+const { nanoid } = require('nanoid');
 const { logger, MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH } = require('@librechat/data-schemas');
 const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
 const {
@@ -181,6 +182,7 @@ const {
   createPrivateTextInitialAdmissionCallback,
   withPrivateTextAdmissionConfig,
   requirePrivateTextAdmission,
+  requirePrivateTextPersistence,
   rejectPrivateTextAdmission,
   createInitialModelBoundAdmissionCallback,
   hasModelBoundContentProtection,
@@ -211,6 +213,11 @@ const {
   getChatProjectContextKey,
   isTemporaryTurn,
   hasEntityEmbeddings,
+  AgentRuntimeUnavailableError,
+  resolveStoredAgentRuntime,
+  assertPiTextOnlyCompatible,
+  getAgentPiModelBindingFactory,
+  executePiGeneration,
 } = require('@librechat/api');
 const {
   Run,
@@ -623,8 +630,11 @@ class AgentClient extends BaseClient {
      * @type {import('@librechat/agents').CompactionSemanticIndexSnapshot | undefined} */
     this.compactionSemanticIndexSnapshot = undefined;
 
+    /** `run` is exclusively a real Legacy AgentRun. Pi execution has no fabricated Graph. */
     /** @type {AgentRun} */
     this.run;
+    /** @type {{ engine: 'pi'; status: 'completed' | 'cancelled' } | undefined} */
+    this.executionOutcome = undefined;
 
     /** Resolves with the agent run once `chatCompletion` initializes it (or
      *  `null` if initialization fails), letting immediate-mode title generation
@@ -4938,6 +4948,12 @@ class AgentClient extends BaseClient {
        * @param {BaseMessage[]} messages
        */
       const runAgents = async (messages) => {
+        const runtimeResolution = resolveStoredAgentRuntime(this.options.agentRuntime);
+        if (runtimeResolution.status !== 'resolved') {
+          throw new AgentRuntimeUnavailableError();
+        }
+        const isPiRuntime = runtimeResolution.selection.engine === 'pi';
+        const request = this.options.req;
         const agents = [this.options.agent];
         // Include additional agents when:
         // - agentConfigs has agents (from addedConvo parallel execution or agent handoffs)
@@ -4945,19 +4961,86 @@ class AgentClient extends BaseClient {
         if (this.agentConfigs && this.agentConfigs.size > 0) {
           agents.push(...this.agentConfigs.values());
         }
-        const initialModelBoundAdmission =
-          AgentClient.prototype.createInitialModelBoundAdmissionCallback.call(
-            this,
-            AgentClient.getStartingAgentIds(agents),
-          );
-        const modelBoundCallback = AgentClient.prototype.createModelBoundChatModelCallback.call(
-          this,
-          initialModelBoundAdmission,
-        );
-        config = withPrivateTextAdmissionConfig(config, initialModelBoundAdmission);
+        let piModelBindingFactory;
+        if (isPiRuntime) {
+          const unsupportedModes = [];
+          if (
+            this.eventActorContinuation != null ||
+            this.eventActorInvocationId != null ||
+            request?._isAgentTrigger === true ||
+            request?._agentEventBindingParentConversationId != null
+          ) {
+            unsupportedModes.push('event_actor');
+          }
+          if (request?._isScheduledFire === true || request?.body?.scheduleId != null) {
+            unsupportedModes.push('scheduled');
+          }
+          if (
+            this.options.subagentTasks != null ||
+            this.agentConfigs?.size > 0 ||
+            (this.options.agent?.edges?.length ?? 0) > 0 ||
+            (this.options.agent?.subagents?.length ?? 0) > 0 ||
+            (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
+          ) {
+            unsupportedModes.push('background');
+          }
+          if (isCompactionTurn) {
+            unsupportedModes.push('compaction');
+          }
+          if (request?.body?.isRegenerate === true || request?.body?.isContinued === true) {
+            unsupportedModes.push('regenerate');
+          }
+          if (
+            request?._recoveredSteerId != null ||
+            request?.body?.steerId != null ||
+            request?.body?.steer != null
+          ) {
+            unsupportedModes.push('steer');
+          }
+          if (
+            (manualSkillPrimes?.length ?? 0) > 0 ||
+            (alwaysApplySkillPrimes?.length ?? 0) > 0 ||
+            (skillPrimeResult?.skills?.size ?? 0) > 0
+          ) {
+            unsupportedModes.push('skills');
+          }
 
-        if (this.processMemory && !isCompactionTurn) {
-          memoryPromise = this.runMemory(memoryMessages);
+          const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
+          const callableToolNames = [...toolSet].filter((name) => !internalToolNames.has(name));
+          assertPiTextOnlyCompatible({
+            rootAgentId: this.options.agent?.id,
+            loadedAgentIds: agents.map((agent) => agent?.id),
+            callableToolNames,
+            unsupportedModes,
+          });
+          piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
+          if (piModelBindingFactory == null) {
+            throw new AgentRuntimeUnavailableError();
+          }
+        }
+        const initialModelBoundAdmission = isPiRuntime
+          ? undefined
+          : AgentClient.prototype.createInitialModelBoundAdmissionCallback.call(
+              this,
+              AgentClient.getStartingAgentIds(agents),
+            );
+        const modelBoundCallback = isPiRuntime
+          ? undefined
+          : AgentClient.prototype.createModelBoundChatModelCallback.call(
+              this,
+              initialModelBoundAdmission,
+            );
+        if (!isPiRuntime) {
+          config = withPrivateTextAdmissionConfig(config, initialModelBoundAdmission);
+        }
+
+        const startMemoryRun = () => {
+          if (this.processMemory && !isCompactionTurn && memoryPromise == null) {
+            memoryPromise = this.runMemory(memoryMessages);
+          }
+        };
+        if (!isPiRuntime) {
+          startMemoryRun();
         }
 
         const { calibrationRatio, fadingTier, fadingTiers } = resolveRunSeeds(this);
@@ -4977,7 +5060,7 @@ class AgentClient extends BaseClient {
         // Start the prune alongside graph construction. The all-settled barrier
         // below still guarantees it completes before the graph is exposed or run.
         const shouldPruneCheckpoint =
-          streamId && this.eventActorInvocationId == null && runUsesCheckpointer;
+          !isPiRuntime && streamId && this.eventActorInvocationId == null && runUsesCheckpointer;
         let checkpointPrunePromise = Promise.resolve();
         if (shouldPruneCheckpoint && this.checkpointNamespace !== '') {
           checkpointPrunePromise = deleteAgentCheckpoint(
@@ -5028,6 +5111,82 @@ class AgentClient extends BaseClient {
         const activityHandlers =
           activityPhase?.handlers(offsetHandlers) ??
           (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
+
+        if (isPiRuntime) {
+          const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
+          try {
+            /** Pi has no LangChain callback boundary. Inspect the exact formatted host messages
+             *  before converting them, retaining stored-message and file provenance. */
+            BaseClient.prototype.assertBuiltModelBoundContent.call(this, messages);
+          } catch (error) {
+            persistence?.cancel();
+            throw error;
+          }
+
+          /** The legacy first-model callback both persists deferred user input and admits
+           *  private-text sidecars. Pi performs the same ordered boundary explicitly after
+           *  its final host-side input check and before any model-side memory work. */
+          await requirePrivateTextPersistence(
+            request,
+            () => (persistence?.isPending() === true ? persistence.start() : undefined),
+            this.privateTextStart,
+          );
+          if (persistence?.isPending() === true) {
+            persistence.start();
+          }
+          await requirePrivateTextAdmission(request, abortController.signal);
+          startMemoryRun();
+
+          const piHandlers = reasoningLabel?.handlers(activityHandlers) ?? activityHandlers;
+          const baseStepIndex = this.contentParts.length;
+          let nextStepIndex = baseStepIndex;
+          const piMetadata = {
+            thread_id: this.conversationId,
+            user_id: this.user ?? request?.user?.id,
+            run_id: this.responseMessageId,
+            agent_id: this.options.agent.id,
+            agentId: this.options.agent.id,
+            last_agent_id: this.options.agent.id,
+            langgraph_node: `agent=${this.options.agent.id}`,
+            hide_sequential_outputs: false,
+          };
+
+          this.options.startupTelemetry?.mark('pi_session_started');
+          const outcome = await executePiGeneration({
+            messages,
+            createModelBinding: piModelBindingFactory,
+            signal: abortController.signal,
+            usageAttribution: {
+              provider: this.options.agent.provider,
+              agentId: this.options.agent.id,
+            },
+            createStepIdentity: () => {
+              const sequence = nextStepIndex++;
+              return {
+                id: `pi-${this.responseMessageId}-${nanoid()}`,
+                index: sequence,
+                messageId: this.responseMessageId,
+                runId: this.responseMessageId,
+                agentId: this.options.agent.id,
+              };
+            },
+            handleHostEvent: async (event) => {
+              const handler = piHandlers?.[event.event];
+              if (handler == null || typeof handler.handle !== 'function') {
+                throw new AgentRuntimeUnavailableError();
+              }
+              await handler.handle(event.event, event.data, piMetadata);
+            },
+          });
+
+          this.executionOutcome = { engine: 'pi', status: outcome.status };
+          this.options.startupTelemetry?.mark('pi_session_settled');
+          if (outcome.status === 'cancelled' && abortController.signal.aborted !== true) {
+            throw new AgentRuntimeUnavailableError();
+          }
+          return;
+        }
+
         const createRunPromise = createRun({
           scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
           recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(

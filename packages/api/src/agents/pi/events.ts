@@ -1,7 +1,9 @@
 import { GraphEvents } from '@librechat/agents';
-import { ContentTypes, StepTypes } from 'librechat-data-provider';
+import { ContentTypes, StepTypes, UsageEvents } from 'librechat-data-provider';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { Agents } from 'librechat-data-provider';
+import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 
 export type PiContentType = 'text' | 'think';
 
@@ -22,6 +24,8 @@ export interface PiMessageStepIdentityInput {
 export interface PiContentEventTranslatorOptions {
   /** The host supplies job-scoped IDs and offsets; Pi never owns product identities. */
   createStepIdentity(input: PiMessageStepIdentityInput): PiMessageStepIdentity;
+  /** Host-owned billing attribution; Pi's provider id is deliberately not authoritative. */
+  usageAttribution?: { provider?: string; agentId?: string };
   now?: () => number;
 }
 
@@ -30,6 +34,22 @@ export type PiHostContentEvent =
   | { event: GraphEvents.ON_MESSAGE_DELTA; data: Agents.MessageDeltaEvent }
   | { event: GraphEvents.ON_REASONING_DELTA; data: Agents.ReasoningDeltaEvent }
   | { event: GraphEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent };
+
+export interface PiHostUsageEvent {
+  event: typeof UsageEvents.ON_TOKEN_USAGE;
+  data: UsageMetadata;
+}
+
+export type PiHostEvent = PiHostContentEvent | PiHostUsageEvent;
+
+export class PiRuntimeResponseError extends Error {
+  readonly code = 'PI_RESPONSE_UNSUPPORTED';
+
+  constructor() {
+    super('The Pi response could not be represented by the current agent runtime.');
+    this.name = 'PiRuntimeResponseError';
+  }
+}
 
 interface PiContentStep {
   identity: PiMessageStepIdentity;
@@ -68,6 +88,77 @@ function closeContentSteps(
     });
   }
   return closedEvents;
+}
+
+function asTokenCount(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new PiRuntimeResponseError();
+  }
+  return value;
+}
+
+function translateAssistantUsage(
+  message: AssistantMessage,
+  attribution: PiContentEventTranslatorOptions['usageAttribution'],
+): PiHostUsageEvent {
+  const { input, output, cacheRead, cacheWrite, totalTokens, reasoning } = message.usage;
+  const inputTokens = asTokenCount(input);
+  const outputTokens = asTokenCount(output);
+  const cacheReadTokens = asTokenCount(cacheRead);
+  const cacheWriteTokens = asTokenCount(cacheWrite);
+  const total = asTokenCount(totalTokens);
+  if (
+    inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens !== total ||
+    (reasoning !== undefined && asTokenCount(reasoning) > outputTokens)
+  ) {
+    throw new PiRuntimeResponseError();
+  }
+
+  return {
+    event: UsageEvents.ON_TOKEN_USAGE,
+    data: {
+      input_tokens: inputTokens + cacheReadTokens + cacheWriteTokens,
+      output_tokens: outputTokens,
+      total_tokens: total,
+      model: message.model,
+      provider: attribution?.provider ?? message.provider,
+      ...(attribution?.agentId == null ? {} : { agentId: attribution.agentId }),
+      ...(cacheReadTokens === 0 && cacheWriteTokens === 0
+        ? {}
+        : {
+            input_token_details: {
+              ...(cacheReadTokens === 0 ? {} : { cache_read: cacheReadTokens }),
+            },
+            ...(cacheWriteTokens === 0 ? {} : { cache_write_tokens: cacheWriteTokens }),
+          }),
+      ...(reasoning === undefined ? {} : { output_token_details: { reasoning } }),
+    },
+  };
+}
+
+function translateAgentEnd(
+  event: Extract<AgentSessionEvent, { type: 'agent_end' }>,
+  options: PiContentEventTranslatorOptions,
+): PiHostUsageEvent[] {
+  const translated: PiHostUsageEvent[] = [];
+  for (const message of event.messages) {
+    if (message.role !== 'assistant') {
+      continue;
+    }
+
+    if (
+      event.willRetry !== true &&
+      (message.stopReason === 'error' ||
+        message.stopReason === 'length' ||
+        message.stopReason === 'deferred' ||
+        (message.stopReason === 'toolUse' &&
+          message.content.some((part) => part.type === 'toolCall')))
+    ) {
+      throw new PiRuntimeResponseError();
+    }
+    translated.push(translateAssistantUsage(message, options.usageAttribution));
+  }
+  return translated;
 }
 
 function createRunStep(step: PiContentStep): Agents.RunStep {
@@ -151,7 +242,7 @@ function translateContentDelta(
  */
 export function createPiContentEventTranslator(
   options: PiContentEventTranslatorOptions,
-): (event: AgentSessionEvent) => PiHostContentEvent[] {
+): (event: AgentSessionEvent) => PiHostEvent[] {
   const now = options.now ?? Date.now;
   let assistantMessageSequence = 0;
   let currentMessage: AssistantMessageState | undefined;
@@ -172,9 +263,22 @@ export function createPiContentEventTranslator(
       if (!currentMessage) {
         return [];
       }
-      const completed = closeContentSteps(currentMessage, 'completed', now());
+      const status =
+        event.message.stopReason === 'aborted'
+          ? 'cancelled'
+          : event.message.stopReason === 'error' ||
+              event.message.stopReason === 'length' ||
+              event.message.stopReason === 'deferred' ||
+              event.message.stopReason === 'toolUse'
+            ? 'failed'
+            : 'completed';
+      const completed = closeContentSteps(currentMessage, status, now());
       currentMessage = undefined;
       return completed;
+    }
+
+    if (event.type === 'agent_end') {
+      return translateAgentEnd(event, options);
     }
 
     if (event.type === 'agent_settled') {

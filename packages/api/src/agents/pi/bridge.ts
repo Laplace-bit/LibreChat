@@ -1,5 +1,5 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
-import type { PiHostContentEvent } from './events';
+import type { PiHostEvent } from './events';
 import type { HostPiSession } from './session';
 
 export interface PiHostEventBridgeOptions {
@@ -7,8 +7,8 @@ export interface PiHostEventBridgeOptions {
   prompt: string;
   promptOptions?: PromptOptions;
   signal?: AbortSignal;
-  translateEvent(event: AgentSessionEvent): readonly PiHostContentEvent[];
-  handleHostEvent(event: PiHostContentEvent): void | Promise<void>;
+  translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
+  handleHostEvent(event: PiHostEvent): void | Promise<void>;
 }
 
 export type PiHostSessionOutcome = { status: 'completed' } | { status: 'cancelled' };
@@ -37,7 +37,7 @@ export async function executePiHostSession(
     void options.session.abort().catch(() => undefined);
   };
 
-  const enqueueHostEvent = (event: PiHostContentEvent) => {
+  const enqueueHostEvent = (event: PiHostEvent) => {
     eventQueue = eventQueue
       .then(async () => {
         if (handlerFailure == null) {
@@ -61,7 +61,7 @@ export async function executePiHostSession(
       return;
     }
 
-    let hostEvents: readonly PiHostContentEvent[];
+    let hostEvents: readonly PiHostEvent[];
     try {
       hostEvents = options.translateEvent(event);
     } catch (error) {

@@ -94,7 +94,11 @@ describe('executePiHostSession', () => {
       session: harness.session,
       prompt: 'hello',
       translateEvent: (event) => [createHostEvent(event.type)],
-      handleHostEvent: async ({ data }) => {
+      handleHostEvent: async (event) => {
+        if (event.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
+          throw new Error('Expected a run-step close event');
+        }
+        const { data } = event;
         delivered.push(`start:${data.id}`);
         if (data.id === 'agent_end') {
           handlerStarted.resolve(undefined);

@@ -1,15 +1,15 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { HostPiSession, HostPiSessionOptions } from './session';
 import type { PiHostSessionOutcome } from './bridge';
-import type { PiHostContentEvent } from './events';
+import type { PiHostEvent } from './events';
 import { executePiHostSession } from './bridge';
 import { createHostPiSession } from './session';
 
 export interface PiGenerationExecutorInput extends HostPiSessionOptions {
   prompt: string;
   promptOptions?: PromptOptions;
-  translateEvent(event: AgentSessionEvent): readonly PiHostContentEvent[];
-  handleHostEvent(event: PiHostContentEvent): void | Promise<void>;
+  translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
+  handleHostEvent(event: PiHostEvent): void | Promise<void>;
 }
 
 export interface PiGenerationExecutorDependencies {

@@ -210,6 +210,7 @@ function createToolLoader(
  * @param {AbortSignal} params.signal
  * @param {Object} params.endpointOption
  * @param {number} [params.jobCreatedAt]
+ * @param {import('@librechat/api').AgentRuntimeSelection} [params.agentRuntime] Generation-pinned engine selection
  * @param {string} [params.checkpointNamespace] Immutable saver-level generation scope
  * @param {string} [params.foregroundRunId] Canonical response identity for foreground execution
  * @param {import('@librechat/api').MCPRuntimeRequestBody} [params.requestBody]
@@ -226,6 +227,7 @@ const initializeClientWithProvider = async ({
   signal,
   endpointOption,
   jobCreatedAt,
+  agentRuntime,
   checkpointNamespace,
   foregroundRunId,
   requestBody,
@@ -2124,6 +2126,7 @@ const initializeClientWithProvider = async ({
     startupTelemetry,
     toolInputValidationErrors,
     jobCreatedAt,
+    agentRuntime,
     checkpointNamespace,
     mcpRequestBody: runtimeRequestBody,
   });

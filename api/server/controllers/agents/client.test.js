@@ -1,4 +1,7 @@
 const mockCreateRun = jest.fn();
+const mockExecutePiGeneration = jest.fn();
+const mockGetAgentPiModelBindingFactory = jest.fn();
+const mockAssertPiTextOnlyCompatible = jest.fn();
 const mockCaptureAgentCheckpointGeneration = jest.fn();
 const mockDeleteAgentCheckpoint = jest.fn();
 const mockIsHITLEnabled = jest.fn().mockReturnValue(false);
@@ -21,9 +24,16 @@ const mockStripActivityLabelParts = jest.fn((payload) =>
 );
 
 const { Providers } = require('@librechat/agents');
-const { Constants, ContentTypes, EModelEndpoint, ErrorTypes } = require('librechat-data-provider');
+const {
+  Constants,
+  ContentTypes,
+  EModelEndpoint,
+  ErrorTypes,
+  UsageEvents,
+} = require('librechat-data-provider');
 const {
   GenerationJobManager,
+  PINNED_PI_AGENT_RUNTIME,
   createStreamServices,
   registerToolApprovalHook,
   clearToolApprovalHooks,
@@ -278,6 +288,9 @@ jest.mock('@librechat/api', () => ({
   buildAgentScopedContext: (...args) => mockBuildAgentScopedContext(...args),
   checkAccess: jest.fn(),
   createRun: (...args) => mockCreateRun(...args),
+  assertPiTextOnlyCompatible: (...args) => mockAssertPiTextOnlyCompatible(...args),
+  executePiGeneration: (...args) => mockExecutePiGeneration(...args),
+  getAgentPiModelBindingFactory: (...args) => mockGetAgentPiModelBindingFactory(...args),
   countFormattedMessageTokens: jest.fn(() => 42),
   countTokens: jest.fn((text) => Math.ceil(String(text ?? '').length / 4)),
   createCachedTokenCounter: jest.fn(async () => jest.fn(() => 0)),
@@ -9970,6 +9983,196 @@ describe('AgentClient - finalizeSubagentContent', () => {
     expect(client.contentParts[1].tool_call.subagent_content).toEqual([
       expect.objectContaining({ type: 'text', text: 'B' }),
     ]);
+  });
+});
+
+describe('AgentClient - Pi generation dispatch', () => {
+  const createPiClient = (overrides = {}) => {
+    const req = overrides.req ?? {};
+    req.user ??= { id: 'user-pi' };
+    req.body ??= {};
+    req.config ??= { endpoints: { [EModelEndpoint.agents]: {} } };
+    const client = new AgentClient({
+      req,
+      res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
+      agent: {
+        id: 'agent-pi',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4o' },
+        hide_sequential_outputs: false,
+        tools: [],
+      },
+      endpointTokenConfig: {},
+      eventHandlers: overrides.eventHandlers ?? {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.conversationId = 'conversation-pi';
+    client.responseMessageId = 'response-pi';
+    client.parentMessageId = 'parent-pi';
+    client.recordCollectedUsage = jest.fn().mockResolvedValue();
+    return client;
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
+    mockExecutePiGeneration.mockResolvedValue({ status: 'completed', usage: [] });
+    mockIsHITLEnabled.mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    mockFormatAgentMessages.mockReset();
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+  });
+
+  it('dispatches a supported turn through Pi and keeps AgentRun unset', async () => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const formattedMessages = [new HumanMessage('hello from the host')];
+    mockFormatAgentMessages.mockReturnValue({
+      messages: formattedMessages,
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+    const usage = {
+      input_tokens: 12,
+      output_tokens: 4,
+      total_tokens: 16,
+      model: 'gpt-4o',
+      provider: 'openai',
+      agentId: 'agent-pi',
+    };
+    const usageHandler = jest.fn();
+    const client = createPiClient({
+      eventHandlers: {
+        [UsageEvents.ON_TOKEN_USAGE]: { handle: usageHandler },
+      },
+    });
+    mockExecutePiGeneration.mockImplementation(async ({ handleHostEvent }) => {
+      await handleHostEvent({ event: UsageEvents.ON_TOKEN_USAGE, data: usage });
+      return { status: 'completed', usage: [usage] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(client.contentParts).toEqual([]);
+    expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledWith(client.options.agent);
+    expect(mockExecutePiGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({
+        messages: formattedMessages,
+        usageAttribution: { provider: EModelEndpoint.openAI, agentId: 'agent-pi' },
+      }),
+    );
+    expect(usageHandler).toHaveBeenCalledWith(UsageEvents.ON_TOKEN_USAGE, usage, expect.anything());
+    expect(client.executionOutcome).toEqual({ engine: 'pi', status: 'completed' });
+    expect(client.run).toBeUndefined();
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('checks the exact formatted model input before starting Pi', async () => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const privateInput = 'PRIVATE-PI-HISTORY';
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage(privateInput)],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+    const client = createPiClient({
+      req: {
+        config: {
+          endpoints: { [EModelEndpoint.agents]: {} },
+          filters: {
+            messages: {
+              pii: {
+                fields: ['text'],
+                starterPatterns: [],
+                customPatterns: [
+                  { id: 'pi-history', label: 'private history', regex: privateInput },
+                ],
+              },
+            },
+          },
+        },
+      },
+    });
+
+    await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
+      code: 'content_filter_block',
+    });
+
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('commits private text admission before dispatching Pi', async () => {
+    const api = require('@librechat/api');
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const filters = {
+      messages: {
+        pii: {
+          action: 'redact',
+          fields: ['text'],
+          starterPatterns: [],
+          customPatterns: [
+            { id: 'email', label: 'Email', regex: 'alice@example\\.com', category: 'email' },
+          ],
+        },
+      },
+    };
+    const req = {
+      path: '/api/agents/chat',
+      user: { id: 'user-pi' },
+      body: { text: 'Remember alice@example.com', clientRequestId: 'pi-private-text' },
+      config: { endpoints: { [EModelEndpoint.agents]: {} }, filters },
+    };
+    api.createPrivateTextIngress({
+      getFilters: () => filters,
+      getLegacyPii: () => undefined,
+      getKey: () => 'ab'.repeat(32),
+    })(req, { status: jest.fn().mockReturnThis(), json: jest.fn() }, jest.fn());
+    const privateMessage = api.stampPrivateTextMessage(req, {
+      messageId: 'user-message-pi',
+      conversationId: 'conversation-pi',
+      isCreatedByUser: true,
+      text: req.body.text,
+    });
+    const saved = { message: privateMessage };
+    let persistenceStarted = false;
+    const startPersistence = jest.fn().mockImplementation(async () => {
+      persistenceStarted = true;
+      return saved;
+    });
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage(req.body.text)],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+    const client = createPiClient({ req });
+    client.modelBoundUserMessagePersistence = {
+      start: startPersistence,
+      cancel: jest.fn(),
+      isPending: () => !persistenceStarted,
+      promise: Promise.resolve(saved),
+    };
+    client.privateTextStart = jest.fn();
+
+    await client.chatCompletion({ payload: [] });
+    await expect(api.requirePrivateTextAdmission(req)).resolves.toBeUndefined();
+
+    expect(startPersistence).toHaveBeenCalledTimes(1);
+    expect(client.privateTextStart).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 });
 

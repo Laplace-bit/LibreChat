@@ -266,6 +266,9 @@ jest.mock('@librechat/api', () => ({
   assertLegacyRuntimeCompatibleGraph: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).assertLegacyRuntimeCompatibleGraph,
+  assertAgentRuntimeCompatibleGraph: jest.requireActual(
+    '../../../../../packages/api/src/agents/runtime/selection',
+  ).assertAgentRuntimeCompatibleGraph,
   getPreliminaryResponseMessageId: jest.requireActual(
     '../../../../../packages/api/src/utils/message',
   ).getPreliminaryResponseMessageId,
@@ -1040,9 +1043,21 @@ describe('ResumableAgentController resume metadata', () => {
     expect(mockStartupTelemetry.end).toHaveBeenCalledWith('error', expect.any(Error));
   });
 
-  it('fails closed for a Pi canary before creating a generation or entering the legacy engine', async () => {
+  it('pins an allowlisted Pi canary on its generation before runtime initialization', async () => {
     const conversationId = 'conversation-123';
-    const initializeClient = jest.fn();
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop before Pi dispatch'));
+    mockGenerationJobManager.createJob.mockResolvedValueOnce({
+      createdAt: 1000,
+      metadata: {
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        checkpointNamespace: '1000',
+        providerExecutionId: 'provider-segment-1',
+        providerDrained: true,
+      },
+      readyPromise: Promise.resolve(),
+      abortController: new AbortController(),
+      emitter: { on: jest.fn() },
+    });
     const req = {
       user: { id: 'user-123' },
       body: {
@@ -1066,16 +1081,26 @@ describe('ResumableAgentController resume metadata', () => {
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
 
-    expect(res.status).toHaveBeenCalledWith(503);
-    expect(res.json).toHaveBeenCalledWith(
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
+      conversationId,
+      'user-123',
+      conversationId,
       expect.objectContaining({
-        code: 'AGENT_RUNTIME_UNAVAILABLE',
-        error: 'The selected agent runtime is not available on this server.',
+        initialMetadata: expect.objectContaining({
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        }),
       }),
     );
-    expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
-    expect(initializeClient).not.toHaveBeenCalled();
-    expect(mockDecrementPendingRequest).toHaveBeenCalledWith('user-123');
+    expect(initializeClient).toHaveBeenCalledWith(
+      expect.objectContaining({ agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } }),
+    );
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+      conversationId,
+      expect.stringContaining('stop before Pi dispatch'),
+      1000,
+      expect.any(Object),
+    );
   });
 
   it('fails closed when a legacy agent graph contains a Pi-pinned connected agent', async () => {

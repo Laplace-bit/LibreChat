@@ -2,6 +2,7 @@ import { StepEvents } from 'librechat-data-provider';
 import type { StandardGraph } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type { ServerSentEvent } from '~/types';
+import { LEGACY_AGENT_RUNTIME, PINNED_PI_AGENT_RUNTIME } from '~/agents/runtime/selection';
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
@@ -83,6 +84,72 @@ describe('GenerationJobManager resume replay events', () => {
       responseMessageId: 'edited-response',
       isRegenerate: true,
     });
+  });
+
+  test('keeps the generation-pinned runtime identity on created and recovered jobs', async () => {
+    manager = createInMemoryManager();
+    const streamId = `runtime-resume-${Date.now()}`;
+    const created = await manager.createJob(streamId, 'user-1', streamId, {
+      initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+    });
+
+    expect(created.metadata.agentRuntime).toEqual(PINNED_PI_AGENT_RUNTIME);
+    expect(Reflect.set(created.metadata, 'agentRuntime', LEGACY_AGENT_RUNTIME)).toBe(false);
+    expect(Reflect.deleteProperty(created.metadata, 'agentRuntime')).toBe(false);
+    await expect(manager.getJob(streamId)).resolves.toMatchObject({
+      metadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+    });
+  });
+
+  test('pins new jobs to legacy when no server runtime choice is supplied', async () => {
+    manager = createInMemoryManager();
+    const streamId = `runtime-default-${Date.now()}`;
+    const created = await manager.createJob(streamId, 'user-1', streamId);
+
+    expect(created.metadata.agentRuntime).toEqual(LEGACY_AGENT_RUNTIME);
+  });
+
+  test('rejects changing the runtime identity after a generation is created', async () => {
+    manager = createInMemoryManager();
+    const streamId = `runtime-immutable-${Date.now()}`;
+    const created = await manager.createJob(streamId, 'user-1', streamId, {
+      initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+    });
+
+    await expect(
+      manager.updateMetadata(streamId, { agentRuntime: LEGACY_AGENT_RUNTIME }, created.createdAt),
+    ).rejects.toThrow('Generation runtime identity is immutable');
+    await expect(manager.getJob(streamId)).resolves.toMatchObject({
+      metadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+    });
+  });
+
+  test('protects the in-memory job record from direct runtime identity mutation', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+    try {
+      const streamId = `runtime-store-immutable-${Date.now()}`;
+      const created = await store.createJob(streamId, 'user-1', streamId, undefined, {
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
+      });
+
+      expect(Reflect.set(created, 'agentRuntime', LEGACY_AGENT_RUNTIME)).toBe(false);
+      expect(Reflect.deleteProperty(created, 'agentRuntime')).toBe(false);
+      await expect(
+        store.updateJob(streamId, { agentRuntime: LEGACY_AGENT_RUNTIME } as never),
+      ).rejects.toThrow('Generation runtime identity is immutable');
+      await expect(
+        store.transitionStatus(streamId, {
+          from: 'running',
+          to: 'complete',
+          patch: { agentRuntime: LEGACY_AGENT_RUNTIME },
+        } as never),
+      ).rejects.toThrow('Generation runtime identity is immutable');
+      await expect(store.getJob(streamId)).resolves.toMatchObject({
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
+      });
+    } finally {
+      await store.destroy();
+    }
   });
 
   test('replays bounded first-fragment and dispatch evidence without tool arguments', async () => {

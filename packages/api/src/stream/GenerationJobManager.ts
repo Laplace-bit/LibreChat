@@ -21,6 +21,7 @@ import type {
 import type { StandardGraph } from '@librechat/agents';
 import type {
   SerializableJobData,
+  MutableJobDataPatch,
   GenerationSettlementState,
   CreatedJobData,
   IEventTransport,
@@ -99,6 +100,11 @@ import { markAbortedCompactionContent } from '~/agents/compaction';
 import { ApprovalLifecycle, pausePersistenceActionId } from './ApprovalLifecycle';
 import { projectPendingMCPOAuthPrompts } from '~/mcp/oauth/resume';
 import { sanitizeJobMetadata } from './metadata';
+import {
+  assertRuntimeIdentityImmutable,
+  freezeStoredAgentRuntimeIdentity,
+  LEGACY_AGENT_RUNTIME,
+} from '~/agents/runtime/selection';
 
 /** Terminal error surfaced to a client still attached when its approval window lapses. */
 const APPROVAL_EXPIRED_ERROR = 'Approval expired before a decision was made';
@@ -2586,7 +2592,14 @@ class GenerationJobManagerClass {
     const tenantId = getTenantId();
     const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
     const creationAttemptId = randomUUID();
-    const sanitizedMetadata = sanitizeJobMetadata(options.initialMetadata ?? {});
+    const initialMetadataInput = options.initialMetadata ?? {};
+    const sanitizedMetadata = sanitizeJobMetadata({
+      ...initialMetadataInput,
+      agentRuntime:
+        initialMetadataInput.agentRuntime === undefined
+          ? LEGACY_AGENT_RUNTIME
+          : initialMetadataInput.agentRuntime,
+    });
     /** Translate the transient capability assertion into its execution-bound
      * marker: valid only while `providerExecutionId` still names this owner,
      * so a legacy replica winning a later HITL resume (which rewrites the
@@ -3112,7 +3125,7 @@ class GenerationJobManagerClass {
       },
     };
 
-    return {
+    const job: t.GenerationJob = {
       streamId,
       emitter: emitterProxy as unknown as t.GenerationJob['emitter'],
       status: jobData.status as t.GenerationJobStatus,
@@ -3141,6 +3154,7 @@ class GenerationJobManagerClass {
         // Surface the originating agent so the resume route can refuse to rebuild a
         // paused run on a different agent.
         agent_id: jobData.agent_id,
+        agentRuntime: jobData.agentRuntime,
         // Surface whether the turn was temporary so a resume keeps it non-persisted.
         isTemporary: jobData.isTemporary,
         retentionExpiresAt: jobData.retentionExpiresAt,
@@ -3192,6 +3206,13 @@ class GenerationJobManagerClass {
       finalEvent: runtime.finalEvent,
       syncSent: runtime.syncSent,
     };
+    Object.defineProperty(job.metadata, 'agentRuntime', {
+      value: freezeStoredAgentRuntimeIdentity(job.metadata.agentRuntime),
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
+    return job;
   }
 
   /**
@@ -4142,7 +4163,7 @@ class GenerationJobManagerClass {
           ...(failedPauseBarrierId != null
             ? ['terminalPersistencePending', 'terminalPersistenceStartedAt']
             : []),
-        ] as (keyof SerializableJobData)[],
+        ] as (Exclude<keyof SerializableJobData, 'agentRuntime'> & string)[],
       }),
     });
     if (drainedSteers == null) {
@@ -8204,9 +8225,11 @@ class GenerationJobManagerClass {
     metadata: Partial<t.GenerationJobMetadata>,
     expectedCreatedAt?: number,
   ): Promise<void> {
+    assertRuntimeIdentityImmutable(metadata);
     const generationId = expectedCreatedAt ?? this.runtimeState.get(streamId)?.createdAt;
-    const updates: Partial<SerializableJobData> = {
-      ...sanitizeJobMetadata(metadata),
+    const { agentRuntime: _agentRuntime, ...sanitizedMetadata } = sanitizeJobMetadata(metadata);
+    const updates: MutableJobDataPatch = {
+      ...sanitizedMetadata,
       ...(metadata.userSubmittedPaths && {
         userSubmittedPaths: metadata.userSubmittedPaths,
       }),

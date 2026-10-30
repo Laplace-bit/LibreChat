@@ -18,6 +18,7 @@ import type {
   IJobStoreV2,
   JobStatus,
   JobMetadataPatch,
+  MutableJobDataPatch,
   JobStatusTransition,
   IdempotencyClaimValue,
   IdempotencyClaimResult,
@@ -45,6 +46,10 @@ import {
   recoveredSteerPayloadMatches,
   RecoveredSteerPayloadMismatchError,
 } from '~/stream/SteerRecovery';
+import {
+  assertRuntimeIdentityImmutable,
+  resolveStoredAgentRuntime,
+} from '~/agents/runtime/selection';
 import { retainedScheduleReceipt } from '~/stream/internal/scheduleReceipts';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { retainScheduleMCPFailure } from '../scheduleFailure';
@@ -321,6 +326,11 @@ export class InMemoryJobStore implements IJobStoreV2 {
     }
     const safeInitialMetadata = { ...initialMetadata };
     delete safeInitialMetadata.providerDrained;
+    const runtime = resolveStoredAgentRuntime(safeInitialMetadata.agentRuntime);
+    if (runtime.status === 'unsupported') {
+      throw new Error('Invalid generation runtime identity');
+    }
+    safeInitialMetadata.agentRuntime = runtime.selection;
     const assertOwnerCompatible = (): void => {
       const existingJob = this.jobs.get(streamId);
       if (
@@ -564,6 +574,12 @@ export class InMemoryJobStore implements IJobStoreV2 {
       ...(providerExecutionId != null && { providerDrained: true }),
       syncSent: false,
     };
+    Object.defineProperty(job, 'agentRuntime', {
+      value: runtime.selection,
+      enumerable: true,
+      configurable: false,
+      writable: false,
+    });
     if (creationAttemptId != null) {
       Object.defineProperty(job, 'creationAttemptId', {
         value: creationAttemptId,
@@ -712,9 +728,10 @@ export class InMemoryJobStore implements IJobStoreV2 {
 
   async updateJob(
     streamId: string,
-    updates: Partial<SerializableJobData>,
+    updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
   ): Promise<void> {
+    assertRuntimeIdentityImmutable(updates);
     const job = this.jobs.get(streamId);
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
       return;
@@ -814,6 +831,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
    * sets to reconcile here.
    */
   async transitionStatus(streamId: string, args: JobStatusTransition): Promise<boolean> {
+    assertRuntimeIdentityImmutable(args.patch, args.clear);
     const job = this.jobs.get(streamId);
     if (!job || job.status !== args.from) {
       return false;

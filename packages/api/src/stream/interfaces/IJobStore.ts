@@ -14,6 +14,7 @@ import type { AgentEventDetachedTerminalEvidence } from '~/agents/triggers/types
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
+import type { AgentRuntimeSelection } from '~/agents/runtime/selection';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
@@ -335,6 +336,9 @@ export interface SerializableJobData {
    */
   agent_id?: string;
 
+  /** Untrusted persisted engine identity; absent on legacy jobs means legacy. */
+  agentRuntime?: unknown;
+
   /**
    * Whether the originating turn was a temporary (non-persisted) chat. Persisted so
    * a HITL resume keeps the resumed response temporary instead of saving it — the
@@ -531,7 +535,13 @@ export type JobMetadataPatch = Partial<
     | 'generationProtocolVersion'
     | 'resolvedAskUserQuestions'
   >
->;
+> & {
+  /** New writes must use a known server-selected engine identity. */
+  agentRuntime?: AgentRuntimeSelection;
+};
+
+/** Mutable metadata after job creation; runtime identity is generation-immutable. */
+export type MutableJobDataPatch = Partial<Omit<SerializableJobData, 'agentRuntime'>>;
 
 /**
  * Whether a job's pending review has passed its `expiresAt`. Shared by the
@@ -702,9 +712,9 @@ export interface JobStatusTransition {
   /** Status to move to when the `from` guard holds. */
   to: JobStatus;
   /** Fields written in the same atomic step as the status change. */
-  patch?: Partial<SerializableJobData>;
+  patch?: MutableJobDataPatch;
   /** Field names removed in the same atomic step (e.g. `pendingAction`). */
-  clear?: Array<keyof SerializableJobData & string>;
+  clear?: Array<Exclude<keyof SerializableJobData, 'agentRuntime'> & string>;
   /**
    * Additional guard: only fire if the job's `pendingActionId` equals this.
    * Checked atomically alongside the `from` status so a stale decision can't
@@ -982,7 +992,7 @@ export interface IJobStore {
   getJob(streamId: string): Promise<SerializableJobData | null>;
   updateJob(
     streamId: string,
-    updates: Partial<SerializableJobData>,
+    updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
   ): Promise<void>;
   transitionStatus(streamId: string, args: JobStatusTransition): Promise<boolean>;
@@ -1145,7 +1155,7 @@ export interface IJobStoreV2 extends IJobStore {
    */
   updateJob(
     streamId: string,
-    updates: Partial<SerializableJobData>,
+    updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
   ): Promise<void>;
 

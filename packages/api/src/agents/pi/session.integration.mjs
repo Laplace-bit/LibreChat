@@ -18,6 +18,10 @@ const {
   convertLibreChatHistoryToPi,
   createHostPiSession,
   createPiContentEventTranslator,
+  LEGACY_AGENT_RUNTIME,
+  PINNED_PI_AGENT_RUNTIME,
+  resolveResumableAgentRuntime,
+  resolveStoredAgentRuntime,
 } = require('../../../dist/index.cjs');
 const tinyPngBase64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWPgEpH7DwABpAE8sdwFIwAAAABJRU5ErkJggg==';
@@ -433,6 +437,36 @@ test('LibreChat history conversion rejects incomplete tool state, signatures, an
       }),
     { code: 'unsupported_content' },
   );
+});
+
+test('generation runtime identity defaults old jobs to legacy and rejects unknown Pi versions', () => {
+  assert.deepEqual(resolveStoredAgentRuntime(undefined), {
+    status: 'resolved',
+    selection: LEGACY_AGENT_RUNTIME,
+  });
+  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'legacy' }), {
+    status: 'resolved',
+    selection: LEGACY_AGENT_RUNTIME,
+  });
+  assert.deepEqual(resolveStoredAgentRuntime(PINNED_PI_AGENT_RUNTIME), {
+    status: 'resolved',
+    selection: PINNED_PI_AGENT_RUNTIME,
+  });
+  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'pi', sdkVersion: '99.0.0' }), {
+    status: 'unsupported',
+  });
+  assert.deepEqual(resolveStoredAgentRuntime(null), { status: 'unsupported' });
+  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'legacy', sdkVersion: 'future' }), {
+    status: 'unsupported',
+  });
+  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'other' }), { status: 'unsupported' });
+  assert.deepEqual(resolveResumableAgentRuntime(undefined), {
+    status: 'available',
+    selection: LEGACY_AGENT_RUNTIME,
+  });
+  assert.deepEqual(resolveResumableAgentRuntime(PINNED_PI_AGENT_RUNTIME), {
+    status: 'unavailable',
+  });
 });
 
 test('Pi content events close an interrupted host step as cancelled', () => {

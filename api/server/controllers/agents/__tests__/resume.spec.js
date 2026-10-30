@@ -2665,6 +2665,26 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['Pi runtime', { engine: 'pi', sdkVersion: '1.4.0' }],
+      ['unknown runtime version', { engine: 'pi', sdkVersion: '99.0.0' }],
+      ['corrupt runtime identity', null],
+    ])('503 before claiming an approval for a paused job with %s', async (_label, agentRuntime) => {
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makeToolApprovalJob({ metadata: { agentRuntime } }),
+      );
+
+      const res = await post(approveBody());
+
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+      expect(mockCheckAndIncrementPendingRequest).not.toHaveBeenCalled();
+      expect(mockClaimScheduleResume).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
+    });
+
     it('409 when the job is not in requires_action (already terminal; no expire)', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob({ status: 'running' }));
       const res = await post(approveBody());

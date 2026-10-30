@@ -1,4 +1,17 @@
+import { LEGACY_AGENT_RUNTIME, PINNED_PI_AGENT_RUNTIME } from '~/agents/runtime/selection';
 import { sanitizeJobMetadata } from './metadata';
+
+it('accepts only known server-selected runtime identities for durable writes', () => {
+  expect(sanitizeJobMetadata({ agentRuntime: LEGACY_AGENT_RUNTIME }).agentRuntime).toEqual(
+    LEGACY_AGENT_RUNTIME,
+  );
+  expect(sanitizeJobMetadata({ agentRuntime: PINNED_PI_AGENT_RUNTIME }).agentRuntime).toEqual(
+    PINNED_PI_AGENT_RUNTIME,
+  );
+  expect(() => sanitizeJobMetadata({ agentRuntime: null })).toThrow(
+    'Invalid generation runtime identity',
+  );
+});
 
 const failure = {
   server: '',

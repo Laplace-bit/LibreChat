@@ -256,6 +256,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  LEGACY_AGENT_RUNTIME: jest.requireActual('@librechat/api').LEGACY_AGENT_RUNTIME,
   getPreliminaryResponseMessageId: jest.requireActual(
     '../../../../../packages/api/src/utils/message',
   ).getPreliminaryResponseMessageId,
@@ -972,6 +973,10 @@ describe('ResumableAgentController resume metadata', () => {
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
 
+    expect(
+      mockGenerationJobManager.createJob.mock.calls[0][3].initialMetadata.agentRuntime,
+    ).toEqual({ engine: 'legacy' });
+
     expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
       conversationId,
       'user-123',
@@ -979,6 +984,7 @@ describe('ResumableAgentController resume metadata', () => {
       {
         startupTelemetry: mockStartupTelemetry,
         initialMetadata: {
+          agentRuntime: { engine: 'legacy' },
           conversationId,
           generationProtocolVersion: 1,
           endpoint: 'agents',

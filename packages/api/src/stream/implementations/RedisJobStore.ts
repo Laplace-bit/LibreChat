@@ -20,6 +20,7 @@ import type {
   IJobStoreV2,
   JobStatus,
   JobMetadataPatch,
+  MutableJobDataPatch,
   JobStatusTransition,
   IdempotencyClaimValue,
   IdempotencyClaimResult,
@@ -62,12 +63,26 @@ import {
 import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuation';
 import { instrumentIORedisClient, RedisUseCases } from '~/cache/redisTelemetry';
 import { RecoveredSteerPayloadMismatchError } from '~/stream/SteerRecovery';
+import { assertRuntimeIdentityImmutable } from '~/agents/runtime/selection';
 import { SCHEDULE_MCP_FAILURE_PATCH_LUA } from '../scheduleFailure';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { createToolTimingTracker } from '~/agents/toolTiming';
 import { evalScript } from '~/cache/redisScript';
 
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+
+function parseStoredRuntimeIdentity(value: string | undefined): unknown {
+  if (value === undefined) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    // Keep malformed persisted identity visible to the runtime boundary, where it
+    // fails closed. Treating it as absent would silently select the legacy engine.
+    return value;
+  }
+}
 
 /** Each retention re-arm requires new publication, even at the same generation epoch. */
 const SCHEDULE_MEMBERSHIP_INVALIDATE_LUA =
@@ -2414,9 +2429,10 @@ export class RedisJobStore implements IJobStoreV2 {
 
   async updateJob(
     streamId: string,
-    updates: Partial<SerializableJobData>,
+    updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
   ): Promise<void> {
+    assertRuntimeIdentityImmutable(updates);
     const key = KEYS.job(streamId);
     const requestedTerminal =
       updates.status != null && ['complete', 'error', 'aborted'].includes(updates.status);
@@ -2442,7 +2458,7 @@ export class RedisJobStore implements IJobStoreV2 {
     // (running ⇄ requires_action — sets, TTLs, the actionId guard) go solely
     // through transitionStatus. The optional epoch guard keeps late metadata
     // and terminal-event persistence from mutating a same-stream replacement.
-    const serialized = this.serializeJob(updates as SerializableJobData);
+    const serialized = this.serializeJob(updates);
     if (Object.keys(serialized).length === 0) {
       return;
     }
@@ -3006,6 +3022,7 @@ export class RedisJobStore implements IJobStoreV2 {
     args: JobStatusTransition,
     returnDrainedSteers: boolean,
   ): Promise<true | SteerQueueItem[] | null> {
+    assertRuntimeIdentityImmutable(args.patch, args.clear);
     const { from, to, patch, clear, expectActionId, expectCreatedAt, notAfterMs } = args;
     const key = KEYS.job(streamId);
     const terminal = this.statusSetKey(to) === null;
@@ -5672,6 +5689,7 @@ export class RedisJobStore implements IJobStoreV2 {
       model: data.model || undefined,
       promptTokens: data.promptTokens ? parseInt(data.promptTokens, 10) : undefined,
       agent_id: data.agent_id || undefined,
+      agentRuntime: parseStoredRuntimeIdentity(data.agentRuntime),
       isTemporary: data.isTemporary != null ? data.isTemporary === '1' : undefined,
       retentionExpiresAt: data.retentionExpiresAt || undefined,
       agentEventDeliveryKey: data.agentEventDeliveryKey || undefined,

@@ -5,6 +5,7 @@ import {
 import type { JobMetadataPatch } from './interfaces/IJobStore';
 import type { GenerationJobMetadata } from '~/types';
 import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuation';
+import { resolveStoredAgentRuntime } from '~/agents/runtime/selection';
 
 export function sanitizeJobMetadata(metadata: Partial<GenerationJobMetadata>): JobMetadataPatch {
   const patch: JobMetadataPatch = {};
@@ -40,6 +41,13 @@ export function sanitizeJobMetadata(metadata: Partial<GenerationJobMetadata>): J
   }
   if (metadata.agent_id) {
     patch.agent_id = metadata.agent_id;
+  }
+  if (metadata.agentRuntime !== undefined) {
+    const runtime = resolveStoredAgentRuntime(metadata.agentRuntime);
+    if (runtime.status === 'unsupported') {
+      throw new Error('Invalid generation runtime identity');
+    }
+    patch.agentRuntime = runtime.selection;
   }
   if (metadata.isTemporary !== undefined) {
     patch.isTemporary = metadata.isTemporary;

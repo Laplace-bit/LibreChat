@@ -11,6 +11,7 @@ const {
 const {
   checkAccess,
   GenerationJobManager,
+  resolveResumableAgentRuntime,
   GENERATION_RECOVERY_FAILED_ERROR,
   isPendingActionStale,
   resolveToolApprovalResume,
@@ -815,6 +816,22 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   generationProtocolVersion = negotiateExistingGenerationProtocol(req, job);
   if (generationCreatedAt != null && job.createdAt !== generationCreatedAt) {
     return sendGenerationJson(res, 409, { code: 'RUN_REPLACED' }, generationProtocolVersion);
+  }
+
+  // A resumed generation uses the engine recorded when it first started. Old jobs
+  // without this field are legacy. Unknown or not-yet-resumable engines fail before
+  // the approval, schedule slot, or running state can be claimed.
+  const runtimeResolution = resolveResumableAgentRuntime(job.metadata?.agentRuntime);
+  if (runtimeResolution.status === 'unavailable') {
+    return sendGenerationJson(
+      res,
+      503,
+      {
+        code: 'AGENT_RUNTIME_UNAVAILABLE',
+        error: 'The runtime pinned to this generation is unavailable for resume.',
+      },
+      generationProtocolVersion,
+    );
   }
 
   // The resume must rebuild the SAME agent/endpoint that paused. Require an EXACT

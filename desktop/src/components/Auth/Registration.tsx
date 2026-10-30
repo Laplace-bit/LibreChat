@@ -153,7 +153,7 @@ const Registration: React.FC = () => {
         <>
           <form
             className="mt-6"
-            aria-label="Registration form"
+            aria-label={localize('com_auth_registration_form')}
             method="POST"
             onSubmit={handleSubmit((data: TRegisterUser) =>
               registerUser.mutate({ ...data, token: token ?? undefined }),
@@ -234,7 +234,7 @@ const Registration: React.FC = () => {
                   (requireCaptcha && !turnstileToken)
                 }
                 type="submit"
-                aria-label="Submit registration"
+                aria-label={localize('com_auth_submit_registration')}
                 variant="submit"
                 shape="soft"
                 size="auth"
@@ -253,7 +253,7 @@ const Registration: React.FC = () => {
             {localize('com_auth_already_have_account')}{' '}
             <Link
               to={loginPage()}
-              aria-label="Login"
+              aria-label={localize('com_auth_login')}
               className="text-accent-primary hover:text-accent-primary-hover inline-flex p-1 text-sm font-medium transition-colors"
             >
               {localize('com_auth_login')}

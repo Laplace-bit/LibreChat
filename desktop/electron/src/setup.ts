@@ -42,7 +42,7 @@ const englishCopy: SetupCopy = {
 };
 
 const simplifiedChineseCopy: SetupCopy = {
-  language: navigator.language,
+  language: 'zh-Hans',
   pageTitle: '连接服务器 · Agent Platform',
   heading: '连接到你的服务器',
   description: '将此桌面应用连接到组织的 LibreChat 服务器。账户和 AI 服务仍由该服务器管理。',

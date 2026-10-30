@@ -73,6 +73,10 @@ app.setAboutPanelOptions({
   version: app.getVersion(),
 });
 
+function shellMessage(english: string, simplifiedChinese: string): string {
+  return app.getLocale().toLowerCase().startsWith('zh') ? simplifiedChinese : english;
+}
+
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   app.quit();
@@ -187,9 +191,13 @@ async function serveSetupPage(): Promise<Response> {
   try {
     return await serveLocalFile(SETUP_FILE, 'GET');
   } catch {
-    return new Response('Desktop setup page is missing. Rebuild the Electron client.', {
-      status: 500,
-    });
+    return new Response(
+      shellMessage(
+        'Desktop setup page is missing. Rebuild the Electron client.',
+        '桌面连接页面缺失，请重新构建 Electron 客户端。',
+      ),
+      { status: 500 },
+    );
   }
 }
 
@@ -242,9 +250,13 @@ async function serveRenderer(request: Request, url: URL): Promise<Response> {
       return await net.fetch(devUrl.href, { method: request.method, redirect: 'manual' });
     } catch (error) {
       console.error('[desktop] Vite renderer request failed:', devUrl.pathname, error);
-      return new Response('The desktop renderer is not reachable. Start the Vite dev server.', {
-        status: 502,
-      });
+      return new Response(
+        shellMessage(
+          'The desktop renderer is not reachable. Start the Vite dev server.',
+          '无法连接桌面界面。请启动 Vite 开发服务器。',
+        ),
+        { status: 502 },
+      );
     }
   }
 
@@ -269,7 +281,7 @@ async function serveRenderer(request: Request, url: URL): Promise<Response> {
   if (isHtmlNavigation(request)) {
     return serveLocalFile(path.join(RENDERER_ROOT, 'index.html'), request.method);
   }
-  return new Response('Not found', { status: 404 });
+  return new Response(shellMessage('Not found', '未找到请求的内容。'), { status: 404 });
 }
 
 function copyResponseHeaders(response: Response, stripRemoteCookieDomain: boolean): Headers {
@@ -320,7 +332,7 @@ function describeRequestError(error: unknown): { name: string; code?: string; me
           .replace(/(password|token|authorization|cookie)\s*[:=]\s*[^\s,]+/gi, '$1=[redacted]')
           .replace(/[\r\n\t]+/g, ' ')
           .slice(0, 160)
-      : 'Unknown request error';
+      : shellMessage('Unknown request error', '未知的请求错误。');
   return { name, code, message };
 }
 
@@ -353,7 +365,9 @@ async function proxyServerRequest(
   const fetchSite = headers.get('sec-fetch-site');
   const isAppOriginRequest = origin === APP_ORIGIN;
   if (isAppOriginRequest && fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
-    return new Response('Cross-site requests are not allowed.', { status: 403 });
+    return new Response(shellMessage('Cross-site requests are not allowed.', '不允许跨站请求。'), {
+      status: 403,
+    });
   }
   if (
     !isAppOriginRequest &&
@@ -362,7 +376,9 @@ async function proxyServerRequest(
     request.method !== 'HEAD' &&
     requestUrl.pathname.startsWith('/api/')
   ) {
-    return new Response('Cross-site requests are not allowed.', { status: 403 });
+    return new Response(shellMessage('Cross-site requests are not allowed.', '不允许跨站请求。'), {
+      status: 403,
+    });
   }
   if (isAppOriginRequest) {
     // The custom app origin is the only renderer origin. Map its verified same-origin requests to
@@ -434,7 +450,10 @@ async function proxyServerRequest(
     });
   } catch (error: unknown) {
     console.error('[desktop] Server request failed.', { phase, ...describeRequestError(error) });
-    return new Response('The configured server could not be reached.', { status: 502 });
+    return new Response(
+      shellMessage('The configured server could not be reached.', '无法连接到已配置的服务器。'),
+      { status: 502 },
+    );
   }
 }
 
@@ -443,10 +462,10 @@ async function handleAppRequest(request: Request): Promise<Response> {
   try {
     url = new URL(request.url);
   } catch {
-    return new Response('Invalid app URL', { status: 400 });
+    return new Response(shellMessage('Invalid app URL', '应用 URL 无效。'), { status: 400 });
   }
   if (url.protocol !== `${APP_SCHEME}:` || url.hostname !== APP_HOST) {
-    return new Response('Not found', { status: 404 });
+    return new Response(shellMessage('Not found', '未找到请求的内容。'), { status: 404 });
   }
 
   if (
@@ -462,7 +481,13 @@ async function handleAppRequest(request: Request): Promise<Response> {
 
   if (isServerRoute(url.pathname)) {
     if (!connection) {
-      return new Response('Connect this desktop app to a server first.', { status: 503 });
+      return new Response(
+        shellMessage(
+          'Connect this desktop app to a server first.',
+          '请先将此桌面应用连接到服务器。',
+        ),
+        { status: 503 },
+      );
     }
     return proxyServerRequest(request, url, connection);
   }

@@ -138,7 +138,7 @@ const PresetsMenu: FC = () => {
             </div>
             <div className="flex justify-end gap-4 pt-4">
               <Button
-                aria-label="cancel"
+                aria-label={localize('com_ui_cancel')}
                 variant="outline"
                 onClick={() => handleDeleteDialogChange(false)}
               >

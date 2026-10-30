@@ -108,7 +108,7 @@ export function DeleteConversationDialog({
       </div>
       <div className="flex justify-end gap-4 pt-4">
         <OGDialogClose asChild>
-          <Button aria-label="cancel" variant="outline">
+          <Button aria-label={localize('com_ui_cancel')} variant="outline">
             {localize('com_ui_cancel')}
           </Button>
         </OGDialogClose>

@@ -41,7 +41,7 @@ function Examples({ readonly, examples, setExample, addExample, removeExample }:
                   disabled={readonly}
                   value={example.input.content || ''}
                   onChange={(e) => setExample(idx, 'input', e.target.value ?? null)}
-                  placeholder="Set example input. Example is ignored if empty."
+                  placeholder={localize('com_endpoint_config_example_input')}
                   className={cn(
                     defaultTextProps,
                     'flex max-h-[8.625rem] min-h-[4.6875rem] w-full resize-none px-3 py-2',
@@ -68,7 +68,7 @@ function Examples({ readonly, examples, setExample, addExample, removeExample }:
                   disabled={readonly}
                   value={example.output.content || ''}
                   onChange={(e) => setExample(idx, 'output', e.target.value ?? null)}
-                  placeholder={'Set example output. Example is ignored if empty.'}
+                  placeholder={localize('com_endpoint_config_example_output')}
                   className={cn(
                     defaultTextProps,
                     'flex max-h-[18.75rem] min-h-[4.6875rem] w-full resize-none px-3 py-2',

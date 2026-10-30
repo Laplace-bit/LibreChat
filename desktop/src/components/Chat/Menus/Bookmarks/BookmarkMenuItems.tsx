@@ -34,7 +34,9 @@ export const BookmarkMenuItems: FC<{
               data-testid="bookmark-item-new"
               handleSubmit={handleToggleOpen}
               selected={false}
-              icon={<BookmarkPlusIcon className="size-4" aria-label="Add Bookmark" />}
+              icon={
+                <BookmarkPlusIcon className="size-4" aria-label={localize('com_ui_add_bookmark')} />
+              }
             />
           </OGDialogTrigger>
         </BookmarkEditDialog>

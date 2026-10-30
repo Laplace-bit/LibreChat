@@ -56,7 +56,7 @@ function ResetPassword() {
   return (
     <form
       className="mt-6"
-      aria-label="Password reset form"
+      aria-label={localize('com_auth_password_reset_form')}
       method="POST"
       onSubmit={handleSubmit(onSubmit)}
     >

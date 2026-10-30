@@ -979,7 +979,7 @@ export default function AgentPanel() {
       <form
         onSubmit={handleSubmit(onSubmit)}
         className="flex flex-1 scrollbar-gutter-stable flex-col px-3 pt-2 pb-3"
-        aria-label="Agent configuration form"
+        aria-label={localize('com_ui_agent_configuration_form')}
       >
         <div className="flex-1">
           <div className="flex w-full flex-wrap gap-2">

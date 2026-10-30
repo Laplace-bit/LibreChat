@@ -89,7 +89,7 @@ const BackupCodesItem: React.FC = () => {
           <Label className="font-light">{localize('com_ui_backup_codes')}</Label>
         </div>
         <OGDialogTrigger asChild>
-          <Button aria-label="Manage Backup Codes" variant="outline">
+          <Button aria-label={localize('com_ui_manage_backup_codes')} variant="outline">
             {localize('com_ui_manage')}
           </Button>
         </OGDialogTrigger>

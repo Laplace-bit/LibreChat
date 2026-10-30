@@ -27,7 +27,7 @@ const PluginPagination: React.FC<TPluginPaginationProps> = ({
       <div
         role="button"
         tabIndex={0}
-        aria-label="Previous page"
+        aria-label={localize('com_ui_previous_page')}
         onClick={() => handlePageChange(currentPage - 1)}
         onKeyDown={(e) => {
           if (e.key === 'Enter' || e.key === ' ') {
@@ -78,7 +78,7 @@ const PluginPagination: React.FC<TPluginPaginationProps> = ({
       ))}
       <div
         role="button"
-        aria-label="Next page"
+        aria-label={localize('com_ui_next_page')}
         tabIndex={0}
         onClick={() => handlePageChange(currentPage + 1)}
         onKeyDown={(e) => {

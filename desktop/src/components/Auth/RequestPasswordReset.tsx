@@ -78,7 +78,7 @@ function RequestPasswordReset() {
   return (
     <form
       className="mt-8 space-y-6"
-      aria-label="Password reset form"
+      aria-label={localize('com_auth_password_reset_form')}
       method="POST"
       onSubmit={handleSubmit(onSubmit)}
     >
@@ -124,7 +124,7 @@ function RequestPasswordReset() {
       </div>
       <div className="space-y-4">
         <Button
-          aria-label="Continue with password reset"
+          aria-label={localize('com_auth_continue')}
           type="submit"
           disabled={!!errors.email || isLoading}
           variant="submit"

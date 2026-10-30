@@ -1,5 +1,6 @@
 import { EModelEndpoint } from 'librechat-data-provider';
 import { useFormContext, Controller } from 'react-hook-form';
+import { useLocalize } from '~/hooks';
 import InputWithLabel from './InputWithLabel';
 
 const OpenAIConfig = ({
@@ -9,6 +10,7 @@ const OpenAIConfig = ({
   endpoint: EModelEndpoint | string;
   userProvideURL?: boolean | null;
 }) => {
+  const localize = useLocalize();
   const { control } = useFormContext();
   const isAzure = endpoint === EModelEndpoint.azureOpenAI;
   return (
@@ -21,7 +23,7 @@ const OpenAIConfig = ({
             <InputWithLabel
               id="apiKey"
               {...field}
-              label={`${isAzure ? 'Azure q' : ''}OpenAI API Key`}
+              label={localize('com_endpoint_config_openai_api_key')}
               labelClassName="mb-1"
               inputClassName="mb-2"
               secret
@@ -38,7 +40,7 @@ const OpenAIConfig = ({
               <InputWithLabel
                 id="azureOpenAIApiKey"
                 {...field}
-                label={'Azure OpenAI API Key'}
+                label={localize('com_endpoint_config_azure_openai_api_key')}
                 labelClassName="mb-1"
                 secret
               />
@@ -52,7 +54,7 @@ const OpenAIConfig = ({
               <InputWithLabel
                 id="azureOpenAIApiInstanceName"
                 {...field}
-                label={'Azure OpenAI Instance Name'}
+                label={localize('com_endpoint_config_azure_openai_instance_name')}
                 labelClassName="mb-1"
               />
             )}
@@ -65,7 +67,7 @@ const OpenAIConfig = ({
               <InputWithLabel
                 id="azureOpenAIApiDeploymentName"
                 {...field}
-                label={'Azure OpenAI Deployment Name'}
+                label={localize('com_endpoint_config_azure_openai_deployment_name')}
                 labelClassName="mb-1"
               />
             )}
@@ -78,7 +80,7 @@ const OpenAIConfig = ({
               <InputWithLabel
                 id="azureOpenAIApiVersion"
                 {...field}
-                label={'Azure OpenAI API Version'}
+                label={localize('com_endpoint_config_azure_openai_api_version')}
                 labelClassName="mb-1"
               />
             )}
@@ -94,8 +96,8 @@ const OpenAIConfig = ({
               <InputWithLabel
                 id="baseURL"
                 {...field}
-                label={'API Base URL'}
-                subLabel={'(Optional)'}
+                label={localize('com_endpoint_config_api_base_url')}
+                subLabel={localize('com_ui_optional')}
                 labelClassName="mb-1"
               />
             )}

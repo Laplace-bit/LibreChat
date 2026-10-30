@@ -27,6 +27,7 @@ export function NoImage() {
 }
 
 export const AgentAvatarRender = ({ url }: { url?: string }) => {
+  const localize = useLocalize();
   const [isLoaded, setIsLoaded] = useState(false);
   useEffect(() => {
     setIsLoaded(false);
@@ -41,7 +42,7 @@ export const AgentAvatarRender = ({ url }: { url?: string }) => {
       <img
         src={url}
         className={`bg-avatar-placeholder h-full w-full rounded-full object-cover transition-opacity duration-200 ease-in-out ${isLoaded ? 'opacity-100' : 'opacity-0'}`}
-        alt="Agent avatar"
+        alt={localize('com_ui_agent_avatar')}
         loading="lazy"
         key={url}
         onLoad={() => setIsLoaded(true)}

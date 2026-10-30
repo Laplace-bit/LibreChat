@@ -24,7 +24,7 @@ const BookmarkMenu: FC = () => {
 
   const renderButtonContent = () => {
     if (isLoading) {
-      return <Spinner aria-label="Spinner" />;
+      return <Spinner aria-label={localize('com_ui_loading')} />;
     }
     if (hasBookmarks) {
       return <BookmarkFilledIcon className="icon-md" aria-hidden="true" />;

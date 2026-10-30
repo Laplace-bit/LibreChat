@@ -62,6 +62,7 @@ type UserAvatarProps = {
 
 const UserAvatar = memo(
   ({ size, avatar, avatarSrc, userId, username, className }: UserAvatarProps) => {
+    const localize = useLocalize();
     const [resolved, setResolved] = React.useState(() => resolveAvatar(userId, avatar, avatarSrc));
 
     React.useEffect(() => {
@@ -78,7 +79,7 @@ const UserAvatar = memo(
           <img
             className="rounded-full"
             src={resolved.src}
-            alt="avatar"
+            alt={localize('com_ui_avatar')}
             onError={() => setResolved(markAvatarFailed(userId, resolved.src))}
           />
         ) : (

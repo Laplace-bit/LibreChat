@@ -8,9 +8,11 @@ import {
   createConfigHtmlSanitizer,
 } from '~/utils/configHtml';
 import { useGetBannerQuery } from '~/data-provider';
+import { useLocalize } from '~/hooks';
 import store from '~/store';
 
 export const Banner = ({ onHeightChange }: { onHeightChange?: (height: number) => void }) => {
+  const localize = useLocalize();
   const { data: banner } = useGetBannerQuery();
   const [hideBannerHint, setHideBannerHint] = useRecoilState<string[]>(store.hideBannerHint);
   const bannerRef = useRef<HTMLDivElement>(null);
@@ -71,7 +73,7 @@ export const Banner = ({ onHeightChange }: { onHeightChange?: (height: number) =
         <Button
           size="icon"
           variant="ghost"
-          aria-label="Dismiss banner"
+          aria-label={localize('com_ui_dismiss_banner')}
           className="size-8"
           onClick={onClick}
         >

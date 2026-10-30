@@ -54,7 +54,7 @@ export default function AddedConvo({
       <button
         className="text-text-secondary shrink-0"
         type="button"
-        aria-label="Close added conversation"
+        aria-label={localize('com_ui_close_added_conversation')}
         onClick={() => setAddedConvo(null)}
       >
         <svg

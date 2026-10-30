@@ -136,6 +136,7 @@ export * from './shared-links/session';
 export * from './stream';
 export * from './agents/pi/session';
 export * from './agents/pi/events';
+export * from './agents/pi/history';
 /* Diagnostics */
 export { memoryDiagnostics } from './utils/memory';
 /* RUM */

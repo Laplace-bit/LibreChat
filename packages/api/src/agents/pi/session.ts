@@ -5,6 +5,7 @@ import type {
   PromptOptions,
   ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
+import type { PiHistoryMessage } from './history';
 
 export interface PiModelBinding {
   /** A request-scoped model selected from the caller's authorized configuration. */
@@ -19,6 +20,8 @@ export interface HostPiSessionOptions {
   createModelBinding(): Promise<PiModelBinding>;
   systemPrompt: string;
   tools: ToolDefinition[];
+  /** Structured, server-converted history; each message remains a separate Pi entry. */
+  history?: PiHistoryMessage[];
   signal?: AbortSignal;
 }
 
@@ -136,6 +139,10 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       systemPrompt: options.systemPrompt,
     });
     await resourceLoader.reload();
+    const sessionManager = SessionManager.inMemory(cwd);
+    for (const message of options.history ?? []) {
+      sessionManager.appendMessage(message);
+    }
 
     const result = await createAgentSession({
       cwd,
@@ -143,7 +150,7 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       model: modelBinding.model,
       modelRuntime: modelBinding.modelRuntime,
       resourceLoader,
-      sessionManager: SessionManager.inMemory(cwd),
+      sessionManager,
       settingsManager: SettingsManager.inMemory({
         defaultTools: options.tools.map(({ name }) => name),
       }),

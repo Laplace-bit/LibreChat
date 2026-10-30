@@ -6,9 +6,21 @@ import { createRequire } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@librechat/agents/langchain/messages';
 
 const require = createRequire(import.meta.url);
-const { createHostPiSession, createPiContentEventTranslator } = require('../../../dist/index.cjs');
+const {
+  convertLibreChatHistoryToPi,
+  createHostPiSession,
+  createPiContentEventTranslator,
+} = require('../../../dist/index.cjs');
+const tinyPngBase64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWPgEpH7DwABpAE8sdwFIwAAAABJRU5ErkJggg==';
 
 async function withTimeout(promise, timeoutMs, message) {
   let timeout;
@@ -57,7 +69,7 @@ async function createFakeOpenAIModelBinding(baseUrl, onDispose) {
         id: 'echo-test',
         name: 'Echo test model',
         reasoning: false,
-        input: ['text'],
+        input: ['text', 'image'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 8192,
         maxTokens: 128,
@@ -279,6 +291,148 @@ test('Pi host session releases a model binding if cancellation races session cre
     { name: 'AbortError' },
   );
   assert.equal(bindingDisposals, 1, 'the binding is disposed when startup is cancelled');
+});
+
+test('LibreChat history becomes structured Pi messages and preserves the current image prompt', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  let session;
+
+  try {
+    const modelBinding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+      bindingDisposals += 1;
+    });
+    const conversion = convertLibreChatHistoryToPi({
+      messages: [
+        new SystemMessage('Agent system instructions.'),
+        new HumanMessage('Previous user question.'),
+        new AIMessage({
+          content: 'I queried the factory system.',
+          tool_calls: [
+            {
+              id: 'historical-query-1',
+              name: 'safe_query',
+              args: { query: 'previous shift output' },
+              type: 'tool_call',
+            },
+          ],
+        }),
+        new ToolMessage({
+          content: 'Stored result: 42 units.',
+          tool_call_id: 'historical-query-1',
+          name: 'safe_query',
+        }),
+        new HumanMessage({
+          content: [
+            { type: 'text', text: 'What is in this image?' },
+            { type: 'image_url', image_url: { url: `data:image/png;base64,${tinyPngBase64}` } },
+          ],
+        }),
+      ],
+      model: modelBinding.model,
+      baseSystemPrompt: 'Host policy instructions.',
+      now: () => 123,
+    });
+
+    assert.equal(conversion.history.length, 3);
+    assert.equal(conversion.history[0].role, 'user');
+    assert.equal(conversion.history[1].role, 'assistant');
+    assert.equal(conversion.history[2].role, 'toolResult');
+    assert.match(conversion.systemPrompt, /Host policy instructions\./);
+    assert.match(conversion.systemPrompt, /Agent system instructions\./);
+    assert.equal(conversion.prompt.text, 'What is in this image?');
+    assert.deepEqual(conversion.prompt.images, [
+      { type: 'image', mimeType: 'image/png', data: tinyPngBase64 },
+    ]);
+
+    session = await createHostPiSession({
+      createModelBinding: async () => modelBinding,
+      systemPrompt: conversion.systemPrompt,
+      history: conversion.history,
+      tools: [],
+    });
+    await session.prompt(conversion.prompt.text, { images: conversion.prompt.images });
+
+    const { messages } = fakeProvider.getRequestBody();
+    assert.deepEqual(
+      messages.map(({ role }) => role),
+      ['system', 'user', 'assistant', 'tool', 'user'],
+    );
+    assert.match(messages[0].content, /Host policy instructions\./);
+    assert.equal(messages[1].content, 'Previous user question.');
+    assert.equal(messages[2].tool_calls[0].id, 'historical-query-1');
+    assert.equal(messages[3].content, 'Stored result: 42 units.');
+    assert.ok(
+      JSON.stringify(messages[4].content).includes(tinyPngBase64),
+      JSON.stringify(messages[4].content),
+    );
+  } finally {
+    try {
+      await session?.dispose();
+    } finally {
+      await fakeProvider.close();
+    }
+  }
+  assert.equal(bindingDisposals, 1);
+});
+
+test('LibreChat history conversion rejects incomplete tool state, signatures, and remote images', () => {
+  const model = { api: 'openai-completions', provider: 'openai', id: 'test-model' };
+  assert.throws(
+    () =>
+      convertLibreChatHistoryToPi({
+        model,
+        messages: [
+          new HumanMessage('Run a query.'),
+          new AIMessage({
+            content: 'Querying.',
+            tool_calls: [{ id: 'missing-result', name: 'safe_query', args: {}, type: 'tool_call' }],
+          }),
+          new HumanMessage('Continue.'),
+        ],
+      }),
+    { code: 'unresolved_tool_call' },
+  );
+  assert.throws(
+    () =>
+      convertLibreChatHistoryToPi({
+        model,
+        messages: [
+          new AIMessage({
+            content: 'Signed answer.',
+            additional_kwargs: { thought_signature: 'provider-private-signature' },
+          }),
+          new HumanMessage('Continue.'),
+        ],
+      }),
+    { code: 'provider_signature' },
+  );
+  assert.throws(
+    () =>
+      convertLibreChatHistoryToPi({
+        model,
+        messages: [
+          new AIMessage({
+            content: 'Signed tool response.',
+            additional_kwargs: { signatures: { 'call-1': 'provider-private-signature' } },
+          }),
+          new HumanMessage('Continue.'),
+        ],
+      }),
+    { code: 'provider_signature' },
+  );
+  assert.throws(
+    () =>
+      convertLibreChatHistoryToPi({
+        model,
+        messages: [
+          new HumanMessage({
+            content: [{ type: 'image_url', image_url: { url: 'https://example.com/image.png' } }],
+          }),
+        ],
+      }),
+    { code: 'unsupported_content' },
+  );
 });
 
 test('Pi content events close an interrupted host step as cancelled', () => {

@@ -3,7 +3,7 @@ import { StepTypes } from 'librechat-data-provider';
 import type { AgentSessionEvent, AgentSessionEventListener } from '@earendil-works/pi-coding-agent';
 import type { PiHostContentEvent } from './events';
 import type { HostPiSession } from './session';
-import { executePiHostSession } from './bridge';
+import { createPiHostEventSequencer, executePiHostSession } from './bridge';
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -120,6 +120,54 @@ describe('executePiHostSession', () => {
       'end:agent_settled',
     ]);
     expect(harness.unsubscribeCount).toBe(1);
+  });
+
+  it('serializes Pi stream events and direct host-tool events through one shared FIFO', async () => {
+    const handlerStarted = deferred<void>();
+    const releaseHandler = deferred<void>();
+    const delivered: string[] = [];
+    const eventSequencer = createPiHostEventSequencer(async (event) => {
+      if (event.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
+        throw new Error('Expected a run-step close event');
+      }
+      delivered.push(`start:${event.data.id}`);
+      if (event.data.id === 'stream') {
+        handlerStarted.resolve(undefined);
+        await releaseHandler.promise;
+      }
+      delivered.push(`end:${event.data.id}`);
+    });
+    const harness = createSession(async (emit) => {
+      emit(sessionEvent('agent_end'));
+      await eventSequencer.enqueue(createHostEvent('tool'));
+      emit(sessionEvent('agent_settled'));
+    });
+
+    const execution = executePiHostSession({
+      session: harness.session,
+      prompt: 'hello',
+      eventSequencer,
+      translateEvent: (event) => [
+        createHostEvent(event.type === 'agent_end' ? 'stream' : 'settled'),
+      ],
+      handleHostEvent: () => {
+        throw new Error('The shared sequencer must own event delivery');
+      },
+    });
+
+    await handlerStarted.promise;
+    expect(delivered).toEqual(['start:stream']);
+    releaseHandler.resolve(undefined);
+
+    await expect(execution).resolves.toEqual({ status: 'completed' });
+    expect(delivered).toEqual([
+      'start:stream',
+      'end:stream',
+      'start:tool',
+      'end:tool',
+      'start:settled',
+      'end:settled',
+    ]);
   });
 
   it('aborts Pi and preserves the host handler error over the prompt abort error', async () => {

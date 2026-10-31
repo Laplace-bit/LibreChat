@@ -4,7 +4,6 @@ const mockGenerateAgentConversationTitle = jest
   .mockResolvedValue({ title: 'Generated Pi Title' });
 const mockExecutePiGeneration = jest.fn();
 const mockGetAgentPiModelBindingFactory = jest.fn();
-const mockAssertPiTextOnlyCompatible = jest.fn();
 const mockCaptureAgentCheckpointGeneration = jest.fn();
 const mockDeleteAgentCheckpoint = jest.fn();
 const mockIsHITLEnabled = jest.fn().mockReturnValue(false);
@@ -26,11 +25,12 @@ const mockStripActivityLabelParts = jest.fn((payload) =>
   jest.requireActual('@librechat/api').stripActivityLabelParts(payload),
 );
 
-const { Providers } = require('@librechat/agents');
+const { GraphEvents, Providers } = require('@librechat/agents');
 const {
   Constants,
   ContentTypes,
   EModelEndpoint,
+  Tools,
   ErrorTypes,
   UsageEvents,
 } = require('librechat-data-provider');
@@ -291,7 +291,6 @@ jest.mock('@librechat/api', () => ({
   buildAgentScopedContext: (...args) => mockBuildAgentScopedContext(...args),
   checkAccess: jest.fn(),
   createRun: (...args) => mockCreateRun(...args),
-  assertPiTextOnlyCompatible: (...args) => mockAssertPiTextOnlyCompatible(...args),
   generateAgentConversationTitle: (...args) => mockGenerateAgentConversationTitle(...args),
   executePiGeneration: (...args) => mockExecutePiGeneration(...args),
   getAgentPiModelBindingFactory: (...args) => mockGetAgentPiModelBindingFactory(...args),
@@ -10102,6 +10101,7 @@ describe('AgentClient - Pi generation dispatch', () => {
         model_parameters: { model: 'gpt-4o' },
         hide_sequential_outputs: false,
         tools: [],
+        ...(overrides.agent ?? {}),
       },
       endpointTokenConfig: {},
       eventHandlers: overrides.eventHandlers ?? {},
@@ -10200,6 +10200,88 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(client.executionOutcome).toEqual({ engine: 'pi', status: 'completed' });
     expect(client.run).toBeUndefined();
     expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {
+    const definition = {
+      name: Tools.file_search,
+      description: 'Search the agent files.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string' } },
+        required: ['query'],
+      },
+    };
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Found the manual.',
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: Tools.file_search }],
+        toolDefinitions: [definition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      toolResult = await input.executeHostToolCall(
+        {
+          id: 'host-tool-call',
+          name: Tools.file_search,
+          args: { query: 'machine maintenance' },
+          stepId: 'host-tool-step',
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch, metadata] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-tool-call',
+        name: Tools.file_search,
+        args: { query: 'machine maintenance' },
+        stepId: 'host-tool-step',
+      },
+    ]);
+    expect(batch.userId).toBe('user-pi');
+    expect(batch.agentId).toBe('agent-pi');
+    expect(batch.configurable).toMatchObject({
+      req,
+      user_id: 'user-pi',
+      thread_id: 'conversation-pi',
+      run_id: 'response-pi',
+    });
+    expect(metadata).toMatchObject({ thread_id: 'conversation-pi', run_id: 'response-pi' });
+    expect(toolResult).toEqual({
+      toolCallId: 'host-tool-call',
+      status: 'success',
+      content: 'Found the manual.',
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([definition]);
+    expect(mockExecutePiGeneration.mock.calls[0][0].createToolStepIdentity).toEqual(
+      expect.any(Function),
+    );
+    expect(mockExecutePiGeneration.mock.calls[0][0].createToolCallId).toEqual(expect.any(Function));
   });
 
   it('keeps Pi context overflow actionable when model-bound content protection is enabled', async () => {

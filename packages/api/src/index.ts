@@ -141,6 +141,8 @@ export type { CreatePiModelBinding } from './agents/pi/modelBindingFactory';
 export * from './agents/pi/events';
 export * from './agents/pi/bridge';
 export * from './agents/pi/execution';
+export * from './agents/pi/toolExecution';
+export * from './agents/pi/hostToolBatch';
 export * from './agents/pi/dispatch';
 export * from './agents/pi/contextUsage';
 export * from './agents/pi/prompt';

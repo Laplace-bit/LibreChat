@@ -1,6 +1,6 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
+import type { PiHostEventSequencer, PiHostSessionOutcome } from './bridge';
 import type { HostPiSession, HostPiSessionOptions } from './session';
-import type { PiHostSessionOutcome } from './bridge';
 import type { PiHostEvent } from './events';
 import { executePiHostSession } from './bridge';
 import { createHostPiSession } from './session';
@@ -10,6 +10,7 @@ export interface PiGenerationExecutorInput extends HostPiSessionOptions {
   promptOptions?: PromptOptions;
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
+  eventSequencer?: PiHostEventSequencer;
 }
 
 export interface PiGenerationExecutorDependencies {
@@ -25,7 +26,14 @@ export function createPiGenerationExecutor(
       return { status: 'cancelled' };
     }
 
-    const { prompt, promptOptions, translateEvent, handleHostEvent, ...sessionOptions } = input;
+    const {
+      prompt,
+      promptOptions,
+      translateEvent,
+      handleHostEvent,
+      eventSequencer,
+      ...sessionOptions
+    } = input;
     let session: HostPiSession;
     try {
       session = await dependencies.createSession(sessionOptions);
@@ -47,6 +55,7 @@ export function createPiGenerationExecutor(
         signal: input.signal,
         translateEvent,
         handleHostEvent,
+        eventSequencer,
       });
       executionResult = { ok: true, outcome };
     } catch (error) {

@@ -9,6 +9,67 @@ export interface PiHostEventBridgeOptions {
   signal?: AbortSignal;
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
+  /** Shared with direct host tool events so the full run has one FIFO. */
+  eventSequencer?: PiHostEventSequencer;
+}
+
+export interface PiHostEventSequencer {
+  enqueue(event: PiHostEvent): Promise<void>;
+  drain(): Promise<void>;
+  onFailure(listener: (error: unknown) => void): () => void;
+}
+
+/** Serializes all host-visible events for one Pi generation and latches failures. */
+export function createPiHostEventSequencer(
+  handleHostEvent: (event: PiHostEvent) => void | Promise<void>,
+): PiHostEventSequencer {
+  let tail: Promise<void> = Promise.resolve();
+  let failure: { error: unknown } | undefined;
+  const failureListeners = new Set<(error: unknown) => void>();
+
+  const reportFailure = (error: unknown) => {
+    if (failure != null) {
+      return;
+    }
+    failure = { error };
+    for (const listener of failureListeners) {
+      try {
+        listener(error);
+      } catch {
+        // A failure observer cannot mask the host event failure.
+      }
+    }
+  };
+
+  const enqueue = (event: PiHostEvent): Promise<void> => {
+    const current = tail.then(async () => {
+      if (failure != null) {
+        throw failure.error;
+      }
+      await handleHostEvent(event);
+    });
+    tail = current.catch((error: unknown) => {
+      reportFailure(error);
+    });
+    return current;
+  };
+
+  return {
+    enqueue,
+    async drain() {
+      await tail;
+      if (failure != null) {
+        throw failure.error;
+      }
+    },
+    onFailure(listener) {
+      failureListeners.add(listener);
+      if (failure != null) {
+        listener(failure.error);
+      }
+      return () => failureListeners.delete(listener);
+    },
+  };
 }
 
 export type PiHostSessionOutcome = { status: 'completed' } | { status: 'cancelled' };
@@ -25,7 +86,6 @@ export async function executePiHostSession(
     return { status: 'cancelled' };
   }
 
-  let eventQueue = Promise.resolve();
   let handlerFailure: { error: unknown } | undefined;
   let promptFailure: { error: unknown } | undefined;
   let promptWasCancelled = false;
@@ -33,21 +93,19 @@ export async function executePiHostSession(
   let active = true;
   let unsubscribed = false;
 
+  const eventSequencer =
+    options.eventSequencer ?? createPiHostEventSequencer(options.handleHostEvent);
   const abortAfterHandlerFailure = () => {
     void options.session.abort().catch(() => undefined);
   };
+  const unsubscribeFailure = eventSequencer.onFailure(abortAfterHandlerFailure);
 
   const enqueueHostEvent = (event: PiHostEvent) => {
-    eventQueue = eventQueue
-      .then(async () => {
-        if (handlerFailure == null) {
-          await options.handleHostEvent(event);
-        }
-      })
-      .catch((error: unknown) => {
-        handlerFailure ??= { error };
-        abortAfterHandlerFailure();
-      });
+    void eventSequencer.enqueue(event).catch((error: unknown) => {
+      if (handlerFailure == null) {
+        handlerFailure = { error };
+      }
+    });
   };
 
   const unsubscribe = options.session.subscribe((event) => {
@@ -79,6 +137,7 @@ export async function executePiHostSession(
     if (!unsubscribed) {
       unsubscribed = true;
       unsubscribe();
+      unsubscribeFailure();
     }
   };
 
@@ -90,7 +149,11 @@ export async function executePiHostSession(
       promptWasCancelled = options.signal?.aborted === true || sessionAborted;
     }
     stopListening();
-    await eventQueue;
+    try {
+      await eventSequencer.drain();
+    } catch (error) {
+      handlerFailure ??= { error };
+    }
 
     if (handlerFailure != null) {
       throw handlerFailure.error;

@@ -221,12 +221,14 @@ const {
   hasEntityEmbeddings,
   AgentRuntimeUnavailableError,
   resolveStoredAgentRuntime,
-  assertPiTextOnlyCompatible,
+  assertPiCompatible,
+  createPiHostToolBatchExecutor,
   generateAgentConversationTitle,
   getAgentPiModelBindingFactory,
   executePiGeneration,
 } = require('@librechat/api');
 const {
+  GraphEvents,
   Run,
   Callback,
   Providers,
@@ -247,6 +249,7 @@ const {
   FileSources,
   ApprovalEvents,
   EModelEndpoint,
+  Tools,
   PermissionTypes,
   AgentCapabilities,
   hasActivePiiPatterns,
@@ -4998,6 +5001,7 @@ class AgentClient extends BaseClient {
           agents.push(...this.agentConfigs.values());
         }
         let piModelBindingFactory;
+        let piToolDefinitions = [];
         if (isPiRuntime) {
           const unsupportedModes = [];
           if (
@@ -5043,10 +5047,18 @@ class AgentClient extends BaseClient {
 
           const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
           const callableToolNames = [...toolSet].filter((name) => !internalToolNames.has(name));
-          assertPiTextOnlyCompatible({
+          const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
+            ? this.options.agent.toolDefinitions
+            : [];
+          piToolDefinitions = configuredToolDefinitions.filter(
+            (definition) =>
+              definition?.name === Tools.file_search && callableToolNames.includes(definition.name),
+          );
+          assertPiCompatible({
             rootAgentId: this.options.agent?.id,
             loadedAgentIds: agents.map((agent) => agent?.id),
             callableToolNames,
+            supportedToolNames: piToolDefinitions.map((definition) => definition.name),
             unsupportedModes,
           });
           piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
@@ -5200,9 +5212,48 @@ class AgentClient extends BaseClient {
           };
 
           this.options.startupTelemetry?.mark('pi_session_started');
+          const createPiStepIdentity = () => {
+            const sequence = nextStepIndex++;
+            return {
+              id: `pi-${this.responseMessageId}-${nanoid()}`,
+              index: sequence,
+              messageId: this.responseMessageId,
+              runId: this.responseMessageId,
+              agentId: this.options.agent.id,
+            };
+          };
+          const handlePiHostEvent = async (event) => {
+            const handler = piHandlers?.[event.event];
+            if (handler == null || typeof handler.handle !== 'function') {
+              throw new AgentRuntimeUnavailableError();
+            }
+            await handler.handle(event.event, event.data, piMetadata);
+          };
+          const piToolHandler = piHandlers?.[GraphEvents.ON_TOOL_EXECUTE];
+          const executePiHostToolCall =
+            typeof piToolHandler?.handle === 'function'
+              ? createPiHostToolBatchExecutor({
+                  handler: piToolHandler,
+                  userId: this.user ?? request?.user?.id,
+                  agentId: this.options.agent.id,
+                  request,
+                  threadId: this.conversationId,
+                  runId: this.responseMessageId,
+                  metadata: piMetadata,
+                  onError: (error) =>
+                    logger.error(
+                      '[AgentClient] Pi host tool execution failed',
+                      getSafeErrorMetadata(error),
+                    ),
+                })
+              : undefined;
           const outcome = await executePiGeneration({
             messages: piMessages,
             createModelBinding: piModelBindingFactory,
+            toolDefinitions: piToolDefinitions,
+            executeHostToolCall: executePiHostToolCall,
+            createToolStepIdentity: createPiStepIdentity,
+            createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
             signal: abortController.signal,
             usageAttribution: {
               provider: this.options.agent.provider,
@@ -5218,23 +5269,8 @@ class AgentClient extends BaseClient {
               calibrationRatio,
               summaryTokens: continuationSummary?.tokenCount,
             },
-            createStepIdentity: () => {
-              const sequence = nextStepIndex++;
-              return {
-                id: `pi-${this.responseMessageId}-${nanoid()}`,
-                index: sequence,
-                messageId: this.responseMessageId,
-                runId: this.responseMessageId,
-                agentId: this.options.agent.id,
-              };
-            },
-            handleHostEvent: async (event) => {
-              const handler = piHandlers?.[event.event];
-              if (handler == null || typeof handler.handle !== 'function') {
-                throw new AgentRuntimeUnavailableError();
-              }
-              await handler.handle(event.event, event.data, piMetadata);
-            },
+            createStepIdentity: createPiStepIdentity,
+            handleHostEvent: handlePiHostEvent,
           });
 
           this.executionOutcome = { engine: 'pi', status: outcome.status };

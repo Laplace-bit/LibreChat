@@ -1,5 +1,5 @@
 import { GraphEvents } from '@librechat/agents';
-import { ContentTypes, StepTypes, UsageEvents } from 'librechat-data-provider';
+import { ContentTypes, StepEvents, StepTypes, UsageEvents } from 'librechat-data-provider';
 import type { Agents, TContextUsageEvent } from 'librechat-data-provider';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
@@ -24,6 +24,8 @@ export interface PiMessageStepIdentityInput {
 export interface PiContentEventTranslatorOptions {
   /** The host supplies job-scoped IDs and offsets; Pi never owns product identities. */
   createStepIdentity(input: PiMessageStepIdentityInput): PiMessageStepIdentity;
+  /** Tool names with an installed LibreChat host adapter for this run. */
+  supportedToolNames?: readonly string[];
   /** Host-owned billing attribution; Pi's provider id is deliberately not authoritative. */
   usageAttribution?: { provider?: string; agentId?: string; runId?: string };
   now?: () => number;
@@ -33,6 +35,12 @@ export type PiHostContentEvent =
   | { event: GraphEvents.ON_RUN_STEP; data: Agents.RunStep }
   | { event: GraphEvents.ON_MESSAGE_DELTA; data: Agents.MessageDeltaEvent }
   | { event: GraphEvents.ON_REASONING_DELTA; data: Agents.ReasoningDeltaEvent }
+  | { event: GraphEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent };
+
+export type PiHostToolEvent =
+  | { event: GraphEvents.ON_RUN_STEP; data: Agents.RunStep }
+  | { event: StepEvents.ON_TOOL_CALLS_DISPATCHED; data: Agents.ToolCallsDispatchedEvent }
+  | { event: GraphEvents.ON_RUN_STEP_COMPLETED; data: { result: Agents.ToolEndEvent } }
   | { event: GraphEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent };
 
 export interface PiHostUsageEvent {
@@ -45,7 +53,11 @@ export interface PiHostContextUsageEvent {
   data: TContextUsageEvent;
 }
 
-export type PiHostEvent = PiHostContentEvent | PiHostUsageEvent | PiHostContextUsageEvent;
+export type PiHostEvent =
+  | PiHostContentEvent
+  | PiHostToolEvent
+  | PiHostUsageEvent
+  | PiHostContextUsageEvent;
 
 export class PiRuntimeResponseError extends Error {
   readonly code = 'PI_RESPONSE_UNSUPPORTED';
@@ -147,19 +159,20 @@ function translateAgentEnd(
   options: PiContentEventTranslatorOptions,
 ): PiHostUsageEvent[] {
   const translated: PiHostUsageEvent[] = [];
+  const supportedToolNames = new Set(options.supportedToolNames ?? []);
   for (const message of event.messages) {
     if (message.role !== 'assistant') {
       continue;
     }
-
-    if (
-      event.willRetry !== true &&
-      (message.stopReason === 'error' ||
-        message.stopReason === 'length' ||
-        message.stopReason === 'deferred' ||
-        (message.stopReason === 'toolUse' &&
-          message.content.some((part) => part.type === 'toolCall')))
-    ) {
+    const toolCalls = message.content.filter((part) => part.type === 'toolCall');
+    const hasUnsupportedToolCall =
+      message.stopReason === 'toolUse' &&
+      (toolCalls.length === 0 || toolCalls.some(({ name }) => !supportedToolNames.has(name)));
+    const hasUnsupportedStopReason =
+      message.stopReason === 'error' ||
+      message.stopReason === 'length' ||
+      message.stopReason === 'deferred';
+    if (event.willRetry !== true && (hasUnsupportedStopReason || hasUnsupportedToolCall)) {
       throw new PiRuntimeResponseError();
     }
     translated.push(translateAssistantUsage(message, options.usageAttribution));
@@ -243,8 +256,8 @@ function translateContentDelta(
 
 /**
  * Translate Pi's streamed text and reasoning blocks into the host event contract.
- * Tool calls, usage, citations, attachments, and errors require separate host
- * mappings and deliberately do not become product events here.
+ * Tool calls use the authorized host tool adapter; citations, attachments, and
+ * provider errors still require separate mappings and do not become events here.
  */
 export function createPiContentEventTranslator(
   options: PiContentEventTranslatorOptions,
@@ -277,8 +290,10 @@ export function createPiContentEventTranslator(
         case 'error':
         case 'length':
         case 'deferred':
-        case 'toolUse':
           status = 'failed';
+          break;
+        case 'toolUse':
+          status = 'completed';
           break;
         default:
           status = 'completed';

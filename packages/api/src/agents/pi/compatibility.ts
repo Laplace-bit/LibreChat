@@ -9,24 +9,33 @@ export type PiUnsupportedTurnMode =
   | 'steer'
   | 'skills';
 
-export interface PiTextOnlyCompatibilityInput {
+export const PI_SUPPORTED_HOST_TOOLS = ['file_search'] as const;
+export type PiSupportedHostTool = (typeof PI_SUPPORTED_HOST_TOOLS)[number];
+
+export interface PiCompatibilityInput {
   rootAgentId: unknown;
   loadedAgentIds: readonly unknown[];
   callableToolNames: readonly string[];
+  supportedToolNames: readonly string[];
   unsupportedModes: readonly PiUnsupportedTurnMode[];
 }
 
 /**
- * The first dispatched Pi slice is one root agent producing text/reasoning only.
- * Every other capability remains rejected until its host adapter is complete.
+ * Pi supports only host tools with a reviewed adapter. Unknown and unimplemented
+ * tool names remain rejected even if the caller mistakenly lists them as supported.
  */
-export function assertPiTextOnlyCompatible(input: PiTextOnlyCompatibilityInput): void {
+export function assertPiCompatible(input: PiCompatibilityInput): void {
+  const supportedNames = new Set(
+    input.supportedToolNames.filter((name) =>
+      PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name),
+    ),
+  );
   if (
     typeof input.rootAgentId !== 'string' ||
     input.rootAgentId.length === 0 ||
     input.loadedAgentIds.length !== 1 ||
     input.loadedAgentIds[0] !== input.rootAgentId ||
-    input.callableToolNames.length > 0 ||
+    !input.callableToolNames.every((name) => supportedNames.has(name)) ||
     input.unsupportedModes.length > 0
   ) {
     throw new AgentRuntimeUnavailableError();

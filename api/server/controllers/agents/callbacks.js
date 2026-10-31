@@ -37,6 +37,7 @@ const {
   feedSubagentAggregator,
   getAttachmentOwnership,
   collectToolCallIds,
+  annotateContextSummaryPlacement,
   createToolTimingAdapter,
   stampCommandExecutor,
 } = require('@librechat/api');
@@ -808,6 +809,7 @@ function getDefaultHandlers({
         const visible =
           checkIfLastAgent(metadata?.last_agent_id, metadata?.langgraph_node) ||
           !metadata?.hide_sequential_outputs;
+        const contextData = annotateContextSummaryPlacement(data);
         /** Capture the latest visible snapshot (last-wins) and how many usage
          *  events preceded it BEFORE awaiting the emit. `emitEvent` can yield
          *  (resumable SSE / Redis publish); with parallel runs active this
@@ -820,7 +822,7 @@ function getDefaultHandlers({
          *  whose only following usage is tagged `summarization`, which a plain
          *  snapshot-count would over-count and wrongly drop. */
         if (visible && contextUsageSink) {
-          contextUsageSink.latest = data;
+          contextUsageSink.latest = contextData;
           contextUsageSink.count = (contextUsageSink.count ?? 0) + 1;
           contextUsageSink.latestUsageIndex = usageEmitSink?.length ?? 0;
           /** Which tool calls this snapshot already accounts for. A turn that
@@ -837,7 +839,7 @@ function getDefaultHandlers({
          *  so the write lands before the model call it describes begins. */
         await contextUsageSink?.onSnapshot?.();
         if (visible) {
-          await emitForJob({ event, data });
+          await emitForJob({ event, data: contextData });
         }
       },
     };

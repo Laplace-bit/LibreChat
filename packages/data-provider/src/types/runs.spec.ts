@@ -148,6 +148,19 @@ describe('reconcileContextUsage', () => {
     ).toBe(55773);
   });
 
+  it('keeps an annotated summary inside the instruction total during reconciliation', () => {
+    const snapshot: TContextUsageEvent = {
+      ...inflatedSnapshot,
+      summaryPlacement: 'system_prompt',
+    };
+    const result = reconcileContextUsage(snapshot, 55773);
+
+    expect(result.breakdown.messageTokens).toBe(55773 - 4205);
+    expect(result.breakdown.instructionTokens).toBe(4205);
+    expect(result.breakdown.summaryTokens).toBe(1938);
+    expect(result.breakdown.messageTokens + result.breakdown.instructionTokens).toBe(55773);
+  });
+
   it('clamps messageTokens to zero when the prompt is smaller than the overhead', () => {
     const result = reconcileContextUsage(inflatedSnapshot, 3000);
     expect(result.breakdown.messageTokens).toBe(0);

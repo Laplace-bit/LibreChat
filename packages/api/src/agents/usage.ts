@@ -645,12 +645,16 @@ export function computeSummaryUsedTokens(
   if (!snapshot || summaryTokens <= 0) {
     return undefined;
   }
+  if (snapshot.summaryPlacement === 'system_prompt') {
+    return undefined;
+  }
   const maxTokens = snapshot.contextBudget ?? snapshot.breakdown.maxContextTokens ?? 0;
+  const summaryIsIncludedInInstructions = snapshot.summaryPlacement != null;
   const baseUsed =
     snapshot.remainingContextTokens != null
       ? maxTokens - snapshot.remainingContextTokens
       : (snapshot.effectiveInstructionTokens ?? snapshot.breakdown.instructionTokens ?? 0) +
-        summaryTokens +
+        (summaryIsIncludedInInstructions ? 0 : summaryTokens) +
         (snapshot.breakdown.messageTokens ?? 0);
   const adjusted = baseUsed - Math.max(0, priorOutputTokens);
   return adjusted > 0 ? Math.round(adjusted) : undefined;

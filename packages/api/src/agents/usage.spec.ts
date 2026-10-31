@@ -2436,6 +2436,28 @@ describe('computeSummaryUsedTokens', () => {
     expect(computeSummaryUsedTokens(summarized({ remainingContextTokens: undefined }))).toBe(150);
   });
 
+  it('does not mark a previous-turn system summary as a summary created by this response', () => {
+    expect(
+      computeSummaryUsedTokens(
+        summarized({
+          summaryPlacement: 'system_prompt',
+          remainingContextTokens: undefined,
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it('does not count a current user-message summary twice in the fallback baseline', () => {
+    expect(
+      computeSummaryUsedTokens(
+        summarized({
+          summaryPlacement: 'user_message',
+          remainingContextTokens: undefined,
+        }),
+      ),
+    ).toBe(70);
+  });
+
   it('returns undefined when the turn did not summarize', () => {
     expect(
       computeSummaryUsedTokens(

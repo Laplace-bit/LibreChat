@@ -72,6 +72,7 @@ export * from './codeFilesSession';
 export * from './run';
 export * from './tail';
 export * from './contextBudget';
+export * from './summary';
 export * from './fading';
 export * from './publication';
 export * from './runtime';

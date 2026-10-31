@@ -206,7 +206,7 @@ export function deriveTokenUsageView({
         : null;
     const breakdownUsed =
       instructionTokens +
-      normalizeTokenCount(breakdown.summaryTokens) +
+      (effective.summaryPlacement == null ? normalizeTokenCount(breakdown.summaryTokens) : 0) +
       normalizeTokenCount(breakdown.messageTokens);
     /** A remaining count measured against a smaller instruction total than the
      *  snapshot publishes would put used below the instruction and summary
@@ -277,7 +277,9 @@ export function deriveTokenUsageView({
             conversationKey,
             tailId,
             liveOutput > 0,
-            normalizeTokenCount(breakdown.summaryTokens),
+            effective.summaryPlacement === 'system_prompt'
+              ? 0
+              : normalizeTokenCount(breakdown.summaryTokens),
           ),
       ),
       subagentUsage,

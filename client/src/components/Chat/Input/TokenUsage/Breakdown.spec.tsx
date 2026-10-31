@@ -323,6 +323,25 @@ describe('TokenUsage Breakdown', () => {
       expect(rowFor('com_ui_context_tool_calls').textContent).toContain('150');
     });
 
+    it('shows an instruction-embedded summary once across system, summary, and message rows', async () => {
+      const placedSummary = JSON.parse(JSON.stringify(snapshotView)) as TokenUsageView;
+      placedSummary.usedTokens = 950;
+      placedSummary.percent = 47.5;
+      placedSummary.snapshot!.summaryPlacement = 'system_prompt';
+      placedSummary.snapshot!.breakdown.messageTokens = 550;
+
+      renderBreakdown({ view: placedSummary });
+      await userEvent.click(toggle());
+
+      const breakdown = screen.getByTestId('context-breakdown');
+      const rowFor = (label: string) =>
+        within(breakdown).getByText(label).parentElement?.parentElement as HTMLElement;
+
+      expect(rowFor('com_ui_context_system').textContent).toContain('70');
+      expect(rowFor('com_ui_context_summary').textContent).toContain('50');
+      expect(rowFor('com_ui_context_messages').textContent).toContain('550');
+    });
+
     it('widens the tool-call row for retained results without exceeding used tokens', async () => {
       const retainedToolSplit = JSON.parse(JSON.stringify(toolSplitView)) as TokenUsageView;
       retainedToolSplit.usedTokens = 1075;

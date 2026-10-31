@@ -308,6 +308,12 @@ export type TContextUsageEvent = {
    *  next turn's snapshot carries it as kept-message context. Counted, never
    *  estimated — the per-tool `toolMessageTokenCounts` stay a subset of the share. */
   retainedToolTokens?: number;
+  /**
+   * Where the summary represented by `breakdown.summaryTokens` sits in the
+   * prompt. When present, those tokens are already included in the instruction
+   * total; older snapshots omit this marker and retain their historical math.
+   */
+  summaryPlacement?: 'system_prompt' | 'user_message';
 };
 
 /**
@@ -456,7 +462,8 @@ export const reconcileContextUsage = (
   const budget =
     finiteNonNegativeInteger(snapshot.contextBudget) ??
     finiteNonNegativeInteger(breakdown.maxContextTokens);
-  const nonMessageTokens = instructionTokens + summaryTokens;
+  const nonMessageTokens =
+    instructionTokens + (snapshot.summaryPlacement == null ? summaryTokens : 0);
   const messageTokens = Math.max(0, normalizedPromptTokens - nonMessageTokens);
   /** `toolMessageTokens` is a subset of the OLD (calibrated) `messageTokens`;
    * rescale it by the same proportion so the split tracks the provider's real

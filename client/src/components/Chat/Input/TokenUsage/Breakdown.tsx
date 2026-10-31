@@ -160,15 +160,23 @@ export default function Breakdown({
     snapshot?.effectiveInstructionTokens ?? breakdown?.instructionTokens,
   );
   const systemTokens =
-    normalizeTokenCount(breakdown?.systemMessageTokens) +
-    normalizeTokenCount(breakdown?.dynamicInstructionTokens);
+    Math.max(
+      0,
+      normalizeTokenCount(breakdown?.systemMessageTokens) -
+        (snapshot?.summaryPlacement === 'system_prompt'
+          ? normalizeTokenCount(breakdown?.summaryTokens)
+          : 0),
+    ) + normalizeTokenCount(breakdown?.dynamicInstructionTokens);
   /** Summary and tool calls have their own rows, so exclude both (they're part
    *  of `usedTokens`) to avoid double-counting them inside the Messages row.
    *  `toolMessageTokens` is absent on older SDK snapshots, keeping the row
    *  unsplit. */
   const summaryTokens = normalizeTokenCount(breakdown?.summaryTokens);
   const retainedToolTokens = normalizeTokenCount(snapshot?.retainedToolTokens);
-  const messageBudget = Math.max(0, usedTokens - instructionTokens - summaryTokens);
+  const messageBudget = Math.max(
+    0,
+    usedTokens - instructionTokens - (snapshot?.summaryPlacement == null ? summaryTokens : 0),
+  );
   /** `toolMessageTokens` is a subset of pre-invoke messages, while retained
    *  tool results sit outside that total. Widen both sides of the split by the
    *  retained count, then bound the share by the current used-token remainder. */

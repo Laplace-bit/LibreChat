@@ -139,5 +139,8 @@ export function projectPiContextUsage(
     prePruneContextTokens: calibratedMessageTokens,
     remainingContextTokens,
     calibrationRatio,
+    ...(input.summaryTokens == null || input.summaryTokens === 0
+      ? {}
+      : { summaryPlacement: 'system_prompt' as const }),
   };
 }

@@ -45,6 +45,7 @@ describe('projectPiContextUsage', () => {
       prePruneContextTokens: 34,
       remainingContextTokens: 7727,
       calibrationRatio: 1.25,
+      summaryPlacement: 'system_prompt',
     });
   });
 

@@ -243,7 +243,9 @@ export function collectAnchorSeries(
           normalizeTokenCount(
             snapshot.effectiveInstructionTokens ?? snapshot.breakdown?.instructionTokens,
           ) +
-          normalizeTokenCount(snapshot.breakdown?.summaryTokens) +
+          (snapshot.summaryPlacement == null
+            ? normalizeTokenCount(snapshot.breakdown?.summaryTokens)
+            : 0) +
           normalizeTokenCount(snapshot.breakdown?.messageTokens);
         if (used > 0) {
           series.push({ used, basis: 'breakdown', configuration });

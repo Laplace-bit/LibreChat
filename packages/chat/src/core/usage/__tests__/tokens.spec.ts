@@ -1032,6 +1032,27 @@ describe('per-message usage index (branch + total)', () => {
     expect(collectAnchorSeries(CONVO, 'a2', anchors)).toEqual([{ used: 185, basis: 'breakdown' }]);
   });
 
+  it('does not add an annotated summary twice to a breakdown-based anchor', () => {
+    buildIndex(CONVO, [msg('u1', Constants.NO_PARENT, true, 4), msg('a1', 'u1', false, 10)]);
+    const anchors = new Map<string, unknown>([
+      [
+        'a1',
+        {
+          contextBudget: 1000,
+          summaryPlacement: 'system_prompt',
+          breakdown: {
+            maxContextTokens: 1000,
+            instructionTokens: 100,
+            summaryTokens: 25,
+            messageTokens: 60,
+          },
+        },
+      ],
+    ]);
+
+    expect(collectAnchorSeries(CONVO, 'a1', anchors)).toEqual([{ used: 160, basis: 'breakdown' }]);
+  });
+
   it('latestExchangeTokens sums the tail response and its user turn', () => {
     buildIndex(CONVO, [
       msg('u1', Constants.NO_PARENT, true, 12),

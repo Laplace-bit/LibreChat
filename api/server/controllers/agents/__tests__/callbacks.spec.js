@@ -33,6 +33,8 @@ jest.mock('@librechat/api', () => ({
   isCodeArtifactToolOutput: jest.requireActual('@librechat/api').isCodeArtifactToolOutput,
   isCodeSessionToolName: jest.requireActual('@librechat/api').isCodeSessionToolName,
   collectToolCallIds: jest.requireActual('@librechat/api').collectToolCallIds,
+  annotateContextSummaryPlacement:
+    jest.requireActual('@librechat/api').annotateContextSummaryPlacement,
   captureSubagentIdentity: jest.requireActual('@librechat/api').captureSubagentIdentity,
   feedSubagentAggregator: jest.requireActual('@librechat/api').feedSubagentAggregator,
   createToolTimingAdapter: jest.requireActual('@librechat/api').createToolTimingAdapter,
@@ -299,6 +301,47 @@ describe('resumable event generation fencing', () => {
     expect(GenerationJobManager.emitChunk).toHaveBeenCalledWith(
       'conversation-1',
       { event: GraphEvents.ON_CONTEXT_USAGE, data },
+      { expectedCreatedAt: 1234 },
+    );
+  });
+
+  it('marks context summaries using the SDK instruction breakdown', async () => {
+    const { GenerationJobManager } = require('@librechat/api');
+    const { GraphEvents } = jest.requireActual('@librechat/agents');
+    const { getDefaultHandlers } = require('../callbacks');
+    const contextUsageSink = { latest: null, count: 0 };
+    const data = {
+      contextBudget: 1000,
+      remainingContextTokens: 400,
+      breakdown: {
+        instructionTokens: 450,
+        systemMessageTokens: 100,
+        dynamicInstructionTokens: 20,
+        toolSchemaTokens: 280,
+        summaryTokens: 50,
+      },
+    };
+    const handlers = getDefaultHandlers({
+      res: { write: jest.fn() },
+      aggregateContent: jest.fn(),
+      toolEndCallback: jest.fn(),
+      collectedUsage: [],
+      contextUsageSink,
+      streamId: 'conversation-summary',
+      jobCreatedAt: 1234,
+    });
+
+    await handlers[GraphEvents.ON_CONTEXT_USAGE].handle(GraphEvents.ON_CONTEXT_USAGE, data, {
+      hide_sequential_outputs: false,
+    });
+
+    expect(contextUsageSink.latest.summaryPlacement).toBe('user_message');
+    expect(GenerationJobManager.emitChunk).toHaveBeenCalledWith(
+      'conversation-summary',
+      {
+        event: GraphEvents.ON_CONTEXT_USAGE,
+        data: { ...data, summaryPlacement: 'user_message' },
+      },
       { expectedCreatedAt: 1234 },
     );
   });

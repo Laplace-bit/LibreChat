@@ -328,6 +328,89 @@ function makePiToolApprovalJob(overrides = {}) {
   return { job, continuation, args };
 }
 
+function makePiAskUserQuestionJob(questions) {
+  const args = { questions };
+  const [first] = questions;
+  const continuation = {
+    kind: 'ask_user_question',
+    version: 1,
+    actionId: ACTION_ID,
+    piToolCallId: 'pi-ask-call-1',
+    hostToolCallId: 'tc1',
+    toolTurn: 0,
+    toolName: 'ask_user_question',
+    args,
+    stepIdentity: {
+      id: 'pi-ask-step-1',
+      index: 0,
+      messageId: RESPONSE_MSG_ID,
+      runId: RESPONSE_MSG_ID,
+      agentId: AGENT_ID,
+    },
+    stepCreatedAt: 100,
+  };
+  const question = {
+    question: first.question,
+    ...(first.description == null ? {} : { description: first.description }),
+    ...(first.options == null ? {} : { options: first.options }),
+    ...(first.multiSelect == null ? {} : { multiSelect: first.multiSelect }),
+  };
+  const job = makeToolApprovalJob({
+    metadata: {
+      agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+      piResumeContinuation: continuation,
+      pendingAction: {
+        actionId: ACTION_ID,
+        payload: {
+          type: 'ask_user_question',
+          question,
+          questions,
+          tool_call_id: 'tc1',
+        },
+      },
+    },
+  });
+  return { job, continuation, args };
+}
+
+function makePiAskUserQuestionResumeState(continuation, args = continuation.args) {
+  return {
+    aggregatedContent: [
+      {
+        type: 'tool_call',
+        tool_call: {
+          id: continuation.hostToolCallId,
+          stepId: continuation.stepIdentity.id,
+          name: continuation.toolName,
+          args: JSON.stringify(args),
+        },
+      },
+    ],
+    runSteps: [
+      {
+        id: continuation.stepIdentity.id,
+        runId: continuation.stepIdentity.runId,
+        agentId: continuation.stepIdentity.agentId,
+        type: 'tool_calls',
+        index: continuation.stepIdentity.index,
+        created_at: continuation.stepCreatedAt,
+        status: 'in_progress',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              id: continuation.hostToolCallId,
+              type: 'tool_call',
+              name: continuation.toolName,
+              args,
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
 function makePiApprovalResumeState({ args, stepIdentity }) {
   return {
     aggregatedContent: [
@@ -355,8 +438,9 @@ function makePiApprovalResumeState({ args, stepIdentity }) {
           tool_calls: [
             {
               id: 'tc1',
-              type: 'function',
-              function: { name: Tools.file_search, arguments: args },
+              type: 'tool_call',
+              name: Tools.file_search,
+              args,
             },
           ],
         },
@@ -2768,6 +2852,127 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockCheckAndIncrementPendingRequest).not.toHaveBeenCalled();
       expect(mockClaimScheduleResume).not.toHaveBeenCalled();
       expect(mockInitializeClient).not.toHaveBeenCalled();
+    });
+
+    it('resumes a Pi ask-user pause through the existing answers API and CAS provenance', async () => {
+      const questions = [
+        { id: 'plant_code', question: 'Which plant should I use?' },
+        { id: 'window_7d', question: 'Which time window should I check?' },
+      ];
+      const { job, continuation } = makePiAskUserQuestionJob(questions);
+      const answers = { plant_code: 'North', window_7d: 'last 7 days' };
+      const output = JSON.stringify({ answers });
+      const resumeState = makePiAskUserQuestionResumeState(continuation);
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
+      const resumedClient = makeClient({
+        contentParts: [
+          makeToolCallContent({
+            id: 'tc1',
+            name: 'ask_user_question',
+            args: JSON.stringify(continuation.args),
+            output,
+          }),
+          { type: 'text', text: 'I will check North for the last 7 days.' },
+        ],
+      });
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+
+      const res = await post({
+        conversationId: CONVO_ID,
+        actionId: ACTION_ID,
+        agent_id: AGENT_ID,
+        endpoint: 'agents',
+        answers,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('resuming');
+      await settled;
+      await flush();
+
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({
+          piAskUserQuestionContinuation: continuation,
+          piAskUserQuestionAnswer: { answers },
+        }),
+      );
+      const [resumeInput] = resumedClient.resumeCompletion.mock.calls[0];
+      expect(resumeInput).not.toHaveProperty('prompt');
+      expect(resumeInput).not.toHaveProperty('messages');
+      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
+        CONVO_ID,
+        ACTION_ID,
+        expect.objectContaining({
+          resolvedAskUserQuestions: [
+            {
+              request: { questions },
+              output,
+              toolCallId: 'tc1',
+            },
+          ],
+        }),
+        1000,
+      );
+      expect(mockSaveMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ unfinished: false }),
+        expect.anything(),
+      );
+    });
+
+    it('rejects empty or foreign Pi answer IDs before the resume ownership CAS', async () => {
+      const { job } = makePiAskUserQuestionJob([{ id: 'asset_id', question: 'Which asset?' }]);
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+
+      const emptyAnswer = await post({
+        conversationId: CONVO_ID,
+        actionId: ACTION_ID,
+        agent_id: AGENT_ID,
+        endpoint: 'agents',
+        answers: { asset_id: '' },
+      });
+      const foreignAnswer = await post({
+        conversationId: CONVO_ID,
+        actionId: ACTION_ID,
+        agent_id: AGENT_ID,
+        endpoint: 'agents',
+        answers: { other_question: 'Plant 2' },
+      });
+
+      expect(emptyAnswer.status).toBe(400);
+      expect(foreignAnswer.status).toBe(400);
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+    });
+
+    it('accepts a user-declined free-form Pi answer without a new API shape', async () => {
+      const { job, continuation } = makePiAskUserQuestionJob([
+        { id: 'asset_id', question: 'Which asset should I inspect?' },
+      ]);
+      const answers = { asset_id: 'I decline to provide an asset ID.' };
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiAskUserQuestionResumeState(continuation),
+      );
+      const resumedClient = makeClient();
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+
+      const res = await post({
+        conversationId: CONVO_ID,
+        actionId: ACTION_ID,
+        agent_id: AGENT_ID,
+        endpoint: 'agents',
+        answers,
+      });
+
+      expect(res.status).toBe(200);
+      await settled;
+      await flush();
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({ piAskUserQuestionAnswer: { answers } }),
+      );
     });
 
     it('resumes a valid Pi approval through the route and finalizes the existing generation', async () => {

@@ -333,7 +333,7 @@ describe('createPiHostToolExecutor', () => {
     const restoredCounts = buildPiToolUsageCounts({
       runSteps: [
         { stepDetails: { tool_calls: [{ function: { name: Tools.web_search } }] } },
-        { stepDetails: { tool_calls: [{ function: { name: PI_CALCULATOR_TOOL_NAME } }] } },
+        { stepDetails: { tool_calls: [{ type: 'tool_call', name: PI_CALCULATOR_TOOL_NAME }] } },
         { stepDetails: { tool_calls: [{ function: { name: Tools.web_search } }] } },
       ],
       pendingTool: { name: Tools.web_search, turn: 2 },
@@ -436,7 +436,9 @@ describe('createPiHostToolExecutor', () => {
           tool_calls: [
             {
               id: 'host-call-1',
-              function: { name: Tools.file_search, arguments: { query: 'maintenance manual' } },
+              type: 'tool_call',
+              name: Tools.file_search,
+              args: { query: 'maintenance manual' },
             },
           ],
         },

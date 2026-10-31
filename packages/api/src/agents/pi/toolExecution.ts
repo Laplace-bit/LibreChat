@@ -31,6 +31,7 @@ import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostEvent } from './events';
 import {
+  ASK_USER_QUESTION_TOOL_NAME,
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
   PI_DELETE_MEMORY_TOOL_NAME,
@@ -40,7 +41,11 @@ import {
   PI_WEB_SEARCH_TOOL_NAME,
   isPiSupportedHostToolName,
 } from './toolNames';
-import { validatePiToolExecutionInput } from './tools';
+import {
+  PiToolCompatibilityError,
+  validatePiAskUserQuestionArguments,
+  validatePiToolExecutionInput,
+} from './tools';
 import { isPiActionToolName } from './actionSchema';
 import { isPiMcpToolName } from './mcpSchema';
 
@@ -159,6 +164,8 @@ export interface PiToolExecutionOptions {
     controller: PiPauseController;
     evaluate: PiToolExecutionGate;
   };
+  /** Set only after the existing Agent capability and administrator gates pass. */
+  askUserQuestionEnabled?: boolean;
   now?: () => number;
 }
 
@@ -183,10 +190,15 @@ export function buildPiToolUsageCounts(input: {
       continue;
     }
     for (const toolCall of step.stepDetails.tool_calls) {
-      if (!isRecord(toolCall) || !isRecord(toolCall.function)) {
+      if (!isRecord(toolCall)) {
         continue;
       }
-      const name = toolCall.function.name;
+      let name: unknown;
+      if (typeof toolCall.name === 'string') {
+        name = toolCall.name;
+      } else if (isRecord(toolCall.function)) {
+        name = toolCall.function.name;
+      }
       if (
         typeof name === 'string' &&
         (isPiSupportedHostToolName(name) || isPiMcpToolName(name) || isPiActionToolName(name))
@@ -440,6 +452,14 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    case ASK_USER_QUESTION_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: ASK_USER_QUESTION_TOOL_NAME,
+        args: input.args,
+        hostExecution,
+        review,
+      };
     default:
       throw new Error('The Pi approval call has no host tool adapter.');
   }
@@ -557,11 +577,9 @@ function buildRunStep(
       tool_calls: [
         {
           id: toolCallId,
-          type: 'function',
-          function: {
-            name: input.name,
-            arguments: input.args,
-          },
+          type: 'tool_call',
+          name: input.name,
+          args: input.args,
         },
       ],
     },
@@ -812,9 +830,17 @@ export function createPiHostToolExecutor(
   };
   const seenPiToolCallIds = new Set<string>();
   const createPauseResult = (signal: PiPauseSignal) =>
-    signal.kind === 'tool_approval'
+    signal.kind === 'tool_approval' || signal.kind === 'ask_user_question'
       ? {
-          content: [{ type: 'text' as const, text: 'This tool call is paused for host review.' }],
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                signal.kind === 'ask_user_question'
+                  ? 'This tool call is paused while the user answers.'
+                  : 'This tool call is paused for host review.',
+            },
+          ],
           details: { status: 'paused' as const },
           terminate: true,
         }
@@ -846,11 +872,38 @@ export function createPiHostToolExecutor(
       }),
       turn: toolInput.turn,
     });
+    const pauseForAskUserQuestion = async (
+      execution: PiToolExecutionContext,
+    ): Promise<
+      AgentToolResult<{ status: HostToolStatus | 'paused' | 'unsupported_batch' }> | undefined
+    > => {
+      if (execution.name !== ASK_USER_QUESTION_TOOL_NAME) {
+        return undefined;
+      }
+      if (options.askUserQuestionEnabled !== true || options.pauseGate == null) {
+        throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
+      }
+      const args = validatePiAskUserQuestionArguments(execution.args);
+      const step = await startPiToolStep(options, execution, now(), now);
+      return createPauseResult(
+        options.pauseGate.controller.requestAskUserQuestion({
+          toolCallId: execution.toolCallId,
+          name: ASK_USER_QUESTION_TOOL_NAME,
+          args,
+          hostExecution: {
+            toolCallId: step.toolCallId,
+            toolTurn: execution.turn,
+            stepIdentity: step.identity,
+            createdAt: step.createdAt,
+          },
+        }),
+      );
+    };
 
     if (options.pauseGate != null) {
       const pendingPause = options.pauseGate.controller.signal;
       if (pendingPause != null) {
-        if (pendingPause.kind === 'tool_approval') {
+        if (pendingPause.kind === 'tool_approval' || pendingPause.kind === 'ask_user_question') {
           return createPauseResult(
             options.pauseGate.controller.rejectBatch([
               pendingPause.toolCall.toolCallId,
@@ -866,7 +919,10 @@ export function createPiHostToolExecutor(
       }
       const pendingPauseAfterGate = options.pauseGate.controller.signal;
       if (pendingPauseAfterGate != null) {
-        if (pendingPauseAfterGate.kind === 'tool_approval') {
+        if (
+          pendingPauseAfterGate.kind === 'tool_approval' ||
+          pendingPauseAfterGate.kind === 'ask_user_question'
+        ) {
           return createPauseResult(
             options.pauseGate.controller.rejectBatch([
               pendingPauseAfterGate.toolCall.toolCallId,
@@ -880,6 +936,10 @@ export function createPiHostToolExecutor(
         case 'execute':
           if (decision.args != null) {
             executionInput = validateGateArguments(decision.args);
+          }
+          if (executionInput.name === ASK_USER_QUESTION_TOOL_NAME) {
+            const paused = await pauseForAskUserQuestion(executionInput);
+            if (paused != null) return paused;
           }
           break;
         case 'deny': {
@@ -927,6 +987,11 @@ export function createPiHostToolExecutor(
           throw exhaustive;
         }
       }
+    }
+
+    if (options.pauseGate == null && executionInput.name === ASK_USER_QUESTION_TOOL_NAME) {
+      const paused = await pauseForAskUserQuestion(executionInput);
+      if (paused != null) return paused;
     }
 
     if (signal?.aborted) {

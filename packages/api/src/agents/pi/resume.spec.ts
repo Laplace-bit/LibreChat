@@ -2,21 +2,26 @@ import { DATE_RANGE, Constants } from '@librechat/agents';
 import { actionDelimiter, Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
 import type { PiDeleteMemoryArguments, PiSetMemoryArguments } from './tools';
-import type { PiPauseToolCall } from './pause';
+import type { PiPauseAskUserQuestionCall, PiPauseToolCall } from './pause';
+import type { PiAskUserQuestionArguments } from './tools';
 import {
   appendPiToolResultContinuation,
   buildPiApprovalInterruptPayload,
+  createPiAskUserQuestionContinuation,
   createPiApprovalContinuation,
+  matchesPiAskUserQuestionHostState,
   matchesPiApprovalHostState,
   revalidatePiActionApprovalArguments,
   revalidatePiMcpApprovalArguments,
   resolvePiApprovalContinuation,
+  resolvePiAskUserQuestionContinuation,
   resolvePiApprovalDecision,
 } from './resume';
 import {
   PI_DELETE_MEMORY_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
+  ASK_USER_QUESTION_TOOL_NAME,
 } from './toolNames';
 import { createPiActionToolSchemaRegistry, isPiActionToolName } from './actionSchema';
 import { createPiMcpToolSchemaRegistry } from './mcpSchema';
@@ -61,6 +66,51 @@ function createApproval() {
   };
 }
 
+function createPiAskUserQuestion() {
+  const args: PiAskUserQuestionArguments = {
+    questions: [
+      { id: 'plant_code', question: 'Which plant?' },
+      { id: 'window_7d', question: 'Which time window?' },
+    ],
+  };
+  const [first] = args.questions;
+  const toolCall: PiPauseAskUserQuestionCall = {
+    toolCallId: 'pi-ask-call-1',
+    name: ASK_USER_QUESTION_TOOL_NAME,
+    args,
+    hostExecution: {
+      toolCallId: 'host-ask-call-1',
+      toolTurn: 2,
+      stepIdentity: {
+        id: 'ask-step-1',
+        index: 3,
+        messageId: 'response-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 101,
+    },
+  };
+  const payload = {
+    type: 'ask_user_question' as const,
+    question: { question: first.question },
+    questions: args.questions,
+    tool_call_id: toolCall.hostExecution.toolCallId,
+  };
+  const pendingAction = buildPendingAction(payload, {
+    streamId: 'conversation-1',
+    conversationId: 'conversation-1',
+    runId: 'response-1',
+    responseMessageId: 'response-1',
+  });
+  return {
+    args,
+    toolCall,
+    pendingAction,
+    continuation: createPiAskUserQuestionContinuation(pendingAction.actionId, toolCall),
+  };
+}
+
 function hostState(args: Record<string, unknown> = { query: 'maintenance manual' }) {
   return {
     runSteps: [
@@ -77,8 +127,9 @@ function hostState(args: Record<string, unknown> = { query: 'maintenance manual'
           tool_calls: [
             {
               id: 'host-call-1',
-              type: 'function',
-              function: { name: Tools.file_search, arguments: args },
+              type: 'tool_call',
+              name: Tools.file_search,
+              args,
             },
           ],
         },
@@ -223,6 +274,129 @@ function createActionApproval() {
 }
 
 describe('Pi approval continuation', () => {
+  it('binds ask-user continuation to the exact question IDs, action and unfinished host step', () => {
+    const { continuation, pendingAction, args, toolCall } = createPiAskUserQuestion();
+    const resumed = resolvePiAskUserQuestionContinuation({
+      value: continuation,
+      pendingAction,
+      responseMessageId: 'response-1',
+      agentId: 'agent-1',
+    });
+    const runSteps = [
+      {
+        id: 'ask-step-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+        type: 'tool_calls',
+        index: 3,
+        created_at: 101,
+        status: 'in_progress',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              id: 'host-ask-call-1',
+              type: 'tool_call',
+              name: ASK_USER_QUESTION_TOOL_NAME,
+              args,
+            },
+          ],
+        },
+      },
+    ];
+    const aggregatedContent = [
+      {
+        type: 'tool_call',
+        tool_call: {
+          id: 'host-ask-call-1',
+          stepId: 'ask-step-1',
+          name: ASK_USER_QUESTION_TOOL_NAME,
+          args: JSON.stringify(args),
+        },
+      },
+    ];
+
+    expect(resumed).toEqual(continuation);
+    expect(
+      resolvePiAskUserQuestionContinuation({
+        value: { ...continuation, hostToolCallId: 'foreign-host-call' },
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+    expect(
+      resolvePiAskUserQuestionContinuation({
+        value: continuation,
+        pendingAction: {
+          ...pendingAction,
+          payload: { type: 'tool_approval' },
+        } as unknown as Agents.PendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+    expect(
+      matchesPiAskUserQuestionHostState({
+        continuation,
+        runSteps,
+        aggregatedContent,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBe(true);
+    expect(
+      matchesPiAskUserQuestionHostState({
+        continuation,
+        runSteps,
+        aggregatedContent,
+        responseMessageId: 'replacement-response',
+        agentId: 'agent-1',
+      }),
+    ).toBe(false);
+    expect(toolCall.toolCallId).toBe(continuation.piToolCallId);
+  });
+
+  it('appends a user answer to the original Pi ask tool-call ID', () => {
+    const { continuation, args } = createPiAskUserQuestion();
+    const answers = { plant_code: 'North', window_7d: 'last 7 days' };
+    const result = appendPiToolResultContinuation({
+      conversion: {
+        systemPrompt: 'Be useful.',
+        history: [],
+        prompt: { text: 'Choose a plant.', images: [] },
+      },
+      continuation,
+      toolArguments: args,
+      result: { content: [{ type: 'text', text: JSON.stringify({ answers }) }], isError: false },
+      model: {
+        api: 'openai-responses',
+        provider: 'librechat-openai',
+        id: 'gpt-4o-mini',
+      },
+      now: () => 200,
+    });
+
+    expect(result.map((message) => message.role)).toEqual(['user', 'assistant', 'toolResult']);
+    expect(result[1]).toMatchObject({
+      role: 'assistant',
+      content: [
+        {
+          type: 'toolCall',
+          id: continuation.piToolCallId,
+          name: ASK_USER_QUESTION_TOOL_NAME,
+          arguments: args,
+        },
+      ],
+    });
+    expect(result[2]).toMatchObject({
+      role: 'toolResult',
+      toolCallId: continuation.piToolCallId,
+      toolName: ASK_USER_QUESTION_TOOL_NAME,
+      content: [{ type: 'text', text: JSON.stringify({ answers }) }],
+    });
+  });
+
   it('preserves a host skill action through the existing approval continuation shape', () => {
     const toolCall: PiPauseToolCall = {
       toolCallId: 'pi-skill-call',
@@ -283,10 +457,9 @@ describe('Pi approval continuation', () => {
               tool_calls: [
                 {
                   id: 'host-skill-call',
-                  function: {
-                    name: PI_SKILL_TOOL_NAME,
-                    arguments: toolCall.args,
-                  },
+                  type: 'tool_call',
+                  name: PI_SKILL_TOOL_NAME,
+                  args: toolCall.args,
                 },
               ],
             },
@@ -379,7 +552,9 @@ describe('Pi approval continuation', () => {
               tool_calls: [
                 {
                   id: `host-${name}-call`,
-                  function: { name, arguments: args },
+                  type: 'tool_call',
+                  name,
+                  args,
                 },
               ],
             },

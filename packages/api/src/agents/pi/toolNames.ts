@@ -1,6 +1,8 @@
 import { Constants } from '@librechat/agents';
 import { Tools } from 'librechat-data-provider';
 import { DELETE_MEMORY_TOOL_NAME, SET_MEMORY_TOOL_NAME } from '../memoryToolNames';
+import { ASK_USER_QUESTION_TOOL_NAME } from '../hitl/askUserQuestionTool';
+export { ASK_USER_QUESTION_TOOL_NAME };
 
 export const PI_CALCULATOR_TOOL_NAME = 'calculator';
 export const PI_BASH_TOOL_NAME: typeof Constants.BASH_TOOL = Constants.BASH_TOOL;
@@ -18,7 +20,8 @@ export type PiSupportedHostTool =
   | typeof PI_READ_FILE_TOOL_NAME
   | typeof PI_SKILL_TOOL_NAME
   | typeof PI_SET_MEMORY_TOOL_NAME
-  | typeof PI_DELETE_MEMORY_TOOL_NAME;
+  | typeof PI_DELETE_MEMORY_TOOL_NAME
+  | typeof ASK_USER_QUESTION_TOOL_NAME;
 export const PI_SUPPORTED_HOST_TOOLS: readonly PiSupportedHostTool[] = [
   Tools.file_search,
   PI_WEB_SEARCH_TOOL_NAME,
@@ -28,6 +31,7 @@ export const PI_SUPPORTED_HOST_TOOLS: readonly PiSupportedHostTool[] = [
   PI_SKILL_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
   PI_DELETE_MEMORY_TOOL_NAME,
+  ASK_USER_QUESTION_TOOL_NAME,
 ];
 
 export function isPiCodeExecutionToolName(

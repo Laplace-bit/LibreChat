@@ -3,10 +3,10 @@ import type {
   AgentSessionEventListener,
   ModelRuntime,
   PromptOptions,
-  ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import type { PiHistoryMessage } from './history';
 import type { PiPauseController } from './pause';
+import type { PiToolDefinition } from './tools';
 import { createPiProviderEventObserver, isPiToolBatchEventApi } from './providerEvents';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 
@@ -22,7 +22,7 @@ export interface HostPiSessionOptions {
   /** Must return a fresh credential/runtime binding for this generation. */
   createModelBinding(): Promise<PiModelBinding>;
   systemPrompt: string;
-  tools: ToolDefinition[];
+  tools: PiToolDefinition[];
   /** Structured, server-converted history; each message remains a separate Pi entry. */
   history?: PiHistoryMessage[];
   /** Rejects multi-call tool batches before any tool gate or host handler runs. */

@@ -7,17 +7,27 @@ import type {
   PiActionToolSchemaRegistry,
 } from './actionSchema';
 import type {
+  PiAskUserQuestionArguments,
+  PiBuiltInToolArguments,
+  PiHostToolExecutionInput,
+  PiToolArguments,
+} from './tools';
+import type {
   PiMcpSchemaFingerprint,
   PiMcpToolArguments,
   PiMcpToolName,
   PiMcpToolSchemaRegistry,
 } from './mcpSchema';
-import type { PiBuiltInToolArguments, PiHostToolExecutionInput, PiToolArguments } from './tools';
+import type { PiPauseAskUserQuestionCall, PiPauseToolCall } from './pause';
 import type { PiHistoryConversion, PiHistoryMessage } from './history';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiSupportedHostTool } from './toolNames';
 import type { PiMessageStepIdentity } from './events';
-import type { PiPauseToolCall } from './pause';
+import {
+  PiToolCompatibilityError,
+  validatePiAskUserQuestionArguments,
+  validatePiToolExecutionInput,
+} from './tools';
 import {
   isPiActionSchemaFingerprint,
   isPiActionToolName,
@@ -29,7 +39,7 @@ import {
   normalizePiMcpToolArguments,
 } from './mcpSchema';
 import { isPiCodeExecutionToolName, isPiSupportedHostToolName } from './toolNames';
-import { PiToolCompatibilityError, validatePiToolExecutionInput } from './tools';
+import { ASK_USER_QUESTION_TOOL_NAME } from '../hitl/askUserQuestionTool';
 import { parsePiCodeSessionSnapshot } from './codeSession';
 
 export const PI_RESUME_CONTINUATION_VERSION = 1 as const;
@@ -74,6 +84,21 @@ export type PiApprovalContinuation = PiApprovalContinuationFields &
         readonly schemaFingerprint: PiActionSchemaFingerprint;
       }
   );
+
+export interface PiAskUserQuestionContinuation {
+  readonly kind: 'ask_user_question';
+  readonly version: typeof PI_RESUME_CONTINUATION_VERSION;
+  readonly actionId: string;
+  readonly piToolCallId: string;
+  readonly hostToolCallId: string;
+  readonly toolTurn: number;
+  readonly toolName: typeof ASK_USER_QUESTION_TOOL_NAME;
+  readonly args: PiAskUserQuestionArguments;
+  readonly stepIdentity: PiMessageStepIdentity;
+  readonly stepCreatedAt: number;
+}
+
+export type PiToolResultContinuation = PiApprovalContinuation | PiAskUserQuestionContinuation;
 
 export type PiApprovalInterruptInput = {
   readonly hostToolCallId: string;
@@ -235,6 +260,45 @@ export function createPiApprovalContinuation(
     };
   }
   return { ...fields, toolName: toolCall.name, args: toolCall.args };
+}
+
+function askUserQuestionFallback(args: PiAskUserQuestionArguments) {
+  const [first] = args.questions;
+  if (first == null) {
+    throw new Error('Pi ask-user continuation requires at least one question');
+  }
+  return {
+    question: first.question,
+    ...(first.description == null ? {} : { description: first.description }),
+    ...(first.options == null ? {} : { options: first.options }),
+    ...(first.multiSelect == null ? {} : { multiSelect: first.multiSelect }),
+  };
+}
+
+/** Convert the host-managed question pause into the durable server-side envelope. */
+export function createPiAskUserQuestionContinuation(
+  actionId: string,
+  toolCall: PiPauseAskUserQuestionCall,
+): PiAskUserQuestionContinuation {
+  if (actionId.length === 0) {
+    throw new Error('Pi continuation requires a pending action identity');
+  }
+  if (toolCall.toolCallId.length === 0) {
+    throw new Error('Pi ask-user continuation has an invalid tool identity');
+  }
+  const args = validatePiAskUserQuestionArguments(toolCall.args);
+  return {
+    kind: 'ask_user_question',
+    version: PI_RESUME_CONTINUATION_VERSION,
+    actionId,
+    piToolCallId: toolCall.toolCallId,
+    hostToolCallId: toolCall.hostExecution.toolCallId,
+    toolTurn: toolCall.hostExecution.toolTurn,
+    toolName: ASK_USER_QUESTION_TOOL_NAME,
+    args,
+    stepIdentity: { ...toolCall.hostExecution.stepIdentity },
+    stepCreatedAt: toolCall.hostExecution.createdAt,
+  };
 }
 
 /**
@@ -418,6 +482,89 @@ export function resolvePiApprovalContinuation(input: {
   return { ...fields, toolName: validatedCall.name, args: validatedCall.args };
 }
 
+/** Decode an ask-user envelope only when every field matches the pending action and job. */
+export function resolvePiAskUserQuestionContinuation(input: {
+  value: unknown;
+  pendingAction: Agents.PendingAction | undefined;
+  responseMessageId: string;
+  agentId: string;
+}): PiAskUserQuestionContinuation | undefined {
+  const { value, pendingAction, responseMessageId, agentId } = input;
+  if (
+    pendingAction == null ||
+    !isRecord(value) ||
+    !hasExactKeys(value, [
+      'kind',
+      'version',
+      'actionId',
+      'piToolCallId',
+      'hostToolCallId',
+      'toolTurn',
+      'toolName',
+      'args',
+      'stepIdentity',
+      'stepCreatedAt',
+    ]) ||
+    value.kind !== 'ask_user_question' ||
+    value.version !== PI_RESUME_CONTINUATION_VERSION ||
+    typeof value.actionId !== 'string' ||
+    value.actionId !== pendingAction.actionId ||
+    typeof value.piToolCallId !== 'string' ||
+    value.piToolCallId.length === 0 ||
+    typeof value.hostToolCallId !== 'string' ||
+    value.hostToolCallId.length === 0 ||
+    typeof value.toolTurn !== 'number' ||
+    !Number.isSafeInteger(value.toolTurn) ||
+    value.toolTurn < 0 ||
+    value.toolName !== ASK_USER_QUESTION_TOOL_NAME ||
+    typeof value.stepCreatedAt !== 'number' ||
+    !Number.isSafeInteger(value.stepCreatedAt) ||
+    value.stepCreatedAt < 0
+  ) {
+    return undefined;
+  }
+
+  let validatedArgs: PiAskUserQuestionArguments;
+  const stepIdentity = parseStepIdentity(value.stepIdentity);
+  try {
+    validatedArgs = validatePiAskUserQuestionArguments(value.args);
+  } catch {
+    return undefined;
+  }
+  if (
+    stepIdentity == null ||
+    stepIdentity.messageId !== responseMessageId ||
+    stepIdentity.runId !== responseMessageId ||
+    stepIdentity.agentId !== agentId
+  ) {
+    return undefined;
+  }
+
+  const payload = pendingAction.payload;
+  if (
+    !isRecord(payload) ||
+    payload.type !== ASK_USER_QUESTION_TOOL_NAME ||
+    payload.tool_call_id !== value.hostToolCallId ||
+    !sameJson(payload.questions, validatedArgs.questions) ||
+    !sameJson(payload.question, askUserQuestionFallback(validatedArgs))
+  ) {
+    return undefined;
+  }
+
+  return {
+    kind: 'ask_user_question',
+    version: PI_RESUME_CONTINUATION_VERSION,
+    actionId: value.actionId,
+    piToolCallId: value.piToolCallId,
+    hostToolCallId: value.hostToolCallId,
+    toolTurn: value.toolTurn,
+    toolName: ASK_USER_QUESTION_TOOL_NAME,
+    args: validatedArgs,
+    stepIdentity,
+    stepCreatedAt: value.stepCreatedAt,
+  };
+}
+
 function decodeArguments(value: unknown): Record<string, unknown> | undefined {
   let decoded = value;
   if (typeof decoded === 'string') {
@@ -430,9 +577,18 @@ function decodeArguments(value: unknown): Record<string, unknown> | undefined {
   return isRecord(decoded) ? decoded : undefined;
 }
 
-/** Bind the envelope to the exact unfinished host step and content recorded by this job. */
-export function matchesPiApprovalHostState(input: {
-  continuation: PiApprovalContinuation;
+interface PiHostStepContinuation {
+  piToolCallId: string;
+  hostToolCallId: string;
+  toolName: string;
+  args: unknown;
+  stepIdentity: PiMessageStepIdentity;
+  stepCreatedAt: number;
+}
+
+/** Bind a Pi tool continuation to the exact unfinished host step and content in this job. */
+function matchesPiToolHostState(input: {
+  continuation: PiHostStepContinuation;
   runSteps: readonly unknown[];
   aggregatedContent: readonly unknown[];
   responseMessageId: string;
@@ -448,7 +604,7 @@ export function matchesPiApprovalHostState(input: {
       return false;
     }
     const [toolCall] = details.tool_calls;
-    if (!isRecord(toolCall) || !isRecord(toolCall.function)) {
+    if (!isRecord(toolCall)) {
       return false;
     }
     return (
@@ -463,8 +619,9 @@ export function matchesPiApprovalHostState(input: {
       candidate.agentId === input.agentId &&
       details.tool_calls.length === 1 &&
       toolCall.id === continuation.hostToolCallId &&
-      toolCall.function.name === continuation.toolName &&
-      sameJson(decodeArguments(toolCall.function.arguments), continuation.args)
+      toolCall.type === 'tool_call' &&
+      toolCall.name === continuation.toolName &&
+      sameJson(decodeArguments(toolCall.args), continuation.args)
     );
   });
   if (matches.length !== 1) {
@@ -484,6 +641,28 @@ export function matchesPiApprovalHostState(input: {
     );
   });
   return contentMatches.length === 1;
+}
+
+/** Bind an approval continuation to its persisted in-progress host step. */
+export function matchesPiApprovalHostState(input: {
+  continuation: PiApprovalContinuation;
+  runSteps: readonly unknown[];
+  aggregatedContent: readonly unknown[];
+  responseMessageId: string;
+  agentId: string;
+}): boolean {
+  return matchesPiToolHostState(input);
+}
+
+/** Bind an ask-user continuation to its persisted in-progress host step. */
+export function matchesPiAskUserQuestionHostState(input: {
+  continuation: PiAskUserQuestionContinuation;
+  runSteps: readonly unknown[];
+  aggregatedContent: readonly unknown[];
+  responseMessageId: string;
+  agentId: string;
+}): boolean {
+  return matchesPiToolHostState(input);
 }
 
 export type PiApprovalDecision =
@@ -618,7 +797,7 @@ export function resolvePiApprovalDecision(input: {
 /** Append the approved tool exchange to a fresh in-memory Pi history projection. */
 export function appendPiToolResultContinuation(input: {
   conversion: PiHistoryConversion;
-  continuation: PiApprovalContinuation;
+  continuation: PiToolResultContinuation;
   toolArguments: PiToolArguments;
   result: Pick<ToolResultMessage, 'content' | 'isError'>;
   model: { api: AssistantMessage['api']; provider: AssistantMessage['provider']; id: string };

@@ -1,5 +1,5 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
-import type { PiPauseController, PiPauseSignal } from './pause';
+import type { PiPauseController, PiResumablePauseSignal } from './pause';
 import type { PiProviderEventFailure } from './providerEvents';
 import type { HostPiSession } from './session';
 import type { PiHostEvent } from './events';
@@ -79,7 +79,7 @@ export function createPiHostEventSequencer(
 export type PiHostSessionOutcome =
   | { status: 'completed' }
   | { status: 'cancelled' }
-  | { status: 'paused'; signal: Extract<PiPauseSignal, { kind: 'tool_approval' }> }
+  | { status: 'paused'; signal: PiResumablePauseSignal }
   | { status: 'unsupported'; reason: 'multiple_tool_calls' }
   | { status: 'unsupported'; reason: 'provider_event'; failure: PiProviderEventFailure };
 
@@ -200,7 +200,10 @@ export async function executePiHostSession(
         if (options.signal?.aborted) {
           return { status: 'cancelled' };
         }
-        if (requestedPause?.kind === 'tool_approval') {
+        if (
+          requestedPause?.kind === 'tool_approval' ||
+          requestedPause?.kind === 'ask_user_question'
+        ) {
           return { status: 'paused', signal: requestedPause };
         }
         if (requestedPause?.kind === 'unsupported_tool_batch') {
@@ -221,7 +224,7 @@ export async function executePiHostSession(
     if (options.signal?.aborted) {
       return { status: 'cancelled' };
     }
-    if (requestedPause?.kind === 'tool_approval') {
+    if (requestedPause?.kind === 'tool_approval' || requestedPause?.kind === 'ask_user_question') {
       return { status: 'paused', signal: requestedPause };
     }
     if (requestedPause?.kind === 'unsupported_tool_batch') {

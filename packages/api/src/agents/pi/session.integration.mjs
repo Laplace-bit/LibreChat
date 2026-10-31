@@ -1060,11 +1060,9 @@ test('Pi dispatcher pauses at the tool gate without host effects or terminal too
           tool_calls: [
             {
               id: 'host-call-1',
-              type: 'function',
-              function: {
-                name: Tools.file_search,
-                arguments: { query: 'maintenance manual' },
-              },
+              type: 'tool_call',
+              name: Tools.file_search,
+              args: { query: 'maintenance manual' },
             },
           ],
         },

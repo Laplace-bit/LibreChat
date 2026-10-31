@@ -10,6 +10,7 @@ import type {
   PiActionToolSchema,
   PiActionToolSchemaRegistry,
 } from './actionSchema';
+import type { AskUserQuestionToolInput } from '../hitl/askUserQuestionTool';
 import {
   createPiMcpToolSchema,
   createPiMcpToolSchemaRegistry,
@@ -31,6 +32,11 @@ import {
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
+import {
+  AskUserQuestionToolDefinition,
+  ASK_USER_QUESTION_TOOL_NAME,
+  askUserQuestionToolSchema,
+} from '../hitl/askUserQuestionTool';
 import {
   createPiActionToolSchema,
   createPiActionToolSchemaRegistry,
@@ -72,6 +78,7 @@ export type PiSkillArguments = {
 
 export type PiSetMemoryArguments = { key: string; value: string };
 export type PiDeleteMemoryArguments = { key: string };
+export type PiAskUserQuestionArguments = AskUserQuestionToolInput;
 
 export type PiBuiltInToolArguments =
   | PiFileSearchArguments
@@ -81,7 +88,8 @@ export type PiBuiltInToolArguments =
   | PiReadFileArguments
   | PiSkillArguments
   | PiSetMemoryArguments
-  | PiDeleteMemoryArguments;
+  | PiDeleteMemoryArguments
+  | PiAskUserQuestionArguments;
 
 export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments | PiActionToolArguments;
 
@@ -127,6 +135,11 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof PI_DELETE_MEMORY_TOOL_NAME;
       args: PiDeleteMemoryArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof ASK_USER_QUESTION_TOOL_NAME;
+      args: PiAskUserQuestionArguments;
     }
   | {
       kind: 'mcp';
@@ -212,6 +225,10 @@ const TOOL_FIELDS = {
   [PI_DELETE_MEMORY_TOOL_NAME]: {
     label: 'Delete memory',
     description: 'Delete user memory through LibreChat’s authorized memory service.',
+  },
+  [ASK_USER_QUESTION_TOOL_NAME]: {
+    label: 'Ask user question',
+    description: 'Ask the user a clarifying question and pause the run until they answer.',
   },
 } as const;
 
@@ -592,6 +609,9 @@ function convertPiMemorySchema(name: string, schema: Record<string, unknown>): T
 
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
+  if (name === ASK_USER_QUESTION_TOOL_NAME) {
+    return AskUserQuestionToolDefinition.schema;
+  }
   if (isPiActionToolName(name)) {
     return validateMcpSchemaResult(
       () => createPiActionToolSchema({ name, parameters: schema }).parameters,
@@ -629,7 +649,11 @@ export function convertPiToolSchema(name: string, schema: unknown): TSchema {
     return convertPiWebSearchSchema(schema);
   }
 
-  const { argument } = TOOL_FIELDS[name];
+  const fields = TOOL_FIELDS[name];
+  if (!('argument' in fields)) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+  const { argument } = fields;
   const propertySchema = schema.properties[argument];
   if (
     !hasOnlyKeys(schema.properties, [argument]) ||
@@ -838,6 +862,37 @@ export function validatePiDeleteMemoryArguments(value: unknown): PiDeleteMemoryA
   return { key: value.key };
 }
 
+export function validatePiAskUserQuestionArguments(value: unknown): PiAskUserQuestionArguments {
+  const parsed = askUserQuestionToolSchema.safeParse(value);
+  if (!parsed.success || !hasExactPiAskUserQuestionKeys(value)) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return parsed.data;
+}
+
+function hasExactPiAskUserQuestionKeys(value: unknown): boolean {
+  if (!isRecord(value) || !hasOnlyKeys(value, ['questions']) || !Array.isArray(value.questions)) {
+    return false;
+  }
+  return value.questions.every(
+    (question) =>
+      isRecord(question) &&
+      hasOnlyKeys(question, [
+        'id',
+        'header',
+        'question',
+        'description',
+        'options',
+        'multiSelect',
+      ]) &&
+      (question.options === undefined ||
+        (Array.isArray(question.options) &&
+          question.options.every(
+            (option) => isRecord(option) && hasOnlyKeys(option, ['label', 'value']),
+          ))),
+  );
+}
+
 export function validatePiToolExecutionInput(
   name: string,
   toolCallId: string,
@@ -896,6 +951,12 @@ export function validatePiToolExecutionInput(
         toolCallId,
         name: PI_DELETE_MEMORY_TOOL_NAME,
         args: validatePiDeleteMemoryArguments(args),
+      };
+    case ASK_USER_QUESTION_TOOL_NAME:
+      return {
+        toolCallId,
+        name: ASK_USER_QUESTION_TOOL_NAME,
+        args: validatePiAskUserQuestionArguments(args),
       };
     default: {
       if (isPiActionToolName(name)) {
@@ -1034,11 +1095,11 @@ export function createPiTools(input: {
       throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
     }
     seenNames.add(candidateName);
-    if (definition.parameters === undefined) {
+    const name = candidateName;
+    if (definition.parameters === undefined && name !== ASK_USER_QUESTION_TOOL_NAME) {
       throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
     }
 
-    const name = candidateName;
     if (isPiMcpToolName(name) && !isPiActionToolName(name)) {
       const schema = mcpToolSchemas.get(name);
       if (schema == null) {

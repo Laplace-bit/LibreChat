@@ -13,7 +13,9 @@ const {
   GenerationJobManager,
   resolveResumableAgentRuntime,
   resolvePiApprovalContinuation,
+  resolvePiAskUserQuestionContinuation,
   matchesPiApprovalHostState,
+  matchesPiAskUserQuestionHostState,
   resolvePiApprovalDecision,
   GENERATION_RECOVERY_FAILED_ERROR,
   isPendingActionStale,
@@ -825,12 +827,19 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   // A resumed generation uses the engine recorded when it first started. Old jobs
   // without this field are legacy. Pi is resumable only when its server-only envelope
   // decodes against the exact pending action and immutable run identities.
-  const piContinuation = resolvePiApprovalContinuation({
+  const piApprovalContinuation = resolvePiApprovalContinuation({
     value: job.metadata?.piResumeContinuation,
     pendingAction: job.metadata?.pendingAction,
     responseMessageId: job.metadata?.responseMessageId,
     agentId: job.metadata?.agent_id,
   });
+  const piAskUserQuestionContinuation = resolvePiAskUserQuestionContinuation({
+    value: job.metadata?.piResumeContinuation,
+    pendingAction: job.metadata?.pendingAction,
+    responseMessageId: job.metadata?.responseMessageId,
+    agentId: job.metadata?.agent_id,
+  });
+  const piContinuation = piApprovalContinuation ?? piAskUserQuestionContinuation;
   const runtimeResolution = resolveResumableAgentRuntime(
     job.metadata?.agentRuntime,
     piContinuation != null,
@@ -1035,18 +1044,28 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       generationProtocolVersion,
     );
   }
+  const isPiAskUserQuestionResume = pendingAction.payload.type === 'ask_user_question';
   const piDecision =
-    runtimeResolution.selection.engine === 'pi'
+    runtimeResolution.selection.engine === 'pi' && !isPiAskUserQuestionResume
       ? resolvePiApprovalDecision({
-          continuation: piContinuation,
+          continuation: piApprovalContinuation,
           resolutions: Array.isArray(req.body.decisions) ? req.body.decisions : [],
         })
       : undefined;
-  if (runtimeResolution.selection.engine === 'pi' && piDecision == null) {
+  if (
+    runtimeResolution.selection.engine === 'pi' &&
+    ((isPiAskUserQuestionResume && piAskUserQuestionContinuation == null) ||
+      (!isPiAskUserQuestionResume && (piApprovalContinuation == null || piDecision == null)))
+  ) {
     return sendGenerationJson(
       res,
       400,
-      { code: 'INVALID_PI_APPROVAL_DECISION', error: 'The Pi tool decision is invalid.' },
+      {
+        code: 'INVALID_PI_APPROVAL_DECISION',
+        error: isPiAskUserQuestionResume
+          ? 'The Pi question continuation is invalid.'
+          : 'The Pi tool decision is invalid.',
+      },
       generationProtocolVersion,
     );
   }
@@ -1154,23 +1173,35 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt, {
       validateEarlyBufferRecovery: true,
     });
-    if (
-      runtimeResolution.selection.engine === 'pi' &&
-      (resumeState == null ||
-        !matchesPiApprovalHostState({
-          continuation: piContinuation,
-          runSteps: resumeState.runSteps,
-          aggregatedContent: resumeState.aggregatedContent,
-          responseMessageId: job.metadata.responseMessageId,
-          agentId: job.metadata.agent_id,
-        }))
-    ) {
-      return sendGenerationJson(
-        res,
-        409,
-        { code: 'PI_CONTINUATION_STALE', error: 'The paused Pi tool step is no longer available.' },
-        generationProtocolVersion,
-      );
+    if (runtimeResolution.selection.engine === 'pi') {
+      const piHostStateMatches =
+        resumeState != null &&
+        (isPiAskUserQuestionResume
+          ? matchesPiAskUserQuestionHostState({
+              continuation: piAskUserQuestionContinuation,
+              runSteps: resumeState.runSteps,
+              aggregatedContent: resumeState.aggregatedContent,
+              responseMessageId: job.metadata.responseMessageId,
+              agentId: job.metadata.agent_id,
+            })
+          : matchesPiApprovalHostState({
+              continuation: piApprovalContinuation,
+              runSteps: resumeState.runSteps,
+              aggregatedContent: resumeState.aggregatedContent,
+              responseMessageId: job.metadata.responseMessageId,
+              agentId: job.metadata.agent_id,
+            }));
+      if (!piHostStateMatches) {
+        return sendGenerationJson(
+          res,
+          409,
+          {
+            code: 'PI_CONTINUATION_STALE',
+            error: 'The paused Pi tool step is no longer available.',
+          },
+          generationProtocolVersion,
+        );
+      }
     }
     const batchedAnswer =
       mapped.resumeValue?.answers != null &&
@@ -2066,8 +2097,14 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
             bindings: pendingAction.toolApprovalBindings,
             decisions: req.body.decisions ?? [],
           },
-          piApprovalContinuation: piContinuation,
+          piApprovalContinuation,
           piApprovalDecision: piDecision,
+          ...(piAskUserQuestionContinuation == null
+            ? {}
+            : {
+                piAskUserQuestionContinuation,
+                piAskUserQuestionAnswer: mapped.resumeValue,
+              }),
           seedContent,
           runSteps: resumeState?.runSteps ?? [],
           storedMessages,

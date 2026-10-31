@@ -1,12 +1,12 @@
 import type { Agents } from 'librechat-data-provider';
+import type { PiAskUserQuestionArguments, PiHostToolExecutionInput } from './tools';
 import type { PiActionToolSchemaRegistry } from './actionSchema';
 import type { PiProviderEventFailure } from './providerEvents';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMcpToolSchemaRegistry } from './mcpSchema';
-import type { PiHostToolExecutionInput } from './tools';
 import type { PiMessageStepIdentity } from './events';
+import { validatePiAskUserQuestionArguments, validatePiToolExecutionInput } from './tools';
 import { parsePiCodeSessionSnapshot } from './codeSession';
-import { validatePiToolExecutionInput } from './tools';
 
 /** Host identity required to settle the in-progress step after an approval resume. */
 export interface PiPauseHostExecution {
@@ -28,8 +28,16 @@ export type PiPauseToolCall = PiHostToolExecutionInput & {
   review: PiPauseReview;
 };
 
+export interface PiPauseAskUserQuestionCall {
+  readonly toolCallId: string;
+  readonly name: 'ask_user_question';
+  readonly args: PiAskUserQuestionArguments;
+  readonly hostExecution: PiPauseHostExecution;
+}
+
 export type PiPauseSignal =
   | { readonly kind: 'tool_approval'; readonly toolCall: PiPauseToolCall }
+  | { readonly kind: 'ask_user_question'; readonly toolCall: PiPauseAskUserQuestionCall }
   | {
       readonly kind: 'unsupported_tool_batch';
       readonly toolCallIds: readonly [string, string, ...string[]];
@@ -39,9 +47,15 @@ export type PiPauseSignal =
       readonly failure: PiProviderEventFailure;
     };
 
+export type PiResumablePauseSignal = Extract<
+  PiPauseSignal,
+  { kind: 'tool_approval' | 'ask_user_question' }
+>;
+
 export interface PiPauseController {
   readonly signal: PiPauseSignal | undefined;
   request(toolCall: PiPauseToolCall): PiPauseSignal;
+  requestAskUserQuestion(toolCall: PiPauseAskUserQuestionCall): PiPauseSignal;
   rejectBatch(toolCallIds: readonly string[]): PiPauseSignal;
   rejectProviderEvent(failure: PiProviderEventFailure): PiPauseSignal;
 }
@@ -163,6 +177,11 @@ export function createPiPauseController(
           kind: 'unsupported_tool_batch',
           toolCallIds: [signal.toolCall.toolCallId, nextCall.toolCallId],
         };
+      } else if (signal.kind === 'ask_user_question') {
+        signal = {
+          kind: 'unsupported_tool_batch',
+          toolCallIds: [signal.toolCall.toolCallId, nextCall.toolCallId],
+        };
       } else {
         signal = {
           kind: 'unsupported_tool_batch',
@@ -170,6 +189,75 @@ export function createPiPauseController(
         };
       }
       return signal;
+    },
+    requestAskUserQuestion(toolCall) {
+      if (signal?.kind === 'unsupported_provider_event') {
+        return signal;
+      }
+      if (toolCall.toolCallId.length === 0) {
+        throw new Error('A Pi ask-user pause has an invalid tool identity');
+      }
+      const args = validatePiAskUserQuestionArguments(toolCall.args);
+      const { hostExecution } = toolCall;
+      if (
+        hostExecution.toolCallId.length === 0 ||
+        !Number.isSafeInteger(hostExecution.toolTurn) ||
+        hostExecution.toolTurn < 0 ||
+        !Number.isFinite(hostExecution.createdAt) ||
+        hostExecution.createdAt < 0 ||
+        hostExecution.stepIdentity.id.length === 0 ||
+        !Number.isSafeInteger(hostExecution.stepIdentity.index) ||
+        hostExecution.stepIdentity.index < 0 ||
+        hostExecution.stepIdentity.messageId.length === 0 ||
+        hostExecution.stepIdentity.runId.length === 0 ||
+        hostExecution.stepIdentity.agentId.length === 0
+      ) {
+        throw new Error('Pi ask-user continuation metadata is invalid');
+      }
+      if (signal?.kind === 'ask_user_question') {
+        const previous = signal.toolCall;
+        if (previous.toolCallId !== toolCall.toolCallId) {
+          signal = {
+            kind: 'unsupported_tool_batch',
+            toolCallIds: [previous.toolCallId, toolCall.toolCallId],
+          };
+          return signal;
+        }
+        if (
+          previous.hostExecution.toolCallId !== hostExecution.toolCallId ||
+          previous.hostExecution.toolTurn !== hostExecution.toolTurn ||
+          previous.hostExecution.createdAt !== hostExecution.createdAt ||
+          JSON.stringify(previous.hostExecution.stepIdentity) !==
+            JSON.stringify(hostExecution.stepIdentity) ||
+          JSON.stringify(previous.args) !== JSON.stringify(args)
+        ) {
+          throw new Error('A Pi tool call ID cannot refer to two different host actions');
+        }
+        return signal;
+      }
+      if (signal != null) {
+        if (signal.kind === 'tool_approval') {
+          signal = {
+            kind: 'unsupported_tool_batch',
+            toolCallIds: [signal.toolCall.toolCallId, toolCall.toolCallId],
+          };
+        }
+        return signal;
+      }
+      const askUserSignal: PiPauseSignal = {
+        kind: 'ask_user_question',
+        toolCall: {
+          toolCallId: toolCall.toolCallId,
+          name: 'ask_user_question',
+          args,
+          hostExecution: {
+            ...hostExecution,
+            stepIdentity: { ...hostExecution.stepIdentity },
+          },
+        },
+      };
+      signal = askUserSignal;
+      return askUserSignal;
     },
     rejectBatch(toolCallIds) {
       if (signal?.kind === 'unsupported_provider_event') {
@@ -184,6 +272,9 @@ export function createPiPauseController(
         return signal;
       }
       if (signal?.kind === 'tool_approval' && !batchIds.includes(signal.toolCall.toolCallId)) {
+        batchIds.unshift(signal.toolCall.toolCallId);
+      }
+      if (signal?.kind === 'ask_user_question' && !batchIds.includes(signal.toolCall.toolCallId)) {
         batchIds.unshift(signal.toolCall.toolCallId);
       }
 

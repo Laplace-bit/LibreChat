@@ -6,6 +6,7 @@ import type { PiGenerationDispatchInput } from './dispatch';
 import type { PiModelBinding } from './session';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiGenerationDispatcher } from './dispatch';
+import { ASK_USER_QUESTION_TOOL_NAME } from './toolNames';
 
 const fileSearchDefinition: LCTool = {
   name: Tools.file_search,
@@ -192,5 +193,65 @@ describe('createPiGenerationDispatcher approval continuation', () => {
     ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
     expect(executeApprovedTool).toHaveBeenCalledTimes(1);
     expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('createPiGenerationDispatcher ask-user pause', () => {
+  const createModelBinding = async (): Promise<PiModelBinding> => ({
+    model: {
+      api: 'openai-responses',
+      provider: 'librechat-openai',
+      id: 'gpt-4o-mini',
+    } as PiModelBinding['model'],
+    modelRuntime: {} as PiModelBinding['modelRuntime'],
+    dispose: jest.fn(),
+  });
+
+  it('routes ask-user through the host pause controller without invoking a host tool', async () => {
+    const args = { questions: [{ id: 'plant_code', question: 'Which plant?' }] };
+    const executeHostToolCall = jest.fn(async () => {
+      throw new Error('ask_user_question must not invoke the host tool batch');
+    });
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const askTool = value.tools.find(({ name }) => name === ASK_USER_QUESTION_TOOL_NAME);
+      if (askTool == null) throw new Error('Pi ask-user tool was not registered');
+      const result = await askTool.execute('pi-ask-call-1', args);
+      expect(result.details).toEqual({ status: 'paused' });
+      const pause = value.pauseController?.signal;
+      if (pause?.kind !== 'ask_user_question') {
+        throw new Error('Pi ask-user invocation did not raise its durable host pause');
+      }
+      return { status: 'paused' as const, signal: pause };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+    const result = await dispatch(
+      input({
+        messages: [new HumanMessage('Pick a plant.')],
+        createModelBinding,
+        toolDefinitions: [{ name: ASK_USER_QUESTION_TOOL_NAME, description: 'Ask user.' }],
+        executeHostToolCall,
+        createToolStepIdentity: () => ({
+          id: 'host-ask-step-1',
+          index: 2,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        }),
+        createToolCallId: () => 'host-ask-call-1',
+        askUserQuestionEnabled: true,
+      }),
+    );
+
+    expect(result).toMatchObject({
+      status: 'paused',
+      signal: {
+        kind: 'ask_user_question',
+        toolCall: {
+          toolCallId: 'pi-ask-call-1',
+          hostExecution: { toolCallId: 'host-ask-call-1' },
+        },
+      },
+    });
+    expect(executeHostToolCall).not.toHaveBeenCalled();
   });
 });

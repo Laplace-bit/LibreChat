@@ -7,6 +7,7 @@ import {
   convertPiToolSchema,
   createPiTools,
   executePiToolCall,
+  validatePiAskUserQuestionArguments,
   PiToolCompatibilityError,
   type PiHostToolDefinition,
   type PiHostToolExecutionInput,
@@ -19,8 +20,10 @@ import {
   PI_READ_FILE_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
+  ASK_USER_QUESTION_TOOL_NAME,
 } from './toolNames';
 import { createPiActionToolSchema, isPiActionToolName } from './actionSchema';
+import { AskUserQuestionToolDefinition } from '../hitl/askUserQuestionTool';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 
 const fileSearchParameters: NonNullable<LCTool['parameters']> = {
@@ -146,6 +149,66 @@ function hostExecutor(implementation: PiHostToolExecutor = async () => successfu
 }
 
 describe('createPiTools', () => {
+  it('advertises the canonical ask-user schema and validates distinct answer IDs', () => {
+    const execute = jest.fn(async (_input: PiHostToolExecutionInput) => ({
+      content: [{ type: 'text' as const, text: 'paused by host' }],
+      details: undefined,
+    }));
+    const [askUserQuestion] = createPiTools({
+      definitions: [
+        {
+          name: ASK_USER_QUESTION_TOOL_NAME,
+          description: 'Ask the user.',
+        },
+      ],
+      execute,
+    });
+
+    expect(askUserQuestion?.name).toBe(ASK_USER_QUESTION_TOOL_NAME);
+    expect(askUserQuestion?.parameters).toEqual(AskUserQuestionToolDefinition.schema);
+    expect(
+      validatePiAskUserQuestionArguments({
+        questions: [
+          { id: 'plant_code', question: 'Which plant?' },
+          { id: 'window_7d', question: 'Which time window?' },
+        ],
+      }).questions.map(({ id }) => id),
+    ).toEqual(['plant_code', 'window_7d']);
+    expect(() =>
+      validatePiAskUserQuestionArguments({
+        questions: [
+          { id: 'plant', question: 'Which plant?' },
+          { id: 'plant', question: 'Which alternate plant?' },
+        ],
+      }),
+    ).toThrow(PiToolCompatibilityError);
+  });
+
+  it.each([
+    {
+      label: 'top-level extra properties',
+      args: { questions: [{ id: 'plant', question: 'Which plant?' }], extra: 'ignored' },
+    },
+    {
+      label: 'question extra properties',
+      args: { questions: [{ id: 'plant', question: 'Which plant?', extra: 'ignored' }] },
+    },
+    {
+      label: 'option extra properties',
+      args: {
+        questions: [
+          {
+            id: 'plant',
+            question: 'Which plant?',
+            options: [{ label: 'North', value: 'north', extra: 'ignored' }],
+          },
+        ],
+      },
+    },
+  ])('rejects $label before Zod can strip it', ({ args }) => {
+    expect(() => validatePiAskUserQuestionArguments(args)).toThrow(PiToolCompatibilityError);
+  });
+
   it('creates a schema-bound host adapter for an authorized MCP definition', async () => {
     const nameValue = `lookup${DataConstants.mcp_delimiter}inventory`;
     if (!isPiMcpToolName(nameValue)) {

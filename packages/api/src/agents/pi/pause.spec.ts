@@ -1,7 +1,7 @@
 import { Constants, Tools } from 'librechat-data-provider';
+import { ASK_USER_QUESTION_TOOL_NAME, PI_CALCULATOR_TOOL_NAME } from './toolNames';
+import { createPiPauseController, type PiPauseAskUserQuestionCall } from './pause';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
-import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
-import { createPiPauseController } from './pause';
 
 describe('Pi pause controller', () => {
   it('returns the same approval for an identical tool call', () => {
@@ -92,6 +92,72 @@ describe('Pi pause controller', () => {
 
     expect(() => createPiPauseController().request(call)).toThrow(
       'This tool schema is not supported by the Pi runtime.',
+    );
+  });
+
+  it('records a validated ask-user pause and refuses to batch it with another ask', () => {
+    const controller = createPiPauseController();
+    const call: PiPauseAskUserQuestionCall = {
+      toolCallId: 'pi-ask-1',
+      name: ASK_USER_QUESTION_TOOL_NAME,
+      args: { questions: [{ id: 'plant_code', question: 'Which plant?' }] },
+      hostExecution: {
+        toolCallId: 'host-ask-1',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'ask-step-1',
+          index: 1,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 10,
+      },
+    };
+
+    const signal = controller.requestAskUserQuestion(call);
+
+    expect(signal).toMatchObject({ kind: 'ask_user_question', toolCall: call });
+    expect(
+      controller.requestAskUserQuestion({
+        ...call,
+        toolCallId: 'pi-ask-2',
+        hostExecution: {
+          ...call.hostExecution,
+          toolCallId: 'host-ask-2',
+          stepIdentity: { ...call.hostExecution.stepIdentity, id: 'ask-step-2', index: 2 },
+        },
+      }),
+    ).toEqual({ kind: 'unsupported_tool_batch', toolCallIds: ['pi-ask-1', 'pi-ask-2'] });
+  });
+
+  it('rejects ask-user arguments without a unique stable answer ID', () => {
+    const controller = createPiPauseController();
+    const call: PiPauseAskUserQuestionCall = {
+      toolCallId: 'pi-ask-invalid',
+      name: ASK_USER_QUESTION_TOOL_NAME,
+      args: {
+        questions: [
+          { id: 'plant', question: 'Which plant?' },
+          { id: 'plant', question: 'Which alternate plant?' },
+        ],
+      },
+      hostExecution: {
+        toolCallId: 'host-ask-invalid',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'ask-step-invalid',
+          index: 1,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 10,
+      },
+    };
+
+    expect(() => controller.requestAskUserQuestion(call)).toThrow(
+      'The Pi tool arguments are invalid.',
     );
   });
 

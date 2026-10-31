@@ -10,7 +10,7 @@ import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMcpToolSchemaRegistry } from './mcpSchema';
-import type { PiApprovalContinuation } from './resume';
+import type { PiToolResultContinuation } from './resume';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostSessionOutcome } from './bridge';
@@ -26,6 +26,7 @@ import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
 import { appendPiToolResultContinuation } from './resume';
+import { ASK_USER_QUESTION_TOOL_NAME } from './toolNames';
 import { createPiGenerationExecutor } from './execution';
 import { convertLibreChatHistoryToPi } from './history';
 import { projectPiContextUsage } from './contextUsage';
@@ -60,8 +61,10 @@ export interface PiGenerationDispatchInput {
   getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
   /** Per-tool call counts reconstructed from the current generation on resume. */
   initialToolUsageCounts?: Readonly<Record<string, number>>;
-  /** Optional internal gate. Production request wiring does not supply this yet. */
+  /** Host-created internal authorization/approval gate; never supplied by clients. */
   toolExecutionGate?: PiToolExecutionGate;
+  /** Must be derived from the existing Agent capability and administrator gates. */
+  askUserQuestionEnabled?: boolean;
   /** Host-generated identities for LibreChat tool call steps. */
   createToolStepIdentity?(): PiMessageStepIdentity;
   createToolCallId?(): string;
@@ -72,7 +75,7 @@ export interface PiGenerationDispatchInput {
   contextUsage?: Omit<PiContextUsageProjectionInput, 'messages' | 'model' | 'provider'>;
   /** Exact approved tool exchange to continue without replaying the user prompt. */
   resumeToolResult?: {
-    continuation: PiApprovalContinuation;
+    continuation: PiToolResultContinuation;
     /** The exact validated arguments executed after the user's approval decision. */
     toolArguments: PiToolArguments;
     execute(): Promise<Pick<ToolResultMessage, 'content' | 'isError'>>;
@@ -147,14 +150,11 @@ export function createPiGenerationDispatcher(
             ? {}
             : { initialToolUsageCounts: input.initialToolUsageCounts }),
           handleHostEvent: eventSequencer.enqueue,
-          ...(input.toolExecutionGate == null
-            ? {}
-            : {
-                pauseGate: {
-                  controller: pauseController,
-                  evaluate: input.toolExecutionGate,
-                },
-              }),
+          askUserQuestionEnabled: input.askUserQuestionEnabled === true,
+          pauseGate: {
+            controller: pauseController,
+            evaluate: input.toolExecutionGate ?? (() => ({ kind: 'execute' as const })),
+          },
         });
       }
       tools = createPiTools({
@@ -169,7 +169,10 @@ export function createPiGenerationDispatcher(
       }
       throw error;
     }
-    if (input.toolExecutionGate != null) {
+    if (
+      input.toolExecutionGate != null ||
+      toolDefinitions.some(({ name }) => name === ASK_USER_QUESTION_TOOL_NAME)
+    ) {
       // Once a gate can pause a tool batch, a sibling must not begin a side effect
       // while another call is awaiting its gate decision.
       tools = tools.map((tool) => ({ ...tool, executionMode: 'sequential' }));

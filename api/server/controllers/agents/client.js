@@ -85,6 +85,9 @@ const {
   collectAllowAlwaysAliases,
   agentRunUsesCheckpointer,
   canAgentGraphPause,
+  agentRequestsAskUserQuestion,
+  isToolDeniedByApprovalPolicy,
+  exemptAskUserQuestionFromApproval,
   getPluginHookSource,
   captureAgentCheckpointGeneration,
   isContentFilterError,
@@ -235,11 +238,14 @@ const {
   isPiActionToolName,
   isPiCodeExecutionToolName,
   PI_SUPPORTED_HOST_TOOLS,
+  ASK_USER_QUESTION_TOOL_NAME,
   createPiCodeSessionBridge,
   createPiToolApprovalGate,
+  createPiAskUserQuestionContinuation,
   compilePiMcpToolSchemaRegistry,
   compilePiActionToolSchemaRegistry,
   PiToolCompatibilityError,
+  validatePiAskUserQuestionArguments,
   createPiHostToolBatchExecutor,
   buildPiToolUsageCounts,
   settlePiHostToolResult,
@@ -4652,11 +4658,12 @@ class AgentClient extends BaseClient {
     }
   }
 
-  /** Stage one approved Pi host call through the shared durable HITL lifecycle. */
-  async handlePiToolApprovalInterrupt(signal, streamId, mcpToolSchemas, actionToolSchemas) {
+  /** Stage Pi approval and ask-user pauses through the shared durable HITL lifecycle. */
+  async handlePiPauseInterrupt(signal, streamId, mcpToolSchemas, actionToolSchemas) {
+    const isAskUserQuestion = signal?.kind === 'ask_user_question';
     if (
       !streamId ||
-      signal?.kind !== 'tool_approval' ||
+      (signal?.kind !== 'tool_approval' && !isAskUserQuestion) ||
       this.eventActorInvocationId != null ||
       this.options.req?._isScheduledFire === true ||
       !this.responseMessageId ||
@@ -4666,29 +4673,107 @@ class AgentClient extends BaseClient {
     }
 
     const toolCall = signal.toolCall;
-    const payload = buildPiApprovalInterruptPayload({
-      hostToolCallId: toolCall.hostExecution.toolCallId,
-      toolName: toolCall.name,
-      args: toolCall.args,
-      ...getPiToolSchemaBinding({
-        name: toolCall.name,
-        kind: toolCall.kind,
-        schemaFingerprint: toolCall.schemaFingerprint,
-        mcpToolSchemas,
-        actionToolSchemas,
-      }),
-      allowedDecisions: toolCall.review.allowedDecisions,
-      ...(toolCall.review.description == null ? {} : { description: toolCall.review.description }),
-    });
     const request = this.options.req;
     const appConfig = request?.config;
+    const reachableAgents = collectReachableAgents([
+      this.options.agent,
+      ...(this.agentConfigs?.values() ?? []),
+    ]);
+    const piMcpToolAliases = reachableAgents.flatMap((agent) =>
+      Array.isArray(agent?.mcpToolAliases) ? agent.mcpToolAliases : [],
+    );
+    let payload;
+    if (isAskUserQuestion) {
+      if (
+        isAskUserQuestionAdminDisabled(appConfig) ||
+        !agentRequestsAskUserQuestion(this.options.agent) ||
+        isToolDeniedByApprovalPolicy(
+          resolveToolApprovalPolicy({
+            endpoint: appConfig?.endpoints?.[EModelEndpoint.agents]?.toolApproval,
+            attachedCodeEnvironment: false,
+          }),
+          ASK_USER_QUESTION_TOOL_NAME,
+        )
+      ) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      const args = validatePiAskUserQuestionArguments(toolCall.args);
+      const [first] = args.questions;
+      if (first == null) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      payload = {
+        type: ASK_USER_QUESTION_TOOL_NAME,
+        question: {
+          question: first.question,
+          ...(first.description == null ? {} : { description: first.description }),
+          ...(first.options == null ? {} : { options: first.options }),
+          ...(first.multiSelect == null ? {} : { multiSelect: first.multiSelect }),
+        },
+        questions: args.questions,
+        tool_call_id: toolCall.hostExecution.toolCallId,
+      };
+      if (Array.isArray(this.contentParts)) {
+        const stamped = attachAskUserQuestionArgs(
+          this.contentParts,
+          { questions: args.questions },
+          toolCall.hostExecution.toolCallId,
+        );
+        if (stamped !== this.contentParts) {
+          this.contentParts.length = 0;
+          this.contentParts.push(...stamped);
+        }
+      }
+    } else {
+      const toolApprovalPolicy = appConfig?.endpoints?.[EModelEndpoint.agents]?.toolApproval;
+      payload = markToolApprovalAllowAlways(
+        markNativeCodeToolApprovalRequests(
+          buildPiApprovalInterruptPayload({
+            hostToolCallId: toolCall.hostExecution.toolCallId,
+            toolName: toolCall.name,
+            args: toolCall.args,
+            ...getPiToolSchemaBinding({
+              name: toolCall.name,
+              kind: toolCall.kind,
+              schemaFingerprint: toolCall.schemaFingerprint,
+              mcpToolSchemas,
+              actionToolSchemas,
+            }),
+            allowedDecisions: toolCall.review.allowedDecisions,
+            ...(toolCall.review.description == null
+              ? {}
+              : { description: toolCall.review.description }),
+          }),
+          reachableAgents,
+        ),
+        {
+          policy: toolApprovalPolicy,
+          agents: reachableAgents,
+          aliases: piMcpToolAliases,
+          storedTools: resolveRunToolApprovalAllows(
+            toolApprovalPolicy,
+            request?.resolvedConversation,
+            this.conversationId,
+          ),
+          hookContext: {
+            userId: request?.user?.id,
+            conversationId: this.conversationId,
+            tenantId: resolveRequestTenantId(request ?? {}),
+            appConfig,
+          },
+          pluginHookSource: getPluginHookSource(),
+        },
+      );
+    }
     const codeExecutionBinding =
-      isPiCodeExecutionToolName(toolCall.name) || toolCall.codeSessionContext != null
+      !isAskUserQuestion &&
+      (isPiCodeExecutionToolName(toolCall.name) || toolCall.codeSessionContext != null)
         ? captureCodeExecutionApprovalBinding([this.options.agent], {
             includeManagedStateless: true,
           })
         : undefined;
     if (
+      !isAskUserQuestion &&
       (isPiCodeExecutionToolName(toolCall.name) || toolCall.codeSessionContext != null) &&
       codeExecutionBinding == null
     ) {
@@ -4718,16 +4803,18 @@ class AgentClient extends BaseClient {
       requestFingerprintV2: computeAgentRequestFingerprint(request?.body ?? {}),
       resumeContext,
       ...(codeExecutionBinding == null ? {} : { codeExecutionBinding }),
-      toolApprovalAliases: [],
+      toolApprovalAliases: isAskUserQuestion
+        ? []
+        : collectAllowAlwaysAliases(payload, piMcpToolAliases),
     });
-    const piResumeContinuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+    const piResumeContinuation = isAskUserQuestion
+      ? createPiAskUserQuestionContinuation(pendingAction.actionId, toolCall)
+      : createPiApprovalContinuation(pendingAction.actionId, toolCall);
 
     if (this.jobCreatedAt != null) {
       const liveJob = await GenerationJobManager.getJobStore().getJob(streamId);
       if (!liveJob || liveJob.createdAt !== this.jobCreatedAt || liveJob.status !== 'running') {
-        logger.debug(
-          `[AgentClient] Pi approval fired but job ${streamId} was replaced; not pausing`,
-        );
+        logger.debug(`[AgentClient] Pi pause fired but job ${streamId} was replaced; not pausing`);
         return;
       }
     }
@@ -5170,6 +5257,7 @@ class AgentClient extends BaseClient {
         let piMcpToolSchemas;
         let piActionToolSchemas;
         let piCodeSessionBridge;
+        let askUserQuestionEnabled = false;
         if (isPiRuntime) {
           const unsupportedModes = [];
           if (
@@ -5210,7 +5298,15 @@ class AgentClient extends BaseClient {
           }
 
           const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
-          const callableToolNames = [...toolSet].filter((name) => !internalToolNames.has(name));
+          askUserQuestionEnabled =
+            !isAskUserQuestionAdminDisabled(appConfig) &&
+            agentRequestsAskUserQuestion(this.options.agent) &&
+            !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
+          const callableToolNames = [...toolSet].filter(
+            (name) =>
+              !internalToolNames.has(name) &&
+              (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
+          );
           const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
             ? this.options.agent.toolDefinitions
             : [];
@@ -5438,7 +5534,10 @@ class AgentClient extends BaseClient {
                 })
               : undefined;
           const piToolExecutionGate = createPiToolApprovalGate({
-            policy: effectiveToolApprovalPolicy,
+            policy: exemptAskUserQuestionFromApproval(
+              effectiveToolApprovalPolicy,
+              ASK_USER_QUESTION_TOOL_NAME,
+            ),
             allowedTools: runToolApprovalAllows,
             logger,
             pluginHookSource: getPluginHookSource(),
@@ -5471,6 +5570,7 @@ class AgentClient extends BaseClient {
                 ? {}
                 : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
               toolExecutionGate: piToolExecutionGate,
+              askUserQuestionEnabled,
               createToolStepIdentity: createPiStepIdentity,
               createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
               signal: abortController.signal,
@@ -5502,7 +5602,7 @@ class AgentClient extends BaseClient {
 
           this.options.startupTelemetry?.mark('pi_session_settled');
           if (outcome.status === 'paused') {
-            await this.handlePiToolApprovalInterrupt(
+            await this.handlePiPauseInterrupt(
               outcome.signal,
               streamId,
               piMcpToolSchemas,
@@ -5513,6 +5613,10 @@ class AgentClient extends BaseClient {
                 code: 'RUN_REPLACED',
               });
             }
+            /** Match the legacy initial-turn path: the durable pause is committed before
+             * its pending-action event is exposed to the existing client UI. Resume
+             * re-pauses expose only after the route persists the new pause projection. */
+            await this.exposePendingApproval();
           } else if (outcome.status === 'unsupported') {
             throw new AgentRuntimeUnavailableError();
           }
@@ -5933,19 +6037,44 @@ class AgentClient extends BaseClient {
   async resumePiCompletion({
     piApprovalContinuation,
     piApprovalDecision,
+    piAskUserQuestionContinuation,
+    piAskUserQuestionAnswer,
     seedContent = [],
     runSteps = [],
     storedMessages = [],
     abortController = null,
     activityPhaseSnapshot,
   }) {
+    const piContinuation = piAskUserQuestionContinuation ?? piApprovalContinuation;
+    const isAskUserQuestionResume = piAskUserQuestionContinuation != null;
     if (
-      piApprovalContinuation == null ||
-      piApprovalDecision == null ||
+      piContinuation == null ||
+      (isAskUserQuestionResume
+        ? piAskUserQuestionAnswer == null || piApprovalDecision != null
+        : piApprovalDecision == null || piAskUserQuestionAnswer != null) ||
       this.options.agentRuntime?.engine !== 'pi' ||
       this.runtimeProgress?.selection?.engine !== 'pi'
     ) {
       throw new AgentRuntimeUnavailableError();
+    }
+    if (isAskUserQuestionResume) {
+      const expectedIds = piAskUserQuestionContinuation.args.questions.map(({ id }) => id);
+      const answers = piAskUserQuestionAnswer?.answers;
+      if (
+        answers == null ||
+        typeof answers !== 'object' ||
+        Array.isArray(answers) ||
+        Object.keys(answers).length !== expectedIds.length ||
+        expectedIds.some(
+          (id) =>
+            typeof answers[id] !== 'string' ||
+            answers[id].length === 0 ||
+            answers[id].length > 16_000,
+        ) ||
+        Object.keys(answers).some((id) => !expectedIds.includes(id))
+      ) {
+        throw new AgentRuntimeUnavailableError();
+      }
     }
     if (!abortController) {
       abortController = new AbortController();
@@ -6003,8 +6132,19 @@ class AgentClient extends BaseClient {
 
       const toolSet = buildRunToolSet(this.options.agent, undefined, undefined, built.prompt);
       const agents = [this.options.agent];
+      const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
+        endpoint: agentsEConfig?.toolApproval,
+        attachedCodeEnvironment: false,
+      });
+      const askUserQuestionEnabled =
+        !isAskUserQuestionAdminDisabled(appConfig) &&
+        agentRequestsAskUserQuestion(this.options.agent) &&
+        !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
       const callableToolNames = [...toolSet].filter(
-        (name) => name !== Constants.SUBAGENT && name !== 'conditional_transfer',
+        (name) =>
+          name !== Constants.SUBAGENT &&
+          name !== 'conditional_transfer' &&
+          (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
       );
       const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
         ? this.options.agent.toolDefinitions
@@ -6069,16 +6209,20 @@ class AgentClient extends BaseClient {
         supportedToolNames: piToolDefinitions.map((definition) => definition.name),
         unsupportedModes,
       });
-      if (
-        !piToolDefinitions.some((definition) => definition.name === piApprovalContinuation.toolName)
-      ) {
+      if (!piToolDefinitions.some((definition) => definition.name === piContinuation.toolName)) {
         throw new AgentRuntimeUnavailableError();
       }
-      let continuationToolArguments =
-        piApprovalDecision.kind === 'execute'
-          ? piApprovalDecision.args
-          : piApprovalContinuation.args;
-      if (piApprovalContinuation.kind === 'mcp') {
+      let continuationToolArguments = piContinuation.args;
+      if (!isAskUserQuestionResume && piApprovalDecision.kind === 'execute') {
+        continuationToolArguments = piApprovalDecision.args;
+      }
+      if (isAskUserQuestionResume) {
+        try {
+          continuationToolArguments = validatePiAskUserQuestionArguments(continuationToolArguments);
+        } catch {
+          throw new AgentRuntimeUnavailableError();
+        }
+      } else if (piApprovalContinuation.kind === 'mcp') {
         try {
           continuationToolArguments = revalidatePiMcpApprovalArguments({
             continuation: piApprovalContinuation,
@@ -6099,8 +6243,44 @@ class AgentClient extends BaseClient {
           throw new AgentRuntimeUnavailableError();
         }
       }
+      if (
+        !isAskUserQuestionResume &&
+        piApprovalContinuation.toolName === ASK_USER_QUESTION_TOOL_NAME &&
+        piApprovalDecision.kind === 'execute'
+      ) {
+        if (!askUserQuestionEnabled) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        const args = validatePiAskUserQuestionArguments(continuationToolArguments);
+        await this.handlePiPauseInterrupt(
+          {
+            kind: 'ask_user_question',
+            toolCall: {
+              toolCallId: piApprovalContinuation.piToolCallId,
+              name: ASK_USER_QUESTION_TOOL_NAME,
+              args,
+              hostExecution: {
+                toolCallId: piApprovalContinuation.hostToolCallId,
+                toolTurn: piApprovalContinuation.toolTurn,
+                stepIdentity: piApprovalContinuation.stepIdentity,
+                createdAt: piApprovalContinuation.stepCreatedAt,
+              },
+            },
+          },
+          streamId,
+          piMcpToolSchemas,
+          piActionToolSchemas,
+        );
+        if (!this.pendingApproval) {
+          throw Object.assign(new Error('Generation was replaced before Pi question pause'), {
+            code: 'RUN_REPLACED',
+          });
+        }
+        this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, 'paused');
+        return;
+      }
       const piCodeSessionBridge = piHasCodeExecutionTools
-        ? createPiCodeSessionBridge(piApprovalContinuation.codeSessionContext)
+        ? createPiCodeSessionBridge(piContinuation.codeSessionContext)
         : undefined;
 
       const messageFormatOptions = {
@@ -6222,10 +6402,6 @@ class AgentClient extends BaseClient {
                 ),
             })
           : undefined;
-      const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
-        endpoint: agentsEConfig?.toolApproval,
-        attachedCodeEnvironment: false,
-      });
       const resolvedToolApprovalHooks = isHITLEnabled(effectiveToolApprovalPolicy)
         ? buildToolApprovalHooks({
             userId: req?.user?.id,
@@ -6235,7 +6411,10 @@ class AgentClient extends BaseClient {
           })
         : undefined;
       const piToolExecutionGate = createPiToolApprovalGate({
-        policy: effectiveToolApprovalPolicy,
+        policy: exemptAskUserQuestionFromApproval(
+          effectiveToolApprovalPolicy,
+          ASK_USER_QUESTION_TOOL_NAME,
+        ),
         allowedTools: resolveRunToolApprovalAllows(
           agentsEConfig?.toolApproval,
           req?.resolvedConversation,
@@ -6259,7 +6438,7 @@ class AgentClient extends BaseClient {
       });
 
       const createApprovedToolResult = async () => {
-        const continuation = piApprovalContinuation;
+        const continuation = piContinuation;
         const executionInput = {
           toolCallId: continuation.piToolCallId,
           name: continuation.toolName,
@@ -6272,7 +6451,12 @@ class AgentClient extends BaseClient {
           turn: continuation.toolTurn,
         };
         let hostResult;
-        if (piApprovalDecision.kind === 'execute') {
+        if (isAskUserQuestionResume) {
+          hostResult = {
+            status: 'success',
+            content: JSON.stringify(piAskUserQuestionAnswer),
+          };
+        } else if (piApprovalDecision.kind === 'execute') {
           if (executePiHostToolCall == null) {
             throw new AgentRuntimeUnavailableError();
           }
@@ -6335,11 +6519,12 @@ class AgentClient extends BaseClient {
           executeHostToolCall: executePiHostToolCall,
           mcpToolSchemas: piMcpToolSchemas,
           actionToolSchemas: piActionToolSchemas,
+          askUserQuestionEnabled,
           initialToolUsageCounts: buildPiToolUsageCounts({
             runSteps,
             pendingTool: {
-              name: piApprovalContinuation.toolName,
-              turn: piApprovalContinuation.toolTurn,
+              name: piContinuation.toolName,
+              turn: piContinuation.toolTurn,
             },
           }),
           ...(piCodeSessionBridge == null
@@ -6349,7 +6534,7 @@ class AgentClient extends BaseClient {
           createToolStepIdentity: createPiStepIdentity,
           createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
           resumeToolResult: {
-            continuation: piApprovalContinuation,
+            continuation: piContinuation,
             toolArguments: continuationToolArguments,
             execute: createApprovedToolResult,
           },
@@ -6373,7 +6558,7 @@ class AgentClient extends BaseClient {
       outcome = execution.outcome;
       this.collectedUsage.push(...outcome.usage);
       if (outcome.status === 'paused') {
-        await this.handlePiToolApprovalInterrupt(
+        await this.handlePiPauseInterrupt(
           outcome.signal,
           streamId,
           piMcpToolSchemas,
@@ -6464,6 +6649,8 @@ class AgentClient extends BaseClient {
     compactionSemanticIndex,
     piApprovalContinuation,
     piApprovalDecision,
+    piAskUserQuestionContinuation,
+    piAskUserQuestionAnswer,
   }) {
     const runtimeResolution = resolveStoredAgentRuntime(this.options.agentRuntime);
     if (runtimeResolution.status !== 'resolved') {
@@ -6474,6 +6661,8 @@ class AgentClient extends BaseClient {
       return this.resumePiCompletion({
         piApprovalContinuation,
         piApprovalDecision,
+        piAskUserQuestionContinuation,
+        piAskUserQuestionAnswer,
         seedContent,
         runSteps,
         storedMessages,

@@ -669,7 +669,9 @@ function getDefaultHandlers({
         if (data == null || typeof data !== 'object') {
           throw new Error('Pi usage event is malformed');
         }
-        const usage = { ...data, usage_type: 'message' };
+        // Primary response usage is the untagged bucket; persisted context
+        // snapshots only reconcile against untagged calls with the same runId.
+        const usage = { ...data };
         collectedUsage.push(usage);
         await emitTokenUsage(usage);
       },

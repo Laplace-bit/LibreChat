@@ -70,6 +70,7 @@ export * from './skillConfigurable';
 export * from './skillFiles';
 export * from './codeFilesSession';
 export * from './run';
+export * from './tail';
 export * from './fading';
 export * from './publication';
 export * from './runtime';

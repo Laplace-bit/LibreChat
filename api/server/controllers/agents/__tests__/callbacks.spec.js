@@ -139,6 +139,39 @@ describe('resumable event generation fencing', () => {
     );
   });
 
+  it('keeps Pi response usage in the primary bucket for context snapshot reconciliation', async () => {
+    const { UsageEvents } = require('librechat-data-provider');
+    const { createContentAggregator } = jest.requireActual('@librechat/agents');
+    const { getDefaultHandlers } = require('../callbacks');
+    const collectedUsage = [];
+    const usageEmitSink = [];
+    const { aggregateContent } = createContentAggregator();
+    const handlers = getDefaultHandlers({
+      res: { write: jest.fn() },
+      aggregateContent,
+      toolEndCallback: jest.fn(),
+      collectedUsage,
+      usageEmitSink,
+      streamId: 'conversation-1',
+      jobCreatedAt: 1234,
+    });
+    const event = {
+      input_tokens: 13,
+      output_tokens: 5,
+      total_tokens: 18,
+      runId: 'response-1',
+      agentId: 'agent-1',
+      provider: 'openAI',
+      model: 'gpt-4o-mini',
+    };
+
+    await handlers[UsageEvents.ON_TOKEN_USAGE].handle(UsageEvents.ON_TOKEN_USAGE, event);
+
+    expect(collectedUsage).toEqual([event]);
+    expect(usageEmitSink).toEqual([expect.objectContaining({ runId: 'response-1' })]);
+    expect(usageEmitSink[0]).not.toHaveProperty('usage_type');
+  });
+
   it('keeps a tool result and its input at full size in the content parts LibreChat persists', async () => {
     const { GraphEvents, createContentAggregator } = jest.requireActual('@librechat/agents');
     const { getDefaultHandlers } = require('../callbacks');

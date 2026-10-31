@@ -13,6 +13,8 @@ export interface PiContextUsageProjectionInput {
   reserveRatio?: number;
   provider?: string;
   calibrationRatio?: number;
+  /** Token count of the cross-run summary already included in the system prompt. */
+  summaryTokens?: number;
 }
 
 function isValidTokenCount(value: number): boolean {
@@ -44,6 +46,9 @@ export function projectPiContextUsage(
     input.maxContextTokens !== undefined &&
     (!Number.isSafeInteger(input.maxContextTokens) || input.maxContextTokens <= 0)
   ) {
+    return undefined;
+  }
+  if (input.summaryTokens !== undefined && !isValidTokenCount(input.summaryTokens)) {
     return undefined;
   }
   const contextWindow =
@@ -104,7 +109,7 @@ export function projectPiContextUsage(
       systemMessageTokens: instructionTokens,
       dynamicInstructionTokens: 0,
       toolSchemaTokens: 0,
-      summaryTokens: 0,
+      summaryTokens: input.summaryTokens ?? 0,
       toolCount: 0,
       messageCount,
       messageTokens,

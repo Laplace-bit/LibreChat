@@ -10202,6 +10202,36 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
+  it('sends the host agent instructions and LibreChat summary as Pi system context', async () => {
+    const { HumanMessage, SystemMessage } = require('@librechat/agents/langchain/messages');
+    const client = createPiClient();
+    client.options.agent.toolContextMap = { connector: 'Business connector guidance' };
+    client.options.agent.instructions = 'Follow the factory policy';
+    client.options.agent.dynamicToolContextMap = { knowledge: 'Retrieved process knowledge' };
+    client.options.agent.additional_instructions = 'Authorized memory context';
+    const summary = { text: 'Previous shift details', tokenCount: 14 };
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage('What changed?')],
+      indexTokenCountMap: {},
+      summary,
+      boundaryTokenAdjustment: undefined,
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    const dispatchedMessages = mockExecutePiGeneration.mock.calls[0][0].messages;
+    expect(SystemMessage.isInstance(dispatchedMessages[0])).toBe(true);
+    expect(dispatchedMessages[0].content).toBe(
+      'Business connector guidance\nFollow the factory policy\n\n' +
+        'Retrieved process knowledge\nAuthorized memory context\n\n' +
+        '## Conversation Summary\n\nPrevious shift details',
+    );
+    expect(dispatchedMessages[1]).toBeInstanceOf(HumanMessage);
+    expect(mockExecutePiGeneration.mock.calls[0][0].contextUsage).toEqual(
+      expect.objectContaining({ summaryTokens: 14 }),
+    );
+  });
+
   it('checks the exact formatted model input before starting Pi', async () => {
     const { HumanMessage } = require('@librechat/agents/langchain/messages');
     const privateInput = 'PRIVATE-PI-HISTORY';
@@ -10236,6 +10266,30 @@ describe('AgentClient - Pi generation dispatch', () => {
 
     expect(mockExecutePiGeneration).not.toHaveBeenCalled();
     expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('includes the Pi system prompt in the final provider policy projection', async () => {
+    const { HumanMessage, SystemMessage } = require('@librechat/agents/langchain/messages');
+    const privatePrompt = 'HOST-PI-SYSTEM-PROMPT';
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new SystemMessage(privatePrompt), new HumanMessage('hello')],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+    const client = createPiClient();
+    const policyProjection = jest.spyOn(AgentClient.prototype, 'assertBuiltModelBoundContent');
+
+    try {
+      await client.chatCompletion({ payload: [] });
+      expect(policyProjection).toHaveBeenCalledWith(
+        expect.arrayContaining([expect.objectContaining({ content: privatePrompt })]),
+      );
+    } finally {
+      policyProjection.mockRestore();
+    }
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
   it('commits private text admission before dispatching Pi', async () => {

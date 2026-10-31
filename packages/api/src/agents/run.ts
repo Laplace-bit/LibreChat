@@ -137,8 +137,8 @@ import { createStepBudgetHook } from '~/agents/stepBudget';
 import { buildHITLRunWiring } from '~/agents/hitl/runtime';
 import { buildLangfuseConfig } from '~/langfuse/config';
 import { applyTestRunHook } from '~/agents/testHook';
-import { frameDynamicInstructions } from './tail';
 import { isUserProvided } from '~/utils/common';
+import { buildAgentPromptParts } from './tail';
 import { createSafeUser } from '~/utils/env';
 
 /** Expected shape of JSON tool search results */
@@ -2479,28 +2479,22 @@ export async function createRun({
       modelCallbacks,
     );
 
-    const joinInstructionMap = (map?: Record<string, unknown>) =>
-      Object.values(map ?? {})
-        .filter((value): value is string => typeof value === 'string' && value !== '')
-        .join('\n')
-        .trim();
-
-    const toolInstructions = joinInstructionMap(agent.toolContextMap);
-    const dynamicToolInstructions = joinInstructionMap(agent.dynamicToolContextMap);
-
-    const systemContent = [toolInstructions, agent.instructions ?? ''].join('\n').trim();
-
-    let additionalInstructions = [dynamicToolInstructions, agent.additional_instructions ?? '']
-      .join('\n')
-      .trim();
+    let additionalInstructionTail: string | undefined;
     if (isSubagent && agent.alwaysApplySkillPrimes?.length) {
-      const skillInstructions = agent.alwaysApplySkillPrimes
+      additionalInstructionTail = agent.alwaysApplySkillPrimes
         .map((prime) => `# Always-apply skill: ${prime.name}\n${prime.body}`)
         .join('\n\n');
-      additionalInstructions = [additionalInstructions, skillInstructions]
-        .filter(Boolean)
-        .join('\n\n');
     }
+
+    const promptParts = buildAgentPromptParts({
+      toolContextMap: agent.toolContextMap,
+      instructions: agent.instructions,
+      dynamicToolContextMap: agent.dynamicToolContextMap,
+      additionalInstructions: agent.additional_instructions,
+      additionalInstructionTail,
+      provider,
+      promptCache: 'promptCache' in llmConfig && llmConfig.promptCache === true,
+    });
 
     /** Resolves issues with new OpenAI usage field */
     if (
@@ -2631,13 +2625,8 @@ export async function createRun({
       agentId: agent.id,
       tools,
       clientOptions: llmConfig,
-      instructions: systemContent,
-      additional_instructions:
-        frameDynamicInstructions({
-          instructions: additionalInstructions,
-          provider,
-          promptCache: 'promptCache' in llmConfig && llmConfig.promptCache === true,
-        }) || undefined,
+      instructions: promptParts.instructions,
+      additional_instructions: promptParts.additionalInstructions,
       name: agent.name ?? undefined,
       toolRegistry,
       maxContextTokens: effectiveMaxContextTokens,

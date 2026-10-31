@@ -143,6 +143,7 @@ export * from './agents/pi/bridge';
 export * from './agents/pi/execution';
 export * from './agents/pi/dispatch';
 export * from './agents/pi/contextUsage';
+export * from './agents/pi/prompt';
 export * from './agents/pi/compatibility';
 export * from './agents/pi/history';
 export * from './agents/runtime/selection';

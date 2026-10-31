@@ -20,6 +20,7 @@ describe('projectPiContextUsage', () => {
       agentId: 'agent-1',
       provider: 'openAI',
       calibrationRatio: 1.25,
+      summaryTokens: 12,
     });
 
     expect(snapshot).toEqual({
@@ -33,7 +34,7 @@ describe('projectPiContextUsage', () => {
         systemMessageTokens: 18,
         dynamicInstructionTokens: 0,
         toolSchemaTokens: 0,
-        summaryTokens: 0,
+        summaryTokens: 12,
         toolCount: 0,
         messageCount: 1,
         messageTokens: 27,
@@ -65,6 +66,19 @@ describe('projectPiContextUsage', () => {
         tokenCounter: () => Number.NaN,
         runId: 'response-1',
         agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('omits a snapshot when the cross-run summary count is invalid', () => {
+    expect(
+      projectPiContextUsage({
+        messages: [new SystemMessage('## Conversation Summary\n\nprevious turn')],
+        model,
+        tokenCounter: () => 18,
+        runId: 'response-1',
+        agentId: 'agent-1',
+        summaryTokens: -1,
       }),
     ).toBeUndefined();
   });

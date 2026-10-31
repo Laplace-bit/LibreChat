@@ -2,7 +2,11 @@ const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { nanoid } = require('nanoid');
 const { logger, MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH } = require('@librechat/data-schemas');
-const { getBufferString, HumanMessage } = require('@librechat/agents/langchain/messages');
+const {
+  getBufferString,
+  HumanMessage,
+  SystemMessage,
+} = require('@librechat/agents/langchain/messages');
 const {
   createRun,
   isEnabled,
@@ -35,6 +39,7 @@ const {
   aggregateEmittedUsage,
   resolveAgentTokenConfig,
   buildPersistedContextUsage,
+  buildPiSystemPrompt,
   resolveRetainedToolTokens,
   computeSummaryUsedTokens,
   priorRunOutputTokens,
@@ -2089,11 +2094,34 @@ class AgentClient extends BaseClient {
     });
   }
 
-  /** Agent pruning and summarization happen inside the SDK after
-   * `buildMessages`, so BaseClient's post-build payload is not yet the final
-   * model selection. The fail-closed callback below enforces the exact payload
-   * at every chat-model call instead. */
-  assertBuiltModelBoundContent() {}
+  /** Run the same source-aware provider-content projection for runtimes that
+   * do not enter LangChain's model callback boundary (currently Pi). */
+  assertBuiltModelBoundContent(messages) {
+    const fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this);
+    const callback = createModelBoundContentCallback({
+      onTraversalFailure: reportLocatorTraversalFailure,
+      filters: this.options.req?.config?.filters,
+      legacyPii: this.options.req?.config?.messageFilter?.pii,
+      storedMessages: this.modelBoundStoredMessages,
+      privateTextTokens: getPrivateTextInspectionTokens(this.modelBoundStoredMessages ?? []),
+      fileIdsBySourceMessageId: fileProjection.fileIdsBySourceMessageId,
+      resolvedFiles: fileProjection.resolvedFiles,
+      sourceFileProjectionOverflowed: fileProjection.overflowed,
+    });
+    callback.handleChatModelStart(
+      undefined,
+      [messages],
+      this.responseMessageId,
+      undefined,
+      undefined,
+      undefined,
+      {
+        run_id: this.responseMessageId,
+        thread_id: this.conversationId,
+        agent_id: this.options.agent?.id,
+      },
+    );
+  }
 
   createModelBoundChatModelCallback(initialAdmission) {
     const fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this);
@@ -5114,11 +5142,17 @@ class AgentClient extends BaseClient {
           (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
 
         if (isPiRuntime) {
+          const piSystemPrompt = buildPiSystemPrompt({
+            agent: this.options.agent,
+            summary: continuationSummary,
+          });
+          const piMessages =
+            piSystemPrompt.length > 0 ? [new SystemMessage(piSystemPrompt), ...messages] : messages;
           const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
           try {
             /** Pi has no LangChain callback boundary. Inspect the exact formatted host messages
              *  before converting them, retaining stored-message and file provenance. */
-            BaseClient.prototype.assertBuiltModelBoundContent.call(this, messages);
+            AgentClient.prototype.assertBuiltModelBoundContent.call(this, piMessages);
           } catch (error) {
             persistence?.cancel();
             throw error;
@@ -5154,7 +5188,7 @@ class AgentClient extends BaseClient {
 
           this.options.startupTelemetry?.mark('pi_session_started');
           const outcome = await executePiGeneration({
-            messages,
+            messages: piMessages,
             createModelBinding: piModelBindingFactory,
             signal: abortController.signal,
             usageAttribution: {
@@ -5169,6 +5203,7 @@ class AgentClient extends BaseClient {
               maxContextTokens: this.maxContextTokens,
               reserveRatio: appConfig?.summarization?.reserveRatio,
               calibrationRatio,
+              summaryTokens: continuationSummary?.tokenCount,
             },
             createStepIdentity: () => {
               const sequence = nextStepIndex++;

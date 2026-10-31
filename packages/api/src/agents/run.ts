@@ -111,6 +111,10 @@ import {
   eventOnlyRunFileTools,
   isRunFileSharingSupported,
 } from './files/runtime';
+import {
+  MIN_SUMMARIZATION_CONTEXT_TOKENS,
+  computeEffectiveMaxContextTokens,
+} from './contextBudget';
 import { resolveToolApprovalPolicy, exemptAskUserQuestionFromApproval } from '~/agents/hitl/policy';
 import { applyCustomHandoffPromptKeyCompatibility } from '~/agents/handoffPromptKeyCompatibility';
 import { stripIntentFromToolRegistry, stripIntentFromToolDefinitions } from '~/agents/intent';
@@ -1509,34 +1513,6 @@ function shapeSummarizationConfig(
     contextPruning: config?.contextPruning as ContextPruningConfig | undefined,
     reserveRatio: config?.reserveRatio,
   };
-}
-
-/**
- * Below this context budget a summarization cycle cannot make progress: the
- * summary allocation rounds down to a handful of tokens, the rewritten history
- * still overflows, and the graph re-triggers summarization on every step until
- * the recursion limit aborts the run. Dozens of wasted LLM calls surfaced to
- * the user as an opaque LangGraph error. Falling back to plain pruning instead
- * either fits the request or fails fast with the actionable `empty_messages`
- * token-budget breakdown. Matches the floor `initializeAgent` applies when the
- * user supplies no override.
- */
-const MIN_SUMMARIZATION_CONTEXT_TOKENS = 1024;
-
-/**
- * Applies `reserveRatio` against the pre-ratio base context budget, falling
- * back to the pre-computed `maxContextTokens` from initializeAgent.
- */
-function computeEffectiveMaxContextTokens(
-  reserveRatio: number | undefined,
-  baseContextTokens: number | undefined,
-  maxContextTokens: number | undefined,
-): number | undefined {
-  if (reserveRatio == null || reserveRatio <= 0 || reserveRatio >= 1 || baseContextTokens == null) {
-    return maxContextTokens;
-  }
-  const ratioComputed = Math.max(1024, Math.round(baseContextTokens * (1 - reserveRatio)));
-  return Math.min(maxContextTokens ?? ratioComputed, ratioComputed);
 }
 
 type CallbackClientOptions = {

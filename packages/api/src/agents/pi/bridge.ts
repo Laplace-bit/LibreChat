@@ -1,6 +1,6 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
-import type { PiHostEvent } from './events';
 import type { HostPiSession } from './session';
+import type { PiHostEvent } from './events';
 
 export interface PiHostEventBridgeOptions {
   session: HostPiSession;

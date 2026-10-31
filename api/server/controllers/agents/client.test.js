@@ -10202,9 +10202,48 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
+  it('keeps Pi context overflow actionable when model-bound content protection is enabled', async () => {
+    const client = createPiClient({
+      req: {
+        config: {
+          endpoints: { [EModelEndpoint.agents]: {} },
+          filters: {
+            messages: {
+              pii: {
+                fields: ['text'],
+                starterPatterns: [],
+                customPatterns: [{ id: 'email', label: 'email', regex: 'never-match' }],
+              },
+            },
+          },
+        },
+      },
+    });
+    mockExecutePiGeneration.mockRejectedValue(
+      Object.assign(
+        new Error(
+          'Pi cannot run this turn because its estimated context exceeds the configured budget.',
+        ),
+        {
+          code: 'PI_CONTEXT_BUDGET_EXCEEDED',
+        },
+      ),
+    );
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(client.contentParts).toContainEqual({
+      type: ContentTypes.ERROR,
+      [ContentTypes.ERROR]: JSON.stringify({ type: ErrorTypes.FINAL_CONTEXT_OVERFLOW }),
+    });
+  });
+
   it('sends the host agent instructions and LibreChat summary as Pi system context', async () => {
     const { HumanMessage, SystemMessage } = require('@librechat/agents/langchain/messages');
     const client = createPiClient();
+    client.options.agent.baseContextTokens = 10_000;
+    client.maxContextTokens = 9_500;
+    client.options.agent.summarization = { reserveRatio: 0.1 };
     client.options.agent.toolContextMap = { connector: 'Business connector guidance' };
     client.options.agent.instructions = 'Follow the factory policy';
     client.options.agent.dynamicToolContextMap = { knowledge: 'Retrieved process knowledge' };
@@ -10228,7 +10267,11 @@ describe('AgentClient - Pi generation dispatch', () => {
     );
     expect(dispatchedMessages[1]).toBeInstanceOf(HumanMessage);
     expect(mockExecutePiGeneration.mock.calls[0][0].contextUsage).toEqual(
-      expect.objectContaining({ summaryTokens: 14 }),
+      expect.objectContaining({
+        maxContextTokens: 9_000,
+        reserveRatio: 0.1,
+        summaryTokens: 14,
+      }),
     );
   });
 
@@ -10288,6 +10331,52 @@ describe('AgentClient - Pi generation dispatch', () => {
     } finally {
       policyProjection.mockRestore();
     }
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses canonical private-text inspection tokens at Pi final-input admission', async () => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const privateToken = '[EMAIL_1_0123456789abcdef0123456789abcdef]';
+    const client = createPiClient({
+      req: {
+        config: {
+          endpoints: { [EModelEndpoint.agents]: {} },
+          filters: {
+            messages: {
+              pii: {
+                fields: ['text'],
+                starterPatterns: [],
+                customPatterns: [
+                  {
+                    id: 'private-token',
+                    label: 'private token',
+                    regex: 'EMAIL_1_0123456789abcdef',
+                  },
+                ],
+              },
+            },
+          },
+        },
+      },
+    });
+    client.setModelBoundStoredMessages([
+      {
+        messageId: 'private-history',
+        role: 'user',
+        isCreatedByUser: true,
+        text: privateToken,
+        privateTextTokens: [privateToken],
+      },
+    ]);
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage(privateToken)],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+
+    await client.chatCompletion({ payload: [] });
 
     expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });

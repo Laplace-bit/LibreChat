@@ -40,6 +40,7 @@ const {
   resolveAgentTokenConfig,
   buildPersistedContextUsage,
   buildPiSystemPrompt,
+  computeEffectiveMaxContextTokens,
   resolveRetainedToolTokens,
   computeSummaryUsedTokens,
   priorRunOutputTokens,
@@ -381,6 +382,12 @@ function getUserFacingRequestError(baseMessage, error, appConfig) {
   /** Carries no model or user content, so it is safe under every filter. */
   if (error?.name === 'ManualSummarizationSkippedError') {
     return JSON.stringify({ type: ErrorTypes.COMPACTION_SKIPPED, reason: error.reason });
+  }
+  /** Pi rejects the host-formatted transcript before provider dispatch when its
+   *  estimated prompt exceeds the configured budget. Keep the typed, actionable
+   *  client error even when content protection suppresses provider messages. */
+  if (error?.code === 'PI_CONTEXT_BUDGET_EXCEEDED') {
+    return JSON.stringify({ type: ErrorTypes.FINAL_CONTEXT_OVERFLOW });
   }
   const protectionEnabled = hasModelBoundContentProtection(
     appConfig?.filters,
@@ -5146,6 +5153,12 @@ class AgentClient extends BaseClient {
             agent: this.options.agent,
             summary: continuationSummary,
           });
+          const summarizationConfig = this.options.agent.summarization ?? appConfig?.summarization;
+          const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
+            summarizationConfig?.reserveRatio,
+            this.options.agent.baseContextTokens,
+            this.maxContextTokens,
+          );
           const piMessages =
             piSystemPrompt.length > 0 ? [new SystemMessage(piSystemPrompt), ...messages] : messages;
           const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
@@ -5200,8 +5213,8 @@ class AgentClient extends BaseClient {
               tokenCounter,
               runId: this.responseMessageId,
               agentId: this.options.agent.id,
-              maxContextTokens: this.maxContextTokens,
-              reserveRatio: appConfig?.summarization?.reserveRatio,
+              maxContextTokens: effectiveMaxContextTokens,
+              reserveRatio: summarizationConfig?.reserveRatio,
               calibrationRatio,
               summaryTokens: continuationSummary?.tokenCount,
             },

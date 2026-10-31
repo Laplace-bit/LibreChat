@@ -1,8 +1,8 @@
 import { GraphEvents } from '@librechat/agents';
 import { ContentTypes, StepTypes, UsageEvents } from 'librechat-data-provider';
-import type { AssistantMessage } from '@earendil-works/pi-ai';
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
 import type { Agents, TContextUsageEvent } from 'librechat-data-provider';
+import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
+import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 
 export type PiContentType = 'text' | 'think';
@@ -269,15 +269,20 @@ export function createPiContentEventTranslator(
       if (!currentMessage) {
         return [];
       }
-      const status =
-        event.message.stopReason === 'aborted'
-          ? 'cancelled'
-          : event.message.stopReason === 'error' ||
-              event.message.stopReason === 'length' ||
-              event.message.stopReason === 'deferred' ||
-              event.message.stopReason === 'toolUse'
-            ? 'failed'
-            : 'completed';
+      let status: Agents.RunStepClosedStatus;
+      switch (event.message.stopReason) {
+        case 'aborted':
+          status = 'cancelled';
+          break;
+        case 'error':
+        case 'length':
+        case 'deferred':
+        case 'toolUse':
+          status = 'failed';
+          break;
+        default:
+          status = 'completed';
+      }
       const completed = closeContentSteps(currentMessage, status, now());
       currentMessage = undefined;
       return completed;

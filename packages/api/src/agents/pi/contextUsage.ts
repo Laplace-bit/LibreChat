@@ -1,5 +1,5 @@
-import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import { DEFAULT_RESERVE_RATIO, REPLY_PRIMER_TOKENS } from '@librechat/agents';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { TContextUsageEvent } from 'librechat-data-provider';
 import type { PiModelBinding } from './session';
 
@@ -15,6 +15,20 @@ export interface PiContextUsageProjectionInput {
   calibrationRatio?: number;
   /** Token count of the cross-run summary already included in the system prompt. */
   summaryTokens?: number;
+}
+
+/** Pi does not yet have the host graph's history pruner, so an estimated
+ * over-budget transcript must fail before the provider sees an incomplete or
+ * known-to-overflow prompt. */
+export class PiContextBudgetExceededError extends Error {
+  readonly code = 'PI_CONTEXT_BUDGET_EXCEEDED';
+  readonly status = 413;
+  readonly statusCode = 413;
+
+  constructor() {
+    super('Pi cannot run this turn because its estimated context exceeds the configured budget.');
+    this.name = 'PiContextBudgetExceededError';
+  }
 }
 
 function isValidTokenCount(value: number): boolean {
@@ -98,6 +112,11 @@ export function projectPiContextUsage(
       ? input.calibrationRatio
       : 1;
   const calibratedMessageTokens = Math.round(messageTokens * calibrationRatio);
+  const remainingContextTokens =
+    contextBudget - instructionTokens - calibratedMessageTokens - REPLY_PRIMER_TOKENS;
+  if (remainingContextTokens < 0) {
+    throw new PiContextBudgetExceededError();
+  }
   return {
     runId: input.runId,
     agentId: input.agentId,
@@ -118,10 +137,7 @@ export function projectPiContextUsage(
     contextBudget,
     effectiveInstructionTokens: instructionTokens,
     prePruneContextTokens: calibratedMessageTokens,
-    remainingContextTokens: Math.max(
-      0,
-      contextBudget - instructionTokens - calibratedMessageTokens - REPLY_PRIMER_TOKENS,
-    ),
+    remainingContextTokens,
     calibrationRatio,
   };
 }

@@ -1,6 +1,6 @@
 import { HumanMessage, SystemMessage } from '@librechat/agents/langchain/messages';
 import type { PiModelBinding } from './session';
-import { projectPiContextUsage } from './contextUsage';
+import { PiContextBudgetExceededError, projectPiContextUsage } from './contextUsage';
 
 const model = {
   api: 'openai-responses',
@@ -81,5 +81,17 @@ describe('projectPiContextUsage', () => {
         summaryTokens: -1,
       }),
     ).toBeUndefined();
+  });
+
+  it('fails closed when the unpruned transcript exceeds its context budget', () => {
+    expect(() =>
+      projectPiContextUsage({
+        messages: [new SystemMessage('system'), new HumanMessage('long user history')],
+        model,
+        tokenCounter: (message) => (message._getType() === 'system' ? 7000 : 2000),
+        runId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toThrow(PiContextBudgetExceededError);
   });
 });

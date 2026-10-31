@@ -3,9 +3,9 @@ import { Type } from 'typebox';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { UsageEvents } from 'librechat-data-provider';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { UsageEvents } from 'librechat-data-provider';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
 import {
   AIMessage,
@@ -19,6 +19,7 @@ const {
   convertLibreChatHistoryToPi,
   createHostPiSession,
   executePiGeneration,
+  PiContextBudgetExceededError,
   PiContextUsageUnavailableError,
   createPiContentEventTranslator,
   LEGACY_AGENT_RUNTIME,
@@ -777,6 +778,53 @@ test('Pi dispatch fails closed before provider invocation when host context usag
     assert.equal(fakeProvider.getRequestCount(), 0, 'Pi fails before contacting the provider');
     assert.equal(hostEvents.length, 0, 'the host does not receive a false context snapshot');
     assert.equal(bindingDisposals, 1, 'the untransferred binding is disposed after the failure');
+  } finally {
+    await fakeProvider.close();
+  }
+});
+
+test('Pi dispatch fails closed before provider invocation when the unpruned transcript is over budget', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  const hostEvents = [];
+
+  try {
+    await assert.rejects(
+      executePiGeneration({
+        messages: [new SystemMessage('Context usage boundary.'), new HumanMessage('Say hello.')],
+        createModelBinding: () =>
+          createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+            bindingDisposals += 1;
+          }),
+        createStepIdentity: () => ({
+          id: 'over-budget-step',
+          index: 0,
+          messageId: 'over-budget-message',
+          runId: 'over-budget-run',
+          agentId: 'over-budget-agent',
+        }),
+        usageAttribution: { provider: 'openAI', agentId: 'over-budget-agent' },
+        contextUsage: {
+          /** 230 × system + user + reply primer exceeds the 450-token
+           *  effective cap, but fits the 500-token model cap without reserve. */
+          tokenCounter: () => 230,
+          maxContextTokens: 500,
+          reserveRatio: 0.1,
+          runId: 'over-budget-run',
+          agentId: 'over-budget-agent',
+        },
+        handleHostEvent: (event) => hostEvents.push(event),
+      }),
+      (error) => error instanceof PiContextBudgetExceededError,
+    );
+
+    assert.equal(fakeProvider.getRequestCount(), 0, 'the over-budget transcript never reaches Pi');
+    assert.equal(
+      hostEvents.length,
+      0,
+      'the host does not receive a context snapshot for an invalid turn',
+    );
+    assert.equal(bindingDisposals, 1, 'the model binding is disposed after the projection fails');
   } finally {
     await fakeProvider.close();
   }

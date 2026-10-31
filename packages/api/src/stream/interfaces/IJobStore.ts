@@ -373,6 +373,10 @@ export interface SerializableJobData {
    */
   pendingAction?: Agents.PendingAction;
 
+  /** Server-only, versioned Pi tool-result continuation. It is validated against
+   * the pending action and generation identities before any resume CAS or side effect. */
+  piResumeContinuation?: unknown;
+
   /** Durable bridge between the resume claim and content reconstruction. An
    * abort can win while the resume controller is still rebuilding the client;
    * retaining the accepted answer here lets that terminal owner stamp it onto

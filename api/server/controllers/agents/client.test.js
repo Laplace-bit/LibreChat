@@ -10397,7 +10397,7 @@ describe('AgentClient - Pi generation dispatch', () => {
     ['default ask policy', { enabled: true }],
     ['explicit ask policy', { enabled: true, mode: 'bypass', ask: ['file_search'] }],
   ])(
-    'rejects Pi tool execution before provider or host effects under %s',
+    'routes %s through the durable tool approval gate before host execution',
     async (_label, toolApproval) => {
       const toolExecuteHandler = { handle: jest.fn() };
       const client = createPiFileSearchClient({
@@ -10407,12 +10407,19 @@ describe('AgentClient - Pi generation dispatch', () => {
 
       await client.chatCompletion({ payload: [] });
 
-      expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
-      expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+      expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledTimes(1);
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+      const [dispatchInput] = mockExecutePiGeneration.mock.calls[0];
+      await expect(
+        dispatchInput.toolExecutionGate({
+          toolCallId: 'pi-approval-test-call',
+          name: Tools.file_search,
+          args: { query: 'machine maintenance' },
+          turn: 0,
+        }),
+      ).resolves.toMatchObject({ kind: 'pause' });
       expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
-      expect(client.contentParts).toContainEqual(
-        expect.objectContaining({ type: ContentTypes.ERROR }),
-      );
+      expect(client.contentParts).toEqual([]);
       expect(mockCreateRun).not.toHaveBeenCalled();
     },
   );
@@ -10438,7 +10445,7 @@ describe('AgentClient - Pi generation dispatch', () => {
     }
   });
 
-  it('rejects Pi before executing a registered PreToolUse hook when approval is enabled', async () => {
+  it('runs a registered PreToolUse hook when Pi reaches the host approval gate', async () => {
     mockIsHITLEnabled.mockReturnValue(true);
     const hook = jest.fn(async () => ({ decision: 'deny' }));
     const unregister = registerToolApprovalHook(() => hook);
@@ -10450,19 +10457,33 @@ describe('AgentClient - Pi generation dispatch', () => {
 
     try {
       await client.chatCompletion({ payload: [] });
+      expect(hook).not.toHaveBeenCalled();
+      expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledTimes(1);
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+      const [dispatchInput] = mockExecutePiGeneration.mock.calls[0];
+      await expect(
+        dispatchInput.toolExecutionGate({
+          toolCallId: 'pi-hook-test-call',
+          name: Tools.file_search,
+          args: { query: 'machine maintenance' },
+          turn: 0,
+        }),
+      ).resolves.toEqual({ kind: 'deny' });
     } finally {
       unregister();
     }
 
-    expect(hook).not.toHaveBeenCalled();
-    expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
-    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(hook).toHaveBeenCalledTimes(1);
     expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
   });
 
-  it('rejects Pi tools when an attached code environment activates default approval', async () => {
+  it.each([
+    ['default approval policy', undefined],
+    ['disabled approval override', { enabled: false }],
+  ])('fails closed for an attached code environment under the %s', async (_label, toolApproval) => {
     const toolExecuteHandler = { handle: jest.fn() };
     const client = createPiFileSearchClient({
+      toolApproval,
       agentOverrides: {
         codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
       },
@@ -10477,20 +10498,6 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(client.contentParts).toContainEqual(
       expect.objectContaining({ type: ContentTypes.ERROR }),
     );
-  });
-
-  it('honors the explicit disabled-policy override for an attached code environment', async () => {
-    const client = createPiFileSearchClient({
-      toolApproval: { enabled: false },
-      agentOverrides: {
-        codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
-      },
-    });
-
-    await client.chatCompletion({ payload: [] });
-
-    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
-    expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledTimes(1);
   });
 
   it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {

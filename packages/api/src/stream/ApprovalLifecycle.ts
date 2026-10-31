@@ -46,6 +46,8 @@ export interface ApprovalPauseOptions {
   persistencePending?: boolean;
   /** Versioned pointer to the canonical signed Conversation suspension. */
   agentEventSuspension?: import('~/agents/triggers/types').AgentEventSuspensionProjection;
+  /** Versioned server-only Pi tool continuation bound to this pending action. */
+  piResumeContinuation?: unknown;
 }
 
 export const PENDING_ACTION_EXPIRED_CODE = 'HITL_ACTION_EXPIRED';
@@ -112,6 +114,15 @@ export class ApprovalLifecycle {
     if (isPendingActionExpired({ pendingAction })) {
       throw new PendingActionExpiredError();
     }
+    if (
+      options.piResumeContinuation != null &&
+      (typeof options.piResumeContinuation !== 'object' ||
+        options.piResumeContinuation === null ||
+        !('actionId' in options.piResumeContinuation) ||
+        options.piResumeContinuation.actionId !== pendingAction.actionId)
+    ) {
+      throw new Error('Pi continuation must be bound to the pending action');
+    }
     const job = await this.store.getJob(streamId);
     if (
       !job ||
@@ -162,10 +173,16 @@ export class ApprovalLifecycle {
           ...(options.agentEventSuspension != null
             ? { agentEventSuspension: options.agentEventSuspension }
             : {}),
+          ...(options.piResumeContinuation != null
+            ? { piResumeContinuation: options.piResumeContinuation }
+            : {}),
         },
         /** A re-pause with nothing persistable must not leave the previous
          * segment's calibration and tier on the job for the next resume. */
-        ...(contextMeta == null ? { clear: ['contextMeta' as const] } : {}),
+        clear: [
+          ...(contextMeta == null ? (['contextMeta'] as const) : []),
+          ...(options.piResumeContinuation == null ? (['piResumeContinuation'] as const) : []),
+        ],
         expectCreatedAt: expectedCreatedAt,
         notAfterMs: pendingAction.expiresAt,
         steerReceiptTtlSeconds: pauseReceiptTtl,
@@ -310,6 +327,7 @@ export class ApprovalLifecycle {
       clear: [
         'pendingAction',
         'pendingActionId',
+        'piResumeContinuation',
         'terminalPersistencePending',
         'terminalPersistenceStartedAt',
       ],
@@ -422,6 +440,7 @@ export class ApprovalLifecycle {
       clear: [
         'pendingAction',
         'pendingActionId',
+        'piResumeContinuation',
         'agentEventSuspension',
         'providerExecutionStartedId',
       ],
@@ -489,7 +508,7 @@ export class ApprovalLifecycle {
     const ok = await this.store.transitionStatus(streamId, {
       from: 'requires_action',
       to: 'aborted',
-      clear: ['pendingAction', 'pendingActionId'],
+      clear: ['pendingAction', 'pendingActionId', 'piResumeContinuation'],
       // completedAt lets the stores' terminal-cleanup reclaim the job; without
       // it an expired approval lingers in the in-memory map indefinitely. When a host
       // action is owed, `terminalHostActionPending` retains the job (and keeps it

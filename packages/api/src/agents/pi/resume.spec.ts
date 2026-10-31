@@ -1,0 +1,273 @@
+import { Tools } from 'librechat-data-provider';
+import type { Agents } from 'librechat-data-provider';
+import type { PiPauseToolCall } from './pause';
+import {
+  appendPiToolResultContinuation,
+  buildPiApprovalInterruptPayload,
+  createPiApprovalContinuation,
+  matchesPiApprovalHostState,
+  resolvePiApprovalContinuation,
+  resolvePiApprovalDecision,
+} from './resume';
+import { buildPendingAction } from '~/agents/hitl/policy';
+
+function createApproval() {
+  const toolCall: PiPauseToolCall = {
+    toolCallId: 'pi-call-1',
+    name: Tools.file_search,
+    args: { query: 'maintenance manual' },
+    hostExecution: {
+      toolCallId: 'host-call-1',
+      toolTurn: 3,
+      stepIdentity: {
+        id: 'step-1',
+        index: 2,
+        messageId: 'response-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 100,
+    },
+    review: { allowedDecisions: ['approve', 'reject', 'edit', 'respond'] },
+  };
+  const payload = buildPiApprovalInterruptPayload({
+    hostToolCallId: toolCall.hostExecution.toolCallId,
+    toolName: toolCall.name,
+    args: toolCall.args,
+    allowedDecisions: toolCall.review.allowedDecisions,
+  });
+  const pendingAction = buildPendingAction(payload, {
+    streamId: 'conversation-1',
+    conversationId: 'conversation-1',
+    runId: 'response-1',
+    responseMessageId: 'response-1',
+  });
+  return {
+    toolCall,
+    pendingAction,
+    continuation: createPiApprovalContinuation(pendingAction.actionId, toolCall),
+  };
+}
+
+function hostState(args: Record<string, unknown> = { query: 'maintenance manual' }) {
+  return {
+    runSteps: [
+      {
+        id: 'step-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+        type: 'tool_calls',
+        index: 2,
+        created_at: 100,
+        status: 'in_progress',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              id: 'host-call-1',
+              type: 'function',
+              function: { name: Tools.file_search, arguments: args },
+            },
+          ],
+        },
+      },
+    ],
+    aggregatedContent: [
+      {
+        type: 'tool_call',
+        tool_call: {
+          id: 'host-call-1',
+          stepId: 'step-1',
+          name: Tools.file_search,
+          args: JSON.stringify(args),
+        },
+      },
+    ],
+  };
+}
+
+describe('Pi approval continuation', () => {
+  it('validates the server envelope against the exact pending action and generation', () => {
+    const { continuation, pendingAction } = createApproval();
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      resolvePiApprovalContinuation({
+        value: { ...continuation, hostToolCallId: 'stale-host-call' },
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'replacement-response',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction: {
+          ...pendingAction,
+          payload: { type: 'tool_approval', action_requests: null, review_configs: [] },
+        } as unknown as Agents.PendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+  });
+
+  it('requires matching unfinished run-step and streamed content before resume', () => {
+    const { continuation } = createApproval();
+    const state = hostState();
+    const input = {
+      continuation,
+      ...state,
+      responseMessageId: 'response-1',
+      agentId: 'agent-1',
+    };
+
+    expect(matchesPiApprovalHostState(input)).toBe(true);
+    expect(
+      matchesPiApprovalHostState({
+        ...input,
+        runSteps: hostState({ query: 'different query' }).runSteps,
+      }),
+    ).toBe(false);
+    expect(matchesPiApprovalHostState({ ...input, aggregatedContent: [] })).toBe(false);
+  });
+
+  it('executes only allowed approve/edit decisions and keeps reject/respond side-effect free', () => {
+    const { continuation } = createApproval();
+    const resolution = (
+      decision: Agents.ToolApprovalDecisionType,
+    ): Agents.ToolApprovalResolution => {
+      if (decision === 'edit') {
+        return {
+          tool_call_id: 'host-call-1',
+          decision,
+          editedArguments: { query: 'revised manual' },
+        };
+      }
+      if (decision === 'respond') {
+        return { tool_call_id: 'host-call-1', decision, responseText: 'Search later' };
+      }
+      return { tool_call_id: 'host-call-1', decision };
+    };
+
+    expect(
+      resolvePiApprovalDecision({ continuation, resolutions: [resolution('approve')] }),
+    ).toEqual({ kind: 'execute', args: { query: 'maintenance manual' } });
+    expect(resolvePiApprovalDecision({ continuation, resolutions: [resolution('edit')] })).toEqual({
+      kind: 'execute',
+      args: { query: 'revised manual' },
+    });
+    expect(
+      resolvePiApprovalDecision({ continuation, resolutions: [resolution('reject')] }),
+    ).toEqual({ kind: 'reject' });
+    expect(
+      resolvePiApprovalDecision({ continuation, resolutions: [resolution('respond')] }),
+    ).toEqual({ kind: 'respond', text: 'Search later' });
+    expect(
+      resolvePiApprovalDecision({
+        continuation: { ...continuation, allowedDecisions: ['reject'] },
+        resolutions: [resolution('approve')],
+      }),
+    ).toBeUndefined();
+    expect(
+      resolvePiApprovalDecision({
+        continuation,
+        resolutions: [
+          {
+            tool_call_id: 'host-call-1',
+            decision: 'edit',
+            editedArguments: { query: 'changed', unexpected: true },
+          },
+        ],
+      }),
+    ).toBeUndefined();
+    expect(resolvePiApprovalDecision({ continuation, resolutions: [null] })).toBeUndefined();
+  });
+
+  it('restores the user prompt followed by the exact Pi call and its result', () => {
+    const { continuation } = createApproval();
+    const messages = appendPiToolResultContinuation({
+      conversion: {
+        systemPrompt: 'Be useful.',
+        history: [],
+        prompt: { text: 'Find the maintenance manual.', images: [] },
+      },
+      continuation,
+      toolArguments: continuation.args,
+      result: { content: [{ type: 'text', text: 'Found two manuals.' }], isError: false },
+      model: {
+        api: 'openai-responses',
+        provider: 'librechat-openai',
+        id: 'gpt-4o-mini',
+      },
+      now: () => 200,
+    });
+
+    expect(messages.map((message) => message.role)).toEqual(['user', 'assistant', 'toolResult']);
+    expect(messages[messages.length - 2]).toMatchObject({
+      role: 'assistant',
+      stopReason: 'toolUse',
+      content: [
+        {
+          type: 'toolCall',
+          id: 'pi-call-1',
+          name: Tools.file_search,
+          arguments: { query: 'maintenance manual' },
+        },
+      ],
+    });
+    expect(messages[messages.length - 1]).toMatchObject({
+      role: 'toolResult',
+      toolCallId: 'pi-call-1',
+      toolName: Tools.file_search,
+    });
+  });
+
+  it('records the reviewed edited arguments in the resumed Pi tool call', () => {
+    const { continuation } = createApproval();
+    const toolArguments = { query: 'revised manual' };
+    const messages = appendPiToolResultContinuation({
+      conversion: {
+        systemPrompt: 'Be useful.',
+        history: [],
+        prompt: { text: 'Find the maintenance manual.', images: [] },
+      },
+      continuation,
+      toolArguments,
+      result: { content: [{ type: 'text', text: 'Found the revised manual.' }], isError: false },
+      model: {
+        api: 'openai-responses',
+        provider: 'librechat-openai',
+        id: 'gpt-4o-mini',
+      },
+      now: () => 200,
+    });
+
+    expect(messages[messages.length - 2]).toMatchObject({
+      role: 'assistant',
+      content: [
+        {
+          type: 'toolCall',
+          id: 'pi-call-1',
+          name: Tools.file_search,
+          arguments: toolArguments,
+        },
+      ],
+    });
+  });
+});

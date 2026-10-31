@@ -260,6 +260,14 @@ describe('hasInvalidToolApprovalResolutions', () => {
     ).toBe(true);
   });
 
+  test('rejects malformed decisions before reading their fields', () => {
+    expect(
+      hasInvalidToolApprovalResolutions(payload, [
+        null,
+      ] as unknown as Agents.ToolApprovalResolution[]),
+    ).toBe(true);
+  });
+
   test('accepts one decision for each requested tool call', () => {
     expect(
       hasInvalidToolApprovalResolutions(payload, [

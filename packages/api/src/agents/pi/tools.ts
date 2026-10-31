@@ -4,11 +4,11 @@ import type { LCTool } from '@librechat/agents';
 import type { TSchema } from 'typebox';
 import { isPiSupportedHostToolName, PI_CALCULATOR_TOOL_NAME } from './toolNames';
 
-export type PiFileSearchArguments = Record<string, unknown> & {
+export type PiFileSearchArguments = Record<string, string> & {
   query: string;
 };
 
-export type PiCalculatorArguments = Record<string, unknown> & {
+export type PiCalculatorArguments = Record<string, string> & {
   input: string;
 };
 

@@ -134,6 +134,8 @@ export interface GenerationJobMetadata {
   terminalPersistenceStartedAt?: number;
   /** Set when the job is paused for human review (status === 'requires_action') */
   pendingAction?: Agents.PendingAction;
+  /** Server-only, versioned Pi continuation bound to the exact pending action. */
+  piResumeContinuation?: unknown;
   /** Accepted ask-user answer retained until this generation terminalizes. */
   resolvedAskUserQuestions?: ResolvedAskUserQuestion[];
 }

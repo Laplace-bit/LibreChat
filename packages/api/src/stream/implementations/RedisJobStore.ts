@@ -3850,6 +3850,7 @@ export class RedisJobStore implements IJobStoreV2 {
               clear: [
                 'pendingAction',
                 'pendingActionId',
+                'piResumeContinuation',
                 'terminalPersistencePending',
                 'terminalPersistenceStartedAt',
               ],
@@ -3874,7 +3875,7 @@ export class RedisJobStore implements IJobStoreV2 {
             const expired = await this.transitionStatus(streamId, {
               from: 'requires_action',
               to: 'aborted',
-              clear: ['pendingAction', 'pendingActionId'],
+              clear: ['pendingAction', 'pendingActionId', 'piResumeContinuation'],
               patch: {
                 error: 'Approval expired before a decision was made',
                 completedAt: Date.now(),
@@ -5798,6 +5799,15 @@ export class RedisJobStore implements IJobStoreV2 {
       contextUsage: data.contextUsage || undefined,
       tokenUsage: data.tokenUsage || undefined,
       pendingAction: this.parsePendingAction(data.pendingAction),
+      piResumeContinuation: data.piResumeContinuation
+        ? (() => {
+            try {
+              return JSON.parse(data.piResumeContinuation);
+            } catch {
+              return {};
+            }
+          })()
+        : undefined,
       resolvedAskUserQuestions: this.parseResolvedAskUserQuestions(data.resolvedAskUserQuestions),
       pendingActionId: data.pendingActionId || undefined,
       lastActiveAt: data.lastActiveAt ? parseInt(data.lastActiveAt, 10) : undefined,

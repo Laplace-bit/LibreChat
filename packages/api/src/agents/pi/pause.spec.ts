@@ -9,6 +9,19 @@ describe('Pi pause controller', () => {
       toolCallId: 'call-1',
       name: Tools.file_search,
       args: { query: 'maintenance manual' },
+      hostExecution: {
+        toolCallId: 'host-call-1',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'step-1',
+          index: 0,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 1,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] as const },
     } as const;
 
     const firstSignal = controller.request(call);
@@ -24,6 +37,19 @@ describe('Pi pause controller', () => {
       toolCallId: 'call-calc-1',
       name: PI_CALCULATOR_TOOL_NAME,
       args: { input: '2 + 2' },
+      hostExecution: {
+        toolCallId: 'host-calc-1',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'calc-step-1',
+          index: 0,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 1,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] as const },
     } as const;
 
     expect(controller.request(call)).toEqual({ kind: 'tool_approval', toolCall: call });

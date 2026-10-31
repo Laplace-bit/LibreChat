@@ -1,19 +1,23 @@
 import { UsageEvents } from 'librechat-data-provider';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { LCTool, ToolExecuteResult } from '@librechat/agents';
+import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import type { PiContentEventTranslatorOptions, PiHostEvent } from './events';
 import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
+import type { PiApprovalContinuation } from './resume';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostSessionOutcome } from './bridge';
 import type { PiModelBinding } from './session';
+import type { PiToolArguments } from './tools';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiTools, PiToolCompatibilityError } from './tools';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
+import { appendPiToolResultContinuation } from './resume';
 import { createPiGenerationExecutor } from './execution';
 import { convertLibreChatHistoryToPi } from './history';
 import { projectPiContextUsage } from './contextUsage';
@@ -50,6 +54,13 @@ export interface PiGenerationDispatchInput {
   usageAttribution?: PiContentEventTranslatorOptions['usageAttribution'];
   /** Host tokenizer and identifiers for the pre-invoke context snapshot. */
   contextUsage?: Omit<PiContextUsageProjectionInput, 'messages' | 'model' | 'provider'>;
+  /** Exact approved tool exchange to continue without replaying the user prompt. */
+  resumeToolResult?: {
+    continuation: PiApprovalContinuation;
+    /** The exact validated arguments executed after the user's approval decision. */
+    toolArguments: PiToolArguments;
+    execute(): Promise<Pick<ToolResultMessage, 'content' | 'isError'>>;
+  };
   signal?: AbortSignal;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
 }
@@ -151,33 +162,6 @@ export function createPiGenerationDispatcher(
           ...(input.contextUsage == null ? {} : { runId: input.contextUsage.runId }),
         },
       });
-      const executionInput: PiGenerationExecutorInput = {
-        createModelBinding: async () => {
-          if (bindingTransferred) {
-            throw new Error('A Pi generation model binding can only be transferred once');
-          }
-          bindingTransferred = true;
-          return modelBinding;
-        },
-        systemPrompt: conversion.systemPrompt,
-        tools,
-        history: conversion.history,
-        prompt: conversion.prompt.text,
-        promptOptions: {
-          expandPromptTemplates: false,
-          source: 'rpc',
-          ...(conversion.prompt.images.length === 0 ? {} : { images: conversion.prompt.images }),
-        },
-        signal: input.signal,
-        pauseController,
-        ...(input.toolExecutionGate == null
-          ? {}
-          : { toolBatchPolicy: { controller: pauseController } }),
-        translateEvent,
-        handleHostEvent: eventSequencer.enqueue,
-        eventSequencer,
-      };
-
       if (input.contextUsage != null) {
         const contextUsage = projectPiContextUsage({
           messages: input.messages,
@@ -188,11 +172,62 @@ export function createPiGenerationDispatcher(
         if (contextUsage == null) {
           throw new PiContextUsageUnavailableError();
         }
-        await executionInput.handleHostEvent({
+        await eventSequencer.enqueue({
           event: UsageEvents.ON_CONTEXT_USAGE,
           data: contextUsage,
         });
       }
+
+      let history = conversion.history;
+      let operation: PiGenerationExecutorInput['operation'];
+      if (input.resumeToolResult == null) {
+        operation = {
+          kind: 'prompt' as const,
+          text: conversion.prompt.text,
+          options: {
+            expandPromptTemplates: false,
+            source: 'rpc' as const,
+            ...(conversion.prompt.images.length === 0 ? {} : { images: conversion.prompt.images }),
+          },
+        };
+      } else {
+        const resumeToolResult = await input.resumeToolResult.execute();
+        if (resumeToolResult == null) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        history = appendPiToolResultContinuation({
+          conversion,
+          continuation: input.resumeToolResult.continuation,
+          toolArguments: input.resumeToolResult.toolArguments,
+          result: resumeToolResult,
+          model: modelBinding.model,
+        });
+        operation = {
+          kind: 'continue_tool_result',
+          toolCallId: input.resumeToolResult.continuation.piToolCallId,
+        };
+      }
+      const executionInput: PiGenerationExecutorInput = {
+        createModelBinding: async () => {
+          if (bindingTransferred) {
+            throw new Error('A Pi generation model binding can only be transferred once');
+          }
+          bindingTransferred = true;
+          return modelBinding;
+        },
+        systemPrompt: conversion.systemPrompt,
+        tools,
+        history,
+        operation,
+        signal: input.signal,
+        pauseController,
+        ...(input.toolExecutionGate == null
+          ? {}
+          : { toolBatchPolicy: { controller: pauseController } }),
+        translateEvent,
+        handleHostEvent: eventSequencer.enqueue,
+        eventSequencer,
+      };
 
       const outcome = await execute(executionInput);
       if (!bindingTransferred) {

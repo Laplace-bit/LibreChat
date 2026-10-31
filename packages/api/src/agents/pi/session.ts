@@ -36,6 +36,12 @@ export interface HostPiSession {
   readonly activeToolNames: readonly string[];
   subscribe(listener: AgentSessionEventListener): () => void;
   prompt(text: string, options?: PromptOptions): Promise<void>;
+  /**
+   * Continue a restored transcript whose final message is the result for exactly
+   * one preceding assistant tool call. This uses Pi's public Agent continuation
+   * API; the host wrapper owns cancellation and waits for it before disposal.
+   */
+  continueFromToolResult(toolCallId: string): Promise<void>;
   steer: AgentSession['steer'];
   followUp: AgentSession['followUp'];
   abort(): Promise<void>;
@@ -64,6 +70,8 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
   let session: AgentSession | undefined;
   let disposed = false;
   let promptStarted = false;
+  let activeOperation: Promise<void> | undefined;
+  let activeOperationKind: 'prompt' | 'tool_result_continuation' | undefined;
   let abortPromise: Promise<void> | undefined;
 
   const requireSession = () => {
@@ -81,9 +89,60 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       return Promise.resolve();
     }
     abortPromise ??= (async () => {
+      if (activeOperationKind === 'tool_result_continuation') {
+        /**
+         * AgentSession.abort() waits on its own `_isAgentRunActive` flag. A
+         * direct Agent.continue() deliberately does not set that private flag,
+         * so abort the public Agent operation and await its exact promise.
+         */
+        session.agent.abort();
+        await activeOperation?.catch(() => undefined);
+        return;
+      }
       await session.abort();
     })();
     return abortPromise;
+  };
+
+  const runOperation = async (
+    kind: NonNullable<typeof activeOperationKind>,
+    start: () => Promise<void>,
+  ) => {
+    if (activeOperation != null) {
+      throw new Error('Pi generation already has an active operation');
+    }
+    const operation = start();
+    activeOperation = operation;
+    activeOperationKind = kind;
+    try {
+      await operation;
+    } finally {
+      if (activeOperation === operation) {
+        activeOperation = undefined;
+        activeOperationKind = undefined;
+      }
+    }
+  };
+
+  const validateToolResultContinuation = (toolCallId: string) => {
+    if (toolCallId.length === 0) {
+      throw new Error('Pi continuation requires a tool call identity');
+    }
+    const messages = requireSession().messages;
+    const toolResult = messages[messages.length - 1];
+    const assistant = messages[messages.length - 2];
+    if (toolResult?.role !== 'toolResult' || assistant?.role !== 'assistant') {
+      throw new Error('Pi continuation requires an assistant tool call followed by its result');
+    }
+    const toolCalls = assistant.content.filter((part) => part.type === 'toolCall');
+    if (
+      toolCalls.length !== 1 ||
+      toolCalls[0].id !== toolCallId ||
+      toolResult.toolCallId !== toolCallId ||
+      toolResult.toolName !== toolCalls[0].name
+    ) {
+      throw new Error('Pi continuation transcript does not match the reviewed tool call');
+    }
   };
 
   const dispose = async () => {
@@ -232,7 +291,16 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
           throw new Error('A Pi host session accepts one initial prompt per generation');
         }
         promptStarted = true;
-        await currentSession.prompt(text, promptOptions);
+        await runOperation('prompt', () => currentSession.prompt(text, promptOptions));
+      },
+      async continueFromToolResult(toolCallId) {
+        const currentSession = requireSession();
+        if (promptStarted) {
+          throw new Error('A Pi host session accepts one generation operation');
+        }
+        validateToolResultContinuation(toolCallId);
+        promptStarted = true;
+        await runOperation('tool_result_continuation', () => currentSession.agent.continue());
       },
       steer(text, images, steerOptions) {
         return requireSession().steer(text, images, steerOptions);

@@ -6,6 +6,7 @@ import {
   assertAgentRuntimeCompatibleGraph,
   assertLegacyRuntimeCompatibleGraph,
   findPiAgentInRuntimeGraph,
+  resolveResumableAgentRuntime,
   selectAgentRuntimeForAgent,
 } from './selection';
 
@@ -80,7 +81,21 @@ describe('selectAgentRuntimeForAgent', () => {
     ).toThrow(AgentRuntimeUnavailableError);
   });
 
-  it('exposes a safe, stable unavailable-runtime error until dispatch is implemented', () => {
+  it('allows Pi resume only with a decoded durable continuation', () => {
+    expect(resolveResumableAgentRuntime(PINNED_PI_AGENT_RUNTIME)).toEqual({
+      status: 'unavailable',
+    });
+    expect(resolveResumableAgentRuntime(PINNED_PI_AGENT_RUNTIME, true)).toEqual({
+      status: 'available',
+      selection: PINNED_PI_AGENT_RUNTIME,
+    });
+    expect(resolveResumableAgentRuntime(LEGACY_AGENT_RUNTIME, false)).toEqual({
+      status: 'available',
+      selection: LEGACY_AGENT_RUNTIME,
+    });
+  });
+
+  it('exposes a safe, stable unavailable-runtime error', () => {
     const error = new AgentRuntimeUnavailableError();
     expect(error).toMatchObject({
       name: 'AgentRuntimeUnavailableError',

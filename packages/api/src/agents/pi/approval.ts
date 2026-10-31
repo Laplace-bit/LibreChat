@@ -1,6 +1,7 @@
 import { HookRegistry, executeHooks } from '@librechat/agents';
 import type { TToolApprovalPolicy } from 'librechat-data-provider';
 import type { ExecuteHooksOptions } from '@librechat/agents';
+import type { Agents } from 'librechat-data-provider';
 import type { ResolvedToolApprovalHook, ToolApprovalHookContext } from '~/agents/hitl/hooks';
 import type { PiToolExecutionContext, PiToolExecutionGate } from './toolExecution';
 import type { PluginHookSource } from '~/agents/hooks/source';
@@ -22,10 +23,18 @@ export interface PiToolApprovalGateOptions {
   model?: string;
 }
 
+const DEFAULT_ALLOWED_DECISIONS: readonly Agents.ToolApprovalDecisionType[] = [
+  'approve',
+  'reject',
+  'edit',
+  'respond',
+];
+
+const SUPPORTED_DECISIONS = new Set<Agents.ToolApprovalDecisionType>(DEFAULT_ALLOWED_DECISIONS);
+
 /**
  * Evaluates the same host PreToolUse policy before Pi reaches ON_TOOL_EXECUTE.
- * Pi currently cannot persist an interactive approval pause, so an unexpected
- * `ask` decision pauses and fails closed at the owning generation boundary.
+ * Interactive `ask` decisions enter the host's durable approval lifecycle.
  */
 export function createPiToolApprovalGate(options: PiToolApprovalGateOptions): PiToolExecutionGate {
   const policy = buildEffectiveToolApprovalPolicy(options.policy, [], options.allowedTools);
@@ -48,7 +57,7 @@ export function createPiToolApprovalGate(options: PiToolApprovalGateOptions): Pi
           model: options.model,
           agentType: options.agentId,
         },
-        askDecisionSupported: false,
+        askDecisionSupported: true,
       });
     } catch {
       throw new AgentRuntimeUnavailableError();
@@ -106,9 +115,41 @@ export function createPiToolApprovalGate(options: PiToolApprovalGateOptions): Pi
       }
       case 'deny':
         return { kind: 'deny' };
-      case 'ask':
+      case 'ask': {
+        let args = input.args;
+        if (result.updatedInput !== undefined) {
+          try {
+            args = validatePiToolExecutionInput(
+              input.name,
+              input.toolCallId,
+              result.updatedInput,
+            ).args;
+          } catch {
+            throw new AgentRuntimeUnavailableError();
+          }
+        }
+        const allowedDecisions = result.allowedDecisions ?? DEFAULT_ALLOWED_DECISIONS;
+        if (
+          allowedDecisions.length === 0 ||
+          allowedDecisions.some((decision) => !SUPPORTED_DECISIONS.has(decision)) ||
+          new Set(allowedDecisions).size !== allowedDecisions.length ||
+          (result.reason !== undefined &&
+            (result.reason.trim().length === 0 || result.reason.length > 1_000))
+        ) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        return {
+          kind: 'pause',
+          args,
+          allowedDecisions,
+          ...(result.reason == null ? {} : { description: result.reason }),
+        };
+      }
       case undefined:
-        return { kind: 'pause' };
+        return {
+          kind: 'pause',
+          allowedDecisions: DEFAULT_ALLOWED_DECISIONS,
+        };
       default: {
         const exhaustive: never = result.decision;
         throw exhaustive;

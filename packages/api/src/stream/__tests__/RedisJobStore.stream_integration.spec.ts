@@ -3692,6 +3692,54 @@ describe('RedisJobStore Integration Tests', () => {
       await store.destroy();
     });
 
+    test('persists the Pi continuation across Redis readers and clears it with the action CAS', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const owner = new RedisJobStore(ioredisClient);
+      const reader = new RedisJobStore(ioredisClient);
+      await Promise.all([owner.initialize(), reader.initialize()]);
+
+      const streamId = `pi-resume-envelope-${Date.now()}`;
+      const job = await owner.createJob(streamId, 'resume-user', streamId, 'tenant-1');
+      const pendingAction = buildPendingAction(streamId);
+      const continuation = { version: 1, actionId: pendingAction.actionId };
+      expect(
+        await owner.transitionStatus(streamId, {
+          from: 'running',
+          to: 'requires_action',
+          expectCreatedAt: job.createdAt,
+          patch: {
+            pendingAction,
+            pendingActionId: pendingAction.actionId,
+            piResumeContinuation: continuation,
+          },
+        }),
+      ).toBe(true);
+      await expect(reader.getJob(streamId)).resolves.toMatchObject({
+        status: 'requires_action',
+        pendingAction,
+        piResumeContinuation: continuation,
+      });
+
+      expect(
+        await reader.transitionStatus(streamId, {
+          from: 'requires_action',
+          to: 'running',
+          expectActionId: pendingAction.actionId,
+          expectCreatedAt: job.createdAt,
+          clear: ['pendingAction', 'pendingActionId', 'piResumeContinuation'],
+        }),
+      ).toBe(true);
+      const resumed = await owner.getJob(streamId);
+      expect(resumed?.status).toBe('running');
+      expect(resumed?.piResumeContinuation).toBeUndefined();
+
+      await Promise.all([owner.destroy(), reader.destroy()]);
+    });
+
     test('terminal transitions and deleteJob remove the steers key', async () => {
       if (!ioredisClient) {
         return;

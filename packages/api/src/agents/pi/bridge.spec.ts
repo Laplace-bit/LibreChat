@@ -51,6 +51,9 @@ function createSession(
     prompt() {
       return runPrompt((event) => listener?.(event));
     },
+    continueFromToolResult() {
+      return runPrompt((event) => listener?.(event));
+    },
     steer() {
       throw new Error('steer is not used by the event bridge');
     },
@@ -89,6 +92,19 @@ describe('executePiHostSession', () => {
       toolCallId: 'pi-call-1',
       name: Tools.file_search,
       args: { query: 'maintenance manual' },
+      hostExecution: {
+        toolCallId: 'host-call-1',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'host-step-1',
+          index: 0,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 1,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] },
     },
   } satisfies PiPauseSignal;
 
@@ -103,7 +119,7 @@ describe('executePiHostSession', () => {
 
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       translateEvent: (event) => [createHostEvent(event.type)],
       handleHostEvent: async (event) => {
         if (event.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
@@ -133,6 +149,87 @@ describe('executePiHostSession', () => {
     expect(harness.unsubscribeCount).toBe(1);
   });
 
+  it('continues a restored tool result without appending another user prompt', async () => {
+    let listener: AgentSessionEventListener | undefined;
+    let promptCalls = 0;
+    const continuationCalls: string[] = [];
+    const session: HostPiSession = {
+      sessionFile: undefined,
+      activeToolNames: [],
+      subscribe(nextListener) {
+        listener = nextListener;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        promptCalls += 1;
+      },
+      async continueFromToolResult(toolCallId) {
+        continuationCalls.push(toolCallId);
+        listener?.({ type: 'agent_end', messages: [], willRetry: false });
+      },
+      steer() {
+        throw new Error('steer is not used by tool-result continuation');
+      },
+      followUp() {
+        throw new Error('followUp is not used by tool-result continuation');
+      },
+      async abort() {},
+      async dispose() {},
+    };
+
+    await expect(
+      executePiHostSession({
+        session,
+        operation: { kind: 'continue_tool_result', toolCallId: 'reviewed-call' },
+        translateEvent: () => [],
+        handleHostEvent: () => undefined,
+      }),
+    ).resolves.toEqual({ status: 'completed' });
+    expect(promptCalls).toBe(0);
+    expect(continuationCalls).toEqual(['reviewed-call']);
+  });
+
+  it('fails closed when a low-level continuation would need AgentSession retry handling', async () => {
+    let listener: AgentSessionEventListener | undefined;
+    let abortCalls = 0;
+    const session: HostPiSession = {
+      sessionFile: undefined,
+      activeToolNames: [],
+      subscribe(nextListener) {
+        listener = nextListener;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {},
+      async continueFromToolResult() {
+        listener?.({ type: 'agent_end', messages: [], willRetry: true });
+      },
+      steer() {
+        throw new Error('steer is not used by tool-result continuation');
+      },
+      followUp() {
+        throw new Error('followUp is not used by tool-result continuation');
+      },
+      async abort() {
+        abortCalls += 1;
+      },
+      async dispose() {},
+    };
+
+    await expect(
+      executePiHostSession({
+        session,
+        operation: { kind: 'continue_tool_result', toolCallId: 'reviewed-call' },
+        translateEvent: () => [],
+        handleHostEvent: () => undefined,
+      }),
+    ).rejects.toThrow('cannot use AgentSession retry handling');
+    expect(abortCalls).toBe(1);
+  });
+
   it('serializes Pi stream events and direct host-tool events through one shared FIFO', async () => {
     const handlerStarted = deferred<void>();
     const releaseHandler = deferred<void>();
@@ -156,7 +253,7 @@ describe('executePiHostSession', () => {
 
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       eventSequencer,
       translateEvent: (event) => [
         createHostEvent(event.type === 'agent_end' ? 'stream' : 'settled'),
@@ -197,7 +294,7 @@ describe('executePiHostSession', () => {
 
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       translateEvent: (event) => [createHostEvent(event.type)],
       handleHostEvent: async () => {
         throw rootFailure;
@@ -221,7 +318,7 @@ describe('executePiHostSession', () => {
     await expect(
       executePiHostSession({
         session: harness.session,
-        prompt: 'hello',
+        operation: { kind: 'prompt', text: 'hello' },
         signal: controller.signal,
         translateEvent: () => [],
         handleHostEvent: () => undefined,
@@ -242,7 +339,7 @@ describe('executePiHostSession', () => {
     });
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       pauseController,
       translateEvent: (event) => [createHostEvent(event.type)],
       handleHostEvent: async (event) => {
@@ -298,7 +395,7 @@ describe('executePiHostSession', () => {
     });
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       signal: controller.signal,
       pauseController,
       translateEvent: () => [createHostEvent('pending-event')],
@@ -323,7 +420,7 @@ describe('executePiHostSession', () => {
     await expect(
       executePiHostSession({
         session: harness.session,
-        prompt: 'hello',
+        operation: { kind: 'prompt', text: 'hello' },
         signal: controller.signal,
         translateEvent: () => [],
         handleHostEvent: () => undefined,
@@ -343,7 +440,7 @@ describe('executePiHostSession', () => {
     });
     const execution = executePiHostSession({
       session: harness.session,
-      prompt: 'hello',
+      operation: { kind: 'prompt', text: 'hello' },
       signal: controller.signal,
       translateEvent: (event) => [createHostEvent(event.type)],
       handleHostEvent: async () => {
@@ -366,7 +463,7 @@ describe('executePiHostSession', () => {
     await expect(
       executePiHostSession({
         session: harness.session,
-        prompt: 'hello',
+        operation: { kind: 'prompt', text: 'hello' },
         translateEvent: () => [],
         handleHostEvent: () => undefined,
       }),

@@ -229,8 +229,12 @@ const {
   PI_SUPPORTED_HOST_TOOLS,
   createPiToolApprovalGate,
   createPiHostToolBatchExecutor,
+  settlePiHostToolResult,
+  settlePiHostToolStep,
   generateAgentConversationTitle,
   getAgentPiModelBindingFactory,
+  buildPiApprovalInterruptPayload,
+  createPiApprovalContinuation,
   executePiGeneration,
 } = require('@librechat/api');
 const {
@@ -657,7 +661,7 @@ class AgentClient extends BaseClient {
     /** `run` is exclusively a real Legacy AgentRun. Pi execution has no fabricated Graph. */
     /** @type {AgentRun} */
     this.run;
-    /** @type {{ engine: 'pi'; status: 'completed' | 'cancelled' } | undefined} */
+    /** @type {{ engine: 'pi'; status: 'completed' | 'cancelled' | 'paused' } | undefined} */
     this.executionOutcome = undefined;
 
     /** Resolves with the agent run once `chatCompletion` initializes it (or
@@ -4291,6 +4295,9 @@ class AgentClient extends BaseClient {
         : { compactionSemanticIndex: staged.compactionSemanticIndex }),
       ...(staged.contextMeta == null ? {} : { contextMeta: staged.contextMeta }),
       persistencePending: true,
+      ...(staged.piResumeContinuation == null
+        ? {}
+        : { piResumeContinuation: staged.piResumeContinuation }),
       ...(eventActorSuspension == null
         ? {}
         : {
@@ -4316,14 +4323,19 @@ class AgentClient extends BaseClient {
       const currentJob = await GenerationJobManager.getJob(staged.streamId).catch(() => null);
       const projected = currentJob?.metadata?.agentEventSuspension;
       const expectedProjection = pauseProjection.agentEventSuspension;
+      const piContinuationCommitted =
+        staged.piResumeContinuation != null &&
+        JSON.stringify(currentJob?.metadata?.piResumeContinuation) ===
+          JSON.stringify(staged.piResumeContinuation);
       if (
         currentJob?.createdAt === this.jobCreatedAt &&
         currentJob.status === 'requires_action' &&
         currentJob.metadata?.pendingAction?.actionId === staged.pendingAction.actionId &&
-        expectedProjection != null &&
-        projected?.version === expectedProjection.version &&
-        projected.suspensionId === expectedProjection.suspensionId &&
-        projected.attempt === expectedProjection.attempt
+        (piContinuationCommitted ||
+          (expectedProjection != null &&
+            projected?.version === expectedProjection.version &&
+            projected.suspensionId === expectedProjection.suspensionId &&
+            projected.attempt === expectedProjection.attempt))
       ) {
         paused = true;
       } else {
@@ -4600,6 +4612,88 @@ class AgentClient extends BaseClient {
     }
     if (await this.publishStagedApproval()) {
       await this.exposePendingApproval();
+    }
+  }
+
+  /** Stage one approved Pi host call through the shared durable HITL lifecycle. */
+  async handlePiToolApprovalInterrupt(signal, streamId) {
+    if (
+      !streamId ||
+      signal?.kind !== 'tool_approval' ||
+      this.eventActorInvocationId != null ||
+      this.options.req?._isScheduledFire === true ||
+      !this.responseMessageId ||
+      !this.options.agent?.id
+    ) {
+      throw new AgentRuntimeUnavailableError();
+    }
+
+    const toolCall = signal.toolCall;
+    const payload = buildPiApprovalInterruptPayload({
+      hostToolCallId: toolCall.hostExecution.toolCallId,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      allowedDecisions: toolCall.review.allowedDecisions,
+      ...(toolCall.review.description == null ? {} : { description: toolCall.review.description }),
+    });
+    const request = this.options.req;
+    const appConfig = request?.config;
+    const checkpointerCfg = appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
+    const resumeContext = pickResumeContext(request?.body, request?.reasoningOverrideBase);
+    const resumeModelParameters = captureResumeModelParameters(
+      request?.body,
+      this.options.agent.model_parameters,
+    );
+    if (resumeModelParameters) {
+      resumeContext.model_parameters = resumeModelParameters;
+    }
+
+    const pendingAction = buildPendingAction(payload, {
+      streamId,
+      conversationId: this.conversationId,
+      runId: this.responseMessageId,
+      responseMessageId: this.responseMessageId,
+      interruptId: `pi-tool:${toolCall.toolCallId}`,
+      threadId: this.conversationId,
+      ttlMs: getApprovalTtlMs(checkpointerCfg),
+      projectContextKey: getChatProjectContextKey(request?.chatProjectContext),
+      expiresAt: request?._agentEventBindingRetention?.expiredAt,
+      requestFingerprint: computeLegacyAgentRequestFingerprint(request?.body ?? {}),
+      requestFingerprintV2: computeAgentRequestFingerprint(request?.body ?? {}),
+      resumeContext,
+      toolApprovalAliases: [],
+    });
+    const piResumeContinuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+
+    if (this.jobCreatedAt != null) {
+      const liveJob = await GenerationJobManager.getJobStore().getJob(streamId);
+      if (!liveJob || liveJob.createdAt !== this.jobCreatedAt || liveJob.status !== 'running') {
+        logger.debug(
+          `[AgentClient] Pi approval fired but job ${streamId} was replaced; not pausing`,
+        );
+        return;
+      }
+    }
+
+    this.stagedApproval = {
+      streamId,
+      pendingAction,
+      interruptId: pendingAction.interruptId,
+      interruptType: payload.type,
+      discoveredTools: [],
+      authoredSkills: captureAuthoredSkills(
+        this.options.eventHandlers?.[GraphEvents.ON_TOOL_EXECUTE],
+      ),
+      activityPhaseSnapshot: this.activityPhaseWiring?.snapshot?.(),
+      compactionSemanticIndex: createCompactionSemanticIndexProjection(
+        this.compactionSemanticIndexSnapshot,
+      ),
+      contextMeta: captureRunContextMeta(this),
+      piResumeContinuation,
+    };
+
+    if (!(await this.publishStagedApproval())) {
+      throw new AgentRuntimeUnavailableError();
     }
   }
 
@@ -5057,6 +5151,9 @@ class AgentClient extends BaseClient {
           ) {
             unsupportedModes.push('skills');
           }
+          if (attachedCodeEnvironmentAgentIds.size > 0) {
+            unsupportedModes.push('code_api_environment');
+          }
 
           const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
           const callableToolNames = [...toolSet].filter((name) => !internalToolNames.has(name));
@@ -5073,11 +5170,6 @@ class AgentClient extends BaseClient {
             loadedAgentIds: agents.map((agent) => agent?.id),
             callableToolNames,
             supportedToolNames: piToolDefinitions.map((definition) => definition.name),
-            toolApprovalCanPause:
-              runCanPause ||
-              effectiveToolApprovalPolicy?.agentModes === true ||
-              (attachedCodeEnvironmentAgentIds.size > 0 &&
-                agentsEConfig?.toolApproval?.enabled !== false),
             unsupportedModes,
           });
           piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
@@ -5312,9 +5404,14 @@ class AgentClient extends BaseClient {
           });
 
           this.options.startupTelemetry?.mark('pi_session_settled');
-          if (outcome.status !== 'completed' && outcome.status !== 'cancelled') {
-            /** Pi pause outcomes are not host-staged or resumable yet. Treat them as
-             *  unavailable until AgentClient can persist and recover the exact action. */
+          if (outcome.status === 'paused') {
+            await this.handlePiToolApprovalInterrupt(outcome.signal, streamId);
+            if (!this.pendingApproval) {
+              throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
+                code: 'RUN_REPLACED',
+              });
+            }
+          } else if (outcome.status === 'unsupported') {
             throw new AgentRuntimeUnavailableError();
           }
           this.executionOutcome = { engine: 'pi', status: outcome.status };
@@ -5713,6 +5810,433 @@ class AgentClient extends BaseClient {
    * @param {AbortController} [params.abortController]
    * @param {Pick<import('@langchain/langgraph').Command, 'update' | 'goto'>} [params.commandOptions]
    */
+  async resumePiCompletion({
+    piApprovalContinuation,
+    piApprovalDecision,
+    seedContent = [],
+    runSteps = [],
+    storedMessages = [],
+    abortController = null,
+    activityPhaseSnapshot,
+  }) {
+    if (
+      piApprovalContinuation == null ||
+      piApprovalDecision == null ||
+      this.options.agentRuntime?.engine !== 'pi'
+    ) {
+      throw new AgentRuntimeUnavailableError();
+    }
+    if (!abortController) {
+      abortController = new AbortController();
+    }
+    const req = this.options.req;
+    const appConfig = req?.config;
+    const streamId = req?._resumableStreamId;
+    const agentsEConfig = appConfig?.endpoints?.[EModelEndpoint.agents];
+    const balanceConfig = getBalanceConfig(appConfig);
+    const transactionsConfig = getTransactionsConfig(appConfig);
+    const terminalRunError = createTerminalRunErrorObserver({
+      maxProviderErrorChars: agentsEConfig?.maxProviderErrorChars,
+      logger,
+      responseMessageId: this.responseMessageId,
+      source: '[api/server/controllers/agents/client.js #resumePiCompletion]',
+      genericMessage:
+        '[api/server/controllers/agents/client.js #resumePiCompletion] Unhandled error',
+      protectionEnabled: hasModelBoundContentProtection(
+        appConfig?.filters,
+        appConfig?.messageFilter?.pii,
+      ),
+    });
+    let reasoningLabel;
+    let outcome;
+
+    try {
+      await this.publishRunContextMeta?.();
+      BaseClient.prototype.setModelBoundStoredMessages.call(
+        this,
+        BaseClient.prototype.getModelBoundStoredMessages.call(this, storedMessages),
+      );
+      if (Array.isArray(seedContent) && seedContent.length > 0) {
+        this.contentParts.push(...seedContent);
+      }
+      hydrateResumeRunSteps(runSteps, this.stepMap, undefined, seedContent);
+      if (streamId && this.contentParts) {
+        GenerationJobManager.setContentParts(streamId, this.contentParts, this.jobCreatedAt);
+      }
+
+      const historyRows = await this.loadHistory(this.conversationId, this.parentMessageId);
+      if (!Array.isArray(historyRows) || historyRows.length === 0) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      const modelBoundHistory = BaseClient.prototype.getModelBoundStoredMessages.call(
+        this,
+        historyRows,
+      );
+      this.setModelBoundStoredMessages(modelBoundHistory);
+      const built = await this.buildMessages(
+        modelBoundHistory,
+        this.parentMessageId,
+        this.getBuildMessagesOptions(),
+        req?.body ?? {},
+      );
+
+      const toolSet = buildRunToolSet(this.options.agent, undefined, undefined, built.prompt);
+      const agents = [this.options.agent];
+      const callableToolNames = [...toolSet].filter(
+        (name) => name !== Constants.SUBAGENT && name !== 'conditional_transfer',
+      );
+      const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
+        ? this.options.agent.toolDefinitions
+        : [];
+      const piToolDefinitions = configuredToolDefinitions.filter(
+        (definition) =>
+          PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) &&
+          callableToolNames.includes(definition.name),
+      );
+      const unsupportedModes = [];
+      if (
+        this.eventActorContinuation != null ||
+        this.eventActorInvocationId != null ||
+        req?._isAgentTrigger === true ||
+        req?._agentEventBindingParentConversationId != null ||
+        req?._isScheduledFire === true ||
+        req?.body?.scheduleId != null ||
+        this.options.subagentTasks != null ||
+        this.agentConfigs?.size > 0 ||
+        (this.options.agent?.edges?.length ?? 0) > 0 ||
+        (this.options.agent?.subagents?.length ?? 0) > 0 ||
+        (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
+      ) {
+        unsupportedModes.push('unsupported_resume_mode');
+      }
+      if (
+        this.isCompactionTurn() ||
+        req?.body?.isRegenerate === true ||
+        req?.body?.isContinued === true ||
+        req?._recoveredSteerId != null ||
+        req?.body?.steerId != null ||
+        req?.body?.steer != null ||
+        (this.options.agent?.manualSkillPrimes?.length ?? 0) > 0 ||
+        (this.options.agent?.alwaysApplySkillPrimes?.length ?? 0) > 0
+      ) {
+        unsupportedModes.push('unsupported_resume_context');
+      }
+      if (collectAttachedCodeEnvironmentAgentIds(agents).size > 0) {
+        unsupportedModes.push('code_api_environment');
+      }
+      assertPiCompatible({
+        rootAgentId: this.options.agent?.id,
+        loadedAgentIds: agents.map((agent) => agent?.id),
+        callableToolNames,
+        supportedToolNames: piToolDefinitions.map((definition) => definition.name),
+        unsupportedModes,
+      });
+      if (
+        !piToolDefinitions.some((definition) => definition.name === piApprovalContinuation.toolName)
+      ) {
+        throw new AgentRuntimeUnavailableError();
+      }
+
+      const messageFormatOptions = {
+        ...(anyAgentReplaysReasoningContent(agents) ? { preserveReasoningContent: true } : {}),
+        ...(this.options.agent?.useLegacyContent === true ? { legacyContent: true } : {}),
+      };
+      const semanticIntentToolNames = new Set(this.options.agent?.semanticIntentToolNames ?? []);
+      for (const name of this.options.agent?.semanticIntentBlockedToolNames ?? []) {
+        semanticIntentToolNames.delete(name);
+      }
+      const formatted = formatAgentMessages(
+        built.prompt,
+        this.indexTokenCountMap,
+        toolSet,
+        undefined,
+        {
+          ...messageFormatOptions,
+          compactionSemanticIndex: { intentToolNames: semanticIntentToolNames },
+        },
+      );
+      this.compactionSemanticIndexSnapshot = formatted.compactionSemanticIndexSnapshot;
+      this.eventActorSummary = formatted.summary;
+      const piSystemPrompt = buildPiSystemPrompt({
+        agent: this.options.agent,
+        summary: formatted.summary,
+      });
+      const piMessages =
+        piSystemPrompt.length > 0
+          ? [new SystemMessage(piSystemPrompt), ...formatted.messages]
+          : formatted.messages;
+      AgentClient.prototype.assertBuiltModelBoundContent.call(this, piMessages);
+      await requirePrivateTextAdmission(req, abortController.signal);
+
+      const createModelBinding = getAgentPiModelBindingFactory(this.options.agent);
+      if (createModelBinding == null) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      const tokenCounter = withRetainedAnswerTokenCounter(
+        await createCachedTokenCounter(this.getEncoding()),
+        this.getEncoding(),
+      );
+      const summarizationConfig = this.options.agent.summarization ?? appConfig?.summarization;
+      const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
+        summarizationConfig?.reserveRatio,
+        this.options.agent.baseContextTokens,
+        this.maxContextTokens,
+      );
+      const { calibrationRatio } = resolveRunSeeds(this);
+      const contextUsage = {
+        tokenCounter,
+        runId: this.responseMessageId,
+        agentId: this.options.agent.id,
+        maxContextTokens: effectiveMaxContextTokens,
+        reserveRatio: summarizationConfig?.reserveRatio,
+        calibrationRatio,
+        summaryTokens: formatted.summary?.tokenCount,
+      };
+
+      const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
+      const activityPhase = this.buildActivityPhaseWiring(
+        streamId,
+        abortController.signal,
+        activityPhaseSnapshot,
+      );
+      reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal, true);
+      const offsetHandlers = createSteerIndexOffsetHandlers(
+        this.options.eventHandlers,
+        this.steerOffsetState,
+      );
+      const activityHandlers =
+        activityPhase?.handlers(offsetHandlers) ??
+        (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
+      const piHandlers = reasoningLabel?.handlers(activityHandlers) ?? activityHandlers;
+      let nextStepIndex = this.contentParts.length;
+      const createPiStepIdentity = () => {
+        const index = nextStepIndex++;
+        return {
+          id: `pi-${this.responseMessageId}-${nanoid()}`,
+          index,
+          messageId: this.responseMessageId,
+          runId: this.responseMessageId,
+          agentId: this.options.agent.id,
+        };
+      };
+      const piMetadata = {
+        thread_id: this.conversationId,
+        user_id: this.user ?? req?.user?.id,
+        run_id: this.responseMessageId,
+        agent_id: this.options.agent.id,
+        agentId: this.options.agent.id,
+        last_agent_id: this.options.agent.id,
+        langgraph_node: `agent=${this.options.agent.id}`,
+        hide_sequential_outputs: false,
+      };
+      const handlePiHostEvent = async (event) => {
+        const handler = piHandlers?.[event.event];
+        if (handler == null || typeof handler.handle !== 'function') {
+          throw new AgentRuntimeUnavailableError();
+        }
+        await handler.handle(event.event, event.data, piMetadata);
+      };
+      const piToolHandler = piHandlers?.[GraphEvents.ON_TOOL_EXECUTE];
+      const executePiHostToolCall =
+        typeof piToolHandler?.handle === 'function'
+          ? createPiHostToolBatchExecutor({
+              handler: piToolHandler,
+              userId: this.user ?? req?.user?.id,
+              agentId: this.options.agent.id,
+              request: req,
+              threadId: this.conversationId,
+              runId: this.responseMessageId,
+              metadata: piMetadata,
+              onError: (error) =>
+                logger.error(
+                  '[AgentClient] Pi resumed host tool execution failed',
+                  getSafeErrorMetadata(error),
+                ),
+            })
+          : undefined;
+      const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
+        endpoint: agentsEConfig?.toolApproval,
+        attachedCodeEnvironment: false,
+      });
+      const resolvedToolApprovalHooks = isHITLEnabled(effectiveToolApprovalPolicy)
+        ? buildToolApprovalHooks({
+            userId: req?.user?.id,
+            conversationId: this.conversationId,
+            tenantId: resolveRequestTenantId(req ?? {}),
+            appConfig,
+          })
+        : undefined;
+      const piToolExecutionGate = createPiToolApprovalGate({
+        policy: effectiveToolApprovalPolicy,
+        allowedTools: resolveRunToolApprovalAllows(
+          agentsEConfig?.toolApproval,
+          req?.resolvedConversation,
+          this.conversationId,
+        ),
+        logger,
+        pluginHookSource: getPluginHookSource(),
+        resolvedHooks: resolvedToolApprovalHooks,
+        hookContext: {
+          userId: req?.user?.id,
+          conversationId: this.conversationId,
+          tenantId: resolveRequestTenantId(req ?? {}),
+          appConfig,
+        },
+        runId: this.responseMessageId,
+        threadId: this.conversationId,
+        agentId: this.options.agent.id,
+        model: this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
+      });
+
+      const continuationToolArguments =
+        piApprovalDecision.kind === 'execute'
+          ? piApprovalDecision.args
+          : piApprovalContinuation.args;
+      const createApprovedToolResult = async () => {
+        const continuation = piApprovalContinuation;
+        const executionInput = {
+          toolCallId: continuation.piToolCallId,
+          name: continuation.toolName,
+          args: continuationToolArguments,
+          turn: continuation.toolTurn,
+        };
+        let hostResult;
+        if (piApprovalDecision.kind === 'execute') {
+          if (executePiHostToolCall == null) {
+            throw new AgentRuntimeUnavailableError();
+          }
+          try {
+            hostResult = await executePiHostToolCall(
+              {
+                id: continuation.hostToolCallId,
+                name: continuation.toolName,
+                args: piApprovalDecision.args,
+                stepId: continuation.stepIdentity.id,
+                turn: continuation.toolTurn,
+              },
+              abortController.signal,
+            );
+          } catch (error) {
+            const cancelled = abortController.signal.aborted === true;
+            await settlePiHostToolStep({
+              identity: continuation.stepIdentity,
+              toolCallId: continuation.hostToolCallId,
+              input: executionInput,
+              output: cancelled ? 'Tool execution was cancelled.' : 'Tool execution failed.',
+              status: cancelled ? 'cancelled' : 'error',
+              createdAt: continuation.stepCreatedAt,
+              handleHostEvent: handlePiHostEvent,
+            });
+            throw error;
+          }
+        } else {
+          hostResult =
+            piApprovalDecision.kind === 'reject'
+              ? { status: 'error', content: 'This tool call was rejected by the user.' }
+              : { status: 'success', content: piApprovalDecision.text };
+        }
+        const settled = await settlePiHostToolResult({
+          identity: continuation.stepIdentity,
+          toolCallId: continuation.hostToolCallId,
+          input: executionInput,
+          hostResult,
+          createdAt: continuation.stepCreatedAt,
+          handleHostEvent: handlePiHostEvent,
+        });
+        return {
+          content: settled.content,
+          isError: settled.isError === true,
+        };
+      };
+
+      outcome = await executePiGeneration({
+        messages: piMessages,
+        createModelBinding,
+        toolDefinitions: piToolDefinitions,
+        executeHostToolCall: executePiHostToolCall,
+        toolExecutionGate: piToolExecutionGate,
+        createToolStepIdentity: createPiStepIdentity,
+        createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
+        resumeToolResult: {
+          continuation: piApprovalContinuation,
+          toolArguments: continuationToolArguments,
+          execute: createApprovedToolResult,
+        },
+        signal: abortController.signal,
+        usageAttribution: {
+          provider: this.options.agent.provider,
+          agentId: this.options.agent.id,
+          runId: this.responseMessageId,
+        },
+        contextUsage,
+        createStepIdentity: createPiStepIdentity,
+        handleHostEvent: handlePiHostEvent,
+      });
+      this.collectedUsage.push(...outcome.usage);
+      if (outcome.status === 'paused') {
+        await this.handlePiToolApprovalInterrupt(outcome.signal, streamId);
+        if (!this.pendingApproval) {
+          throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
+            code: 'RUN_REPLACED',
+          });
+        }
+      } else if (outcome.status === 'unsupported') {
+        throw new AgentRuntimeUnavailableError();
+      } else if (outcome.status === 'cancelled' && !abortController.signal.aborted) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      this.executionOutcome = { engine: 'pi', status: outcome.status };
+      if (outcome.status !== 'paused') {
+        this.completeActivityPhase(null, activityPhase);
+      }
+    } catch (error) {
+      if (
+        error?.code === 'RUN_REPLACED' ||
+        error?.code === PENDING_ACTION_EXPIRED_CODE ||
+        error?.code === 'SCHEDULED_HITL_REQUIRES_SHARED_STORE' ||
+        error?.code === 'HITL_CHECKPOINT_UNAVAILABLE'
+      ) {
+        throw error;
+      }
+      if (isAgentRunCancellation(error, abortController.signal)) {
+        logger.debug(
+          '[api/server/controllers/agents/client.js #resumePiCompletion] Aborted by user',
+          {
+            conversationId: this.conversationId,
+          },
+        );
+      } else {
+        terminalRunError.log(error, abortController.signal);
+        this.contentParts.push({
+          type: ContentTypes.ERROR,
+          [ContentTypes.ERROR]: terminalRunError.getUserFacingError(error, () =>
+            getUserFacingRequestError(
+              'An error occurred while resuming the request',
+              error,
+              appConfig,
+            ),
+          ),
+        });
+      }
+    } finally {
+      reasoningLabel?.complete();
+      await this.options.runFiles?.close();
+      await this.settleActivityLabels();
+      try {
+        await this.recordCollectedUsage({
+          context: resolveRunUsageContext(abortController.signal.aborted === true),
+          balance: balanceConfig,
+          transactions: transactionsConfig,
+        });
+      } catch (error) {
+        logger.error(
+          '[api/server/controllers/agents/client.js #resumePiCompletion] Error in cleanup phase',
+          getSafeErrorMetadata(error),
+        );
+      }
+    }
+  }
+
   async resumeCompletion({
     resumeValue,
     reviewedToolApprovals,
@@ -5726,7 +6250,20 @@ class AgentClient extends BaseClient {
     authoredSkills,
     activityPhaseSnapshot,
     compactionSemanticIndex,
+    piApprovalContinuation,
+    piApprovalDecision,
   }) {
+    if (this.options.agentRuntime?.engine === 'pi') {
+      return this.resumePiCompletion({
+        piApprovalContinuation,
+        piApprovalDecision,
+        seedContent,
+        runSteps,
+        storedMessages,
+        abortController,
+        activityPhaseSnapshot,
+      });
+    }
     restoreAuthoredSkills(
       this.options.eventHandlers?.[GraphEvents.ON_TOOL_EXECUTE],
       authoredSkills,

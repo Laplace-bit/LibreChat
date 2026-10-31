@@ -20,7 +20,12 @@ export type PiToolExecutionContext = PiToolExecutionInput & { turn: number };
 export type PiToolGateDecision =
   | { kind: 'execute'; args?: PiToolArguments }
   | { kind: 'deny' }
-  | { kind: 'pause' };
+  | {
+      kind: 'pause';
+      args?: PiToolArguments;
+      allowedDecisions: readonly Agents.ToolApprovalDecisionType[];
+      description?: string;
+    };
 
 export type PiToolExecutionGate = (
   input: PiToolExecutionContext,
@@ -88,19 +93,27 @@ function abortError(): Error {
   return error;
 }
 
-function toPauseToolCall(input: PiToolExecutionInput): PiPauseToolCall {
+function toPauseToolCall(
+  input: PiToolExecutionInput,
+  hostExecution: PiPauseToolCall['hostExecution'],
+  review: PiPauseToolCall['review'],
+): PiPauseToolCall {
   switch (input.name) {
     case Tools.file_search:
       return {
         toolCallId: input.toolCallId,
         name: input.name,
         args: { query: input.args.query },
+        hostExecution,
+        review,
       };
     case PI_CALCULATOR_TOOL_NAME:
       return {
         toolCallId: input.toolCallId,
         name: input.name,
         args: { input: input.args.input },
+        hostExecution,
+        review,
       };
   }
 }
@@ -230,6 +243,64 @@ async function settleRunStep(options: {
   }
 }
 
+/** Persist completion for an approval-stopped Pi host step using its original identities. */
+export async function settlePiHostToolStep(options: {
+  identity: PiMessageStepIdentity;
+  toolCallId: string;
+  input: PiToolExecutionContext;
+  output: string;
+  status: HostToolStatus;
+  createdAt: number;
+  now?: () => number;
+  handleHostEvent(event: PiHostEvent): void | Promise<void>;
+}): Promise<void> {
+  await settleRunStep({
+    identity: options.identity,
+    toolCallId: options.toolCallId,
+    input: options.input,
+    output: options.output,
+    status: options.status,
+    createdAt: options.createdAt,
+    now: options.now ?? Date.now,
+    handleHostEvent: options.handleHostEvent,
+  });
+}
+
+export async function settlePiHostToolResult(options: {
+  identity: PiMessageStepIdentity;
+  toolCallId: string;
+  input: PiToolExecutionContext;
+  hostResult: ToolExecuteResult;
+  createdAt: number;
+  now?: () => number;
+  handleHostEvent(event: PiHostEvent): void | Promise<void>;
+}): Promise<{
+  content: Array<{ type: 'text'; text: string }>;
+  details: { status: Exclude<HostToolStatus, 'cancelled'> };
+  isError?: boolean;
+}> {
+  const now = options.now ?? Date.now;
+  const hostText = hostContentToText(options.hostResult.content);
+  const status: Exclude<HostToolStatus, 'cancelled'> =
+    options.hostResult.status === 'success' && hostText != null ? 'success' : 'error';
+  const output = hostText ?? 'The host tool returned an unsupported result format.';
+  await settlePiHostToolStep({
+    ...options,
+    output,
+    status,
+    now,
+  });
+  const modelText =
+    output.length > 0 || status === 'success'
+      ? output
+      : 'The tool could not complete this request.';
+  return {
+    content: [{ type: 'text', text: modelText }],
+    details: { status },
+    ...(status === 'error' ? { isError: true } : {}),
+  };
+}
+
 interface StartedPiToolStep {
   identity: PiMessageStepIdentity;
   toolCallId: string;
@@ -296,6 +367,7 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
 }> {
   const now = options.now ?? Date.now;
   let nextTurn = 0;
+  const seenPiToolCallIds = new Set<string>();
   const createPauseResult = (signal: PiPauseSignal) =>
     signal.kind === 'tool_approval'
       ? {
@@ -314,6 +386,10 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
     if (signal?.aborted) {
       throw abortError();
     }
+    if (seenPiToolCallIds.has(input.toolCallId)) {
+      throw new Error('A Pi host tool call ID can only be executed once per generation');
+    }
+    seenPiToolCallIds.add(input.toolCallId);
 
     const toolInput: PiToolExecutionContext = { ...input, turn: nextTurn++ };
     let executionInput = toolInput;
@@ -321,7 +397,15 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
     if (options.pauseGate != null) {
       const pendingPause = options.pauseGate.controller.signal;
       if (pendingPause != null) {
-        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(toolInput)));
+        if (pendingPause.kind === 'tool_approval') {
+          return createPauseResult(
+            options.pauseGate.controller.rejectBatch([
+              pendingPause.toolCall.toolCallId,
+              toolInput.toolCallId,
+            ]),
+          );
+        }
+        return createPauseResult(pendingPause);
       }
       const decision = await options.pauseGate.evaluate(toolInput, signal);
       if (signal?.aborted) {
@@ -329,7 +413,15 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       }
       const pendingPauseAfterGate = options.pauseGate.controller.signal;
       if (pendingPauseAfterGate != null) {
-        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(toolInput)));
+        if (pendingPauseAfterGate.kind === 'tool_approval') {
+          return createPauseResult(
+            options.pauseGate.controller.rejectBatch([
+              pendingPauseAfterGate.toolCall.toolCallId,
+              toolInput.toolCallId,
+            ]),
+          );
+        }
+        return createPauseResult(pendingPauseAfterGate);
       }
       switch (decision.kind) {
         case 'execute':
@@ -357,8 +449,29 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
           };
         }
         case 'pause': {
+          if (decision.args != null) {
+            executionInput = {
+              ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, decision.args),
+              turn: toolInput.turn,
+            };
+          }
+          const pausedStep = await startPiToolStep(options, executionInput, now(), now);
           return createPauseResult(
-            options.pauseGate.controller.request(toPauseToolCall(toolInput)),
+            options.pauseGate.controller.request(
+              toPauseToolCall(
+                executionInput,
+                {
+                  toolCallId: pausedStep.toolCallId,
+                  toolTurn: toolInput.turn,
+                  stepIdentity: pausedStep.identity,
+                  createdAt: pausedStep.createdAt,
+                },
+                {
+                  allowedDecisions: decision.allowedDecisions,
+                  ...(decision.description == null ? {} : { description: decision.description }),
+                },
+              ),
+            ),
           );
         }
         default: {
@@ -427,29 +540,14 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       throw abortError();
     }
 
-    const hostText = hostContentToText(hostResult.content);
-    const status: Exclude<HostToolStatus, 'cancelled'> =
-      hostResult.status === 'success' && hostText != null ? 'success' : 'error';
-    const output = hostText ?? 'The host tool returned an unsupported result format.';
-    await settleRunStep({
+    return settlePiHostToolResult({
       identity,
       toolCallId,
       input: executionInput,
-      output,
-      status,
+      hostResult,
       createdAt,
       now,
       handleHostEvent: options.handleHostEvent,
     });
-
-    const modelText =
-      output.length > 0 || status === 'success'
-        ? output
-        : 'The tool could not complete this request.';
-    return {
-      content: [{ type: 'text', text: modelText }],
-      details: { status },
-      ...(status === 'error' ? { isError: true } : {}),
-    };
   };
 }

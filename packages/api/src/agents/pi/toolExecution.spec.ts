@@ -298,14 +298,18 @@ describe('createPiHostToolExecutor', () => {
     });
   });
 
-  it('pauses before host dispatch and emits no terminal tool-step event', async () => {
+  it('records a durable in-progress host step before pausing and dispatches no tool side effect', async () => {
     const { batches, events, eventSequencer, pauseController, tool } = createHarness(
       {
         toolCallId: 'host-call-1',
         status: 'success',
         content: 'This result must not be reached.',
       },
-      async () => ({ kind: 'pause' }),
+      async () => ({
+        kind: 'pause',
+        allowedDecisions: ['approve', 'reject'],
+        description: 'Review the file search request.',
+      }),
     );
 
     await expect(tool.execute('pi-call-1', { query: 'maintenance manual' })).resolves.toMatchObject(
@@ -317,13 +321,32 @@ describe('createPiHostToolExecutor', () => {
     await eventSequencer.drain();
 
     expect(batches).toHaveLength(0);
-    expect(events).toEqual([]);
+    expect(events.map(({ event }) => event)).toEqual([
+      GraphEvents.ON_RUN_STEP,
+      StepEvents.ON_TOOL_CALLS_DISPATCHED,
+    ]);
     expect(pauseController.signal).toEqual({
       kind: 'tool_approval',
       toolCall: {
         toolCallId: 'pi-call-1',
         name: Tools.file_search,
         args: { query: 'maintenance manual' },
+        hostExecution: {
+          toolCallId: 'host-call-1',
+          toolTurn: 0,
+          stepIdentity: {
+            id: 'pi-step-1',
+            index: 3,
+            messageId: 'response-1',
+            runId: 'run-1',
+            agentId: 'agent-1',
+          },
+          createdAt: 42,
+        },
+        review: {
+          allowedDecisions: ['approve', 'reject'],
+          description: 'Review the file search request.',
+        },
       },
     });
   });
@@ -357,7 +380,7 @@ describe('createPiHostToolExecutor', () => {
         evaluate: async () => {
           gateStarted.resolve(undefined);
           await releaseGate.promise;
-          return { kind: 'pause' };
+          return { kind: 'pause', allowedDecisions: ['approve', 'reject'] };
         },
       },
     });

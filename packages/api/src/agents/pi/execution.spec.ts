@@ -21,6 +21,9 @@ function createSession(
     prompt() {
       return runPrompt((event) => listener?.(event));
     },
+    continueFromToolResult() {
+      return runPrompt((event) => listener?.(event));
+    },
     steer() {
       throw new Error('steer is not used by the generation executor');
     },
@@ -51,7 +54,7 @@ function createInput(
     },
     systemPrompt: 'system',
     tools: [],
-    prompt: 'hello',
+    operation: { kind: 'prompt', text: 'hello' },
     translateEvent: () => [],
     handleHostEvent: () => undefined,
     ...overrides,

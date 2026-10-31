@@ -80,13 +80,17 @@ describe('Pi PreToolUse gate', () => {
     await expect(gate(toolInput())).resolves.toEqual({ kind: 'deny' });
   });
 
-  it('marks an ask decision for the fail-closed pause path', async () => {
+  it('preserves ask decisions and their resolved review policy for durable resume', async () => {
     const gate = createPiToolApprovalGate({
       ...baseOptions,
       policy: { enabled: true, mode: 'bypass', ask: [Tools.file_search] },
     });
 
-    await expect(gate(toolInput())).resolves.toEqual({ kind: 'pause' });
+    await expect(gate(toolInput())).resolves.toEqual({
+      kind: 'pause',
+      args: { query: 'maintenance manual' },
+      allowedDecisions: ['approve', 'reject', 'edit', 'respond'],
+    });
   });
 
   it('registers the injected deployment hook source into the host policy registry', async () => {
@@ -94,7 +98,7 @@ describe('Pi PreToolUse gate', () => {
     const pluginHookSource: PluginHookSource = {
       hasHooks: () => true,
       register: ({ registry, askDecisionSupported }) => {
-        expect(askDecisionSupported).toBe(false);
+        expect(askDecisionSupported).toBe(true);
         registry.register('PreToolUse', { hooks: [hook] });
         return 1;
       },

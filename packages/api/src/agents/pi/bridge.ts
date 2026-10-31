@@ -6,8 +6,9 @@ import type { PiHostEvent } from './events';
 
 export interface PiHostEventBridgeOptions {
   session: HostPiSession;
-  prompt: string;
-  promptOptions?: PromptOptions;
+  operation:
+    | { kind: 'prompt'; text: string; options?: PromptOptions }
+    | { kind: 'continue_tool_result'; toolCallId: string };
   signal?: AbortSignal;
   pauseController?: PiPauseController;
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
@@ -143,6 +144,17 @@ export async function executePiHostSession(
       // only now to stop AgentSession's outer auto-continue without racing it.
       void options.session.abort().catch(() => undefined);
     }
+    if (
+      event.type === 'agent_end' &&
+      options.operation.kind === 'continue_tool_result' &&
+      event.willRetry === true
+    ) {
+      /** AgentSession normally owns retry/compaction continuation after agent_end. */
+      handlerFailure ??= {
+        error: new Error('Pi tool-result continuation cannot use AgentSession retry handling'),
+      };
+      void options.session.abort().catch(() => undefined);
+    }
   });
 
   const stopListening = () => {
@@ -156,7 +168,18 @@ export async function executePiHostSession(
 
   try {
     try {
-      await options.session.prompt(options.prompt, options.promptOptions);
+      switch (options.operation.kind) {
+        case 'prompt':
+          await options.session.prompt(options.operation.text, options.operation.options);
+          break;
+        case 'continue_tool_result':
+          await options.session.continueFromToolResult(options.operation.toolCallId);
+          break;
+        default: {
+          const exhaustive: never = options.operation;
+          throw exhaustive;
+        }
+      }
     } catch (error) {
       promptFailure = { error };
       promptWasCancelled = options.signal?.aborted === true || sessionAborted;

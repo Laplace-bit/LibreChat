@@ -14,7 +14,10 @@ export type StoredAgentRuntimeResolution =
   | { status: 'unsupported' };
 
 export type ResumableAgentRuntimeResolution =
-  | { status: 'available'; selection: typeof LEGACY_AGENT_RUNTIME }
+  | {
+      status: 'available';
+      selection: typeof LEGACY_AGENT_RUNTIME | typeof PINNED_PI_AGENT_RUNTIME;
+    }
   | { status: 'unavailable' };
 
 /** Selects a canary only from the server-owned allowlist and an admitted agent identifier. */
@@ -143,11 +146,21 @@ export function resolveStoredAgentRuntime(value: unknown): StoredAgentRuntimeRes
   return { status: 'unsupported' };
 }
 
-/** Pi has no durable host approval-resume adapter yet; only legacy jobs can resume. */
-export function resolveResumableAgentRuntime(value: unknown): ResumableAgentRuntimeResolution {
+/** Pi resume is available only when the caller has decoded its durable host continuation. */
+export function resolveResumableAgentRuntime(
+  value: unknown,
+  hasValidatedPiContinuation = false,
+): ResumableAgentRuntimeResolution {
   const resolution = resolveStoredAgentRuntime(value);
   if (resolution.status === 'resolved' && resolution.selection.engine === 'legacy') {
     return { status: 'available', selection: LEGACY_AGENT_RUNTIME };
+  }
+  if (
+    resolution.status === 'resolved' &&
+    resolution.selection.engine === 'pi' &&
+    hasValidatedPiContinuation
+  ) {
+    return { status: 'available', selection: PINNED_PI_AGENT_RUNTIME };
   }
   return { status: 'unavailable' };
 }

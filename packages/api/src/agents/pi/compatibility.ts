@@ -8,15 +8,14 @@ export type PiUnsupportedTurnMode =
   | 'compaction'
   | 'regenerate'
   | 'steer'
-  | 'skills';
+  | 'skills'
+  | 'code_api_environment';
 
 export interface PiCompatibilityInput {
   rootAgentId: unknown;
   loadedAgentIds: readonly unknown[];
   callableToolNames: readonly string[];
   supportedToolNames: readonly string[];
-  /** Pi cannot yet persist and resume an interactive approval pause. */
-  toolApprovalCanPause: boolean;
   unsupportedModes: readonly PiUnsupportedTurnMode[];
 }
 
@@ -36,7 +35,6 @@ export function assertPiCompatible(input: PiCompatibilityInput): void {
     input.loadedAgentIds.length !== 1 ||
     input.loadedAgentIds[0] !== input.rootAgentId ||
     !input.callableToolNames.every((name) => supportedNames.has(name)) ||
-    (input.toolApprovalCanPause === true && input.callableToolNames.length > 0) ||
     input.unsupportedModes.length > 0
   ) {
     throw new AgentRuntimeUnavailableError();

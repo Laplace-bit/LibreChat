@@ -64,6 +64,32 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
       }
     });
 
+    test('persists Pi continuation with its action and clears it on resolution', async () => {
+      const streamId = 'stream-pi-continuation-persistence';
+      await manager.createJob(streamId, 'user-1');
+
+      const action = buildAction(streamId);
+      const continuation = {
+        version: 1,
+        actionId: action.actionId,
+        opaqueServerState: 'retained only for this run',
+      };
+      expect(
+        await manager.approvals.pause(streamId, action, {
+          piResumeContinuation: continuation,
+        }),
+      ).toBe(true);
+      await expect(manager.getJob(streamId)).resolves.toMatchObject({
+        status: 'requires_action',
+        metadata: { pendingAction: action, piResumeContinuation: continuation },
+      });
+
+      expect(await manager.approvals.resolve(streamId, action.actionId)).toBe(true);
+      const resumed = await manager.getJob(streamId);
+      expect(resumed?.status).toBe('running');
+      expect(resumed?.metadata.piResumeContinuation).toBeUndefined();
+    });
+
     test('refuses an action whose deadline passed before the pause transition', async () => {
       const streamId = 'stream-expired-before-pause';
       await manager.createJob(streamId, 'user-1');

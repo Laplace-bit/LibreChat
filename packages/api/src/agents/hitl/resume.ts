@@ -11,6 +11,10 @@ import type { Agents } from 'librechat-data-provider';
 import { ASK_USER_QUESTION_TOOL_NAME } from './askUserQuestionTool';
 import { isToolApprovalPayloadValid } from './policy';
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
  * Translate the host-facing approval wire format into the SDK's resume value.
  *
@@ -272,10 +276,19 @@ export function hasInvalidToolApprovalResolutions(
   payload: Agents.ToolApprovalInterruptPayload,
   resolutions: readonly Agents.ToolApprovalResolution[],
 ): boolean {
+  if (!Array.isArray(resolutions)) {
+    return true;
+  }
   const requestedIds = new Set(payload.action_requests.map((request) => request.tool_call_id));
   const resolutionIds = new Set<string>();
   for (const resolution of resolutions) {
-    if (resolutionIds.has(resolution.tool_call_id) || !requestedIds.has(resolution.tool_call_id)) {
+    if (
+      !isRecord(resolution) ||
+      typeof resolution.tool_call_id !== 'string' ||
+      resolution.tool_call_id.length === 0 ||
+      resolutionIds.has(resolution.tool_call_id) ||
+      !requestedIds.has(resolution.tool_call_id)
+    ) {
       return true;
     }
     resolutionIds.add(resolution.tool_call_id);

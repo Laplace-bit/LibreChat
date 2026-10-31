@@ -704,6 +704,162 @@ test('Pi host session sends a prompt through its bound provider and streams the 
   assert.equal(bindingDisposals, 1);
 });
 
+test('Pi host session continues an exact restored tool-result transcript without replaying the prompt', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  let session;
+
+  try {
+    const modelBinding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+      bindingDisposals += 1;
+    });
+    session = await createHostPiSession({
+      createModelBinding: async () => modelBinding,
+      systemPrompt: 'Continue the reviewed tool call.',
+      tools: [],
+      history: [
+        { role: 'user', content: 'Search for the maintenance manual.', timestamp: 100 },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'toolCall',
+              id: 'pi-reviewed-call',
+              name: Tools.file_search,
+              arguments: { query: 'maintenance manual' },
+            },
+          ],
+          api: modelBinding.model.api,
+          provider: modelBinding.model.provider,
+          model: modelBinding.model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'toolUse',
+          timestamp: 101,
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'pi-reviewed-call',
+          toolName: Tools.file_search,
+          content: [{ type: 'text', text: 'Approved search result.' }],
+          isError: false,
+          timestamp: 102,
+        },
+      ],
+    });
+    let streamedText = '';
+    session.subscribe((event) => {
+      if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
+        streamedText += event.assistantMessageEvent.delta;
+      }
+    });
+
+    await session.continueFromToolResult('pi-reviewed-call');
+
+    assert.equal(fakeProvider.getRequestCount(), 1);
+    assert.ok(
+      JSON.stringify(fakeProvider.getRequestBody()).includes('Approved search result.'),
+      'the approved host result reaches the next Pi model turn',
+    );
+    assert.equal(streamedText, 'Pi adapter stream');
+    assert.equal(bindingDisposals, 0, 'the session retains the binding until host disposal');
+  } finally {
+    try {
+      await session?.dispose();
+    } finally {
+      await fakeProvider.close();
+    }
+  }
+
+  assert.equal(bindingDisposals, 1);
+});
+
+test('Pi host session drains cancellation of an active restored tool-result continuation', async () => {
+  const fakeProvider = await createFakeChatServer({ responseDelayMs: 1000 });
+  const controller = new AbortController();
+  let bindingDisposals = 0;
+  let session;
+
+  try {
+    const modelBinding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+      bindingDisposals += 1;
+    });
+    session = await createHostPiSession({
+      createModelBinding: async () => modelBinding,
+      systemPrompt: 'Cancel a restored tool-result continuation.',
+      tools: [],
+      signal: controller.signal,
+      history: [
+        { role: 'user', content: 'Search the maintenance manual.', timestamp: 100 },
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'toolCall',
+              id: 'pi-cancelled-call',
+              name: Tools.file_search,
+              arguments: { query: 'maintenance manual' },
+            },
+          ],
+          api: modelBinding.model.api,
+          provider: modelBinding.model.provider,
+          model: modelBinding.model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'toolUse',
+          timestamp: 101,
+        },
+        {
+          role: 'toolResult',
+          toolCallId: 'pi-cancelled-call',
+          toolName: Tools.file_search,
+          content: [{ type: 'text', text: 'Approved search result.' }],
+          isError: false,
+          timestamp: 102,
+        },
+      ],
+    });
+
+    const continuation = session.continueFromToolResult('pi-cancelled-call');
+    const requestDeadline = Date.now() + 3000;
+    while (fakeProvider.getRequestCount() === 0 && Date.now() < requestDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fakeProvider.getRequestCount(), 1, 'the continuation provider request started');
+    controller.abort();
+    await withTimeout(
+      continuation.catch(() => undefined),
+      3000,
+      'Pi restored continuation did not drain after abort',
+    );
+    const cancellationDeadline = Date.now() + 1000;
+    while (!fakeProvider.wasClientCancelled() && Date.now() < cancellationDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fakeProvider.wasClientCancelled(), true);
+  } finally {
+    try {
+      await session?.dispose();
+    } finally {
+      await fakeProvider.close();
+    }
+  }
+
+  assert.equal(bindingDisposals, 1, 'the binding is disposed after the continuation drains');
+});
+
 test('Pi generation dispatcher streams a host-formatted turn and reports provider usage', async () => {
   const hostEvents = [];
   let contextUsagePrecededProviderRequest = false;
@@ -818,7 +974,7 @@ test('Pi dispatcher pauses at the tool gate without host effects or terminal too
       toolExecutionGate: async (call) => {
         assert.equal(call.name, Tools.file_search);
         assert.deepEqual(call.args, { query: 'maintenance manual' });
-        return { kind: 'pause' };
+        return { kind: 'pause', allowedDecisions: ['approve', 'reject'] };
       },
       createStepIdentity: () => ({
         id: 'pause-content-step',
@@ -858,8 +1014,26 @@ test('Pi dispatcher pauses at the tool gate without host effects or terminal too
         toolCallId: 'call_safe_query',
         name: Tools.file_search,
         args: { query: 'maintenance manual' },
+        hostExecution: {
+          toolCallId: 'host-call-1',
+          toolTurn: 0,
+          stepIdentity: {
+            id: 'paused-tool-step',
+            index: 0,
+            messageId: 'pause-response',
+            runId: 'pause-run',
+            agentId: 'pause-agent',
+          },
+          createdAt: outcome.signal.toolCall.hostExecution.createdAt,
+        },
+        review: { allowedDecisions: ['approve', 'reject'] },
       },
     });
+    assert.equal(
+      Number.isSafeInteger(outcome.signal.toolCall.hostExecution.createdAt),
+      true,
+      'pause carries the durable host-step timestamp',
+    );
     assert.equal(fakeProvider.getRequestCount(), 1, 'pause stops the next model request');
     assert.equal(hostToolCalls, 0, 'the host handler is not invoked before approval');
     assert.equal(bindingDisposals, 1, 'the per-run provider binding is disposed');
@@ -868,10 +1042,39 @@ test('Pi dispatcher pauses at the tool gate without host effects or terminal too
       true,
       'Pi settles and the sequenced usage event is drained before pause returns',
     );
+    assert.deepEqual(
+      hostEvents.find(
+        (event) =>
+          event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS,
+      )?.data,
+      {
+        id: 'paused-tool-step',
+        runId: 'pause-run',
+        agentId: 'pause-agent',
+        type: StepTypes.TOOL_CALLS,
+        index: 0,
+        created_at: outcome.signal.toolCall.hostExecution.createdAt,
+        status: 'in_progress',
+        stepDetails: {
+          type: StepTypes.TOOL_CALLS,
+          tool_calls: [
+            {
+              id: 'host-call-1',
+              type: 'function',
+              function: {
+                name: Tools.file_search,
+                arguments: { query: 'maintenance manual' },
+              },
+            },
+          ],
+        },
+      },
+      'the approval is tied to one durable in-progress host step',
+    );
     assert.equal(
       hostEvents.some(
         (event) =>
-          (event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS) ||
+          event.event === GraphEvents.ON_RUN_STEP_COMPLETED ||
           (event.event === GraphEvents.ON_RUN_STEP_CLOSED &&
             event.data.type === StepTypes.TOOL_CALLS),
       ),
@@ -934,7 +1137,9 @@ for (const [scenario, siblingToolCallId, expectedReason] of [
           createToolCallId: () => 'host-call-1',
           toolExecutionGate: async () => {
             gateCalls += 1;
-            return gateCalls === 1 ? { kind: 'execute' } : { kind: 'pause' };
+            return gateCalls === 1
+              ? { kind: 'execute' }
+              : { kind: 'pause', allowedDecisions: ['approve', 'reject'] };
           },
           createStepIdentity: () => ({
             id: 'unsupported-content-step',

@@ -2778,6 +2778,16 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
     });
 
+    it('400 when the client submits a malformed decision entry', async () => {
+      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+
+      const res = await post(approveBody({ decisions: [null] }));
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/invalid tool approval decisions/i);
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+    });
+
     it('403 when a decision is not permitted by the tool policy', async () => {
       const job = makeToolApprovalJob();
       // Policy restricts tc1 to reject only; an `approve` must be refused.

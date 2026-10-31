@@ -1,4 +1,5 @@
 import { Tools } from 'librechat-data-provider';
+import { HumanMessage } from '@librechat/agents/langchain/messages';
 import type { LCTool } from '@librechat/agents';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiGenerationDispatchInput } from './dispatch';
@@ -80,6 +81,93 @@ describe('createPiGenerationDispatcher tool preflight', () => {
       ),
     ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
     expect(createModelBinding).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('createPiGenerationDispatcher approval continuation', () => {
+  const continuation = {
+    version: 1 as const,
+    actionId: 'action-1',
+    piToolCallId: 'pi-call-1',
+    hostToolCallId: 'host-call-1',
+    toolTurn: 0,
+    toolName: Tools.file_search as typeof Tools.file_search,
+    args: { query: 'maintenance manual' },
+    allowedDecisions: ['approve', 'reject', 'edit', 'respond'] as const,
+    stepIdentity: {
+      id: 'tool-step-1',
+      index: 1,
+      messageId: 'message-1',
+      runId: 'run-1',
+      agentId: 'agent-1',
+    },
+    stepCreatedAt: 100,
+  };
+
+  function createModelBinding(): Promise<PiModelBinding> {
+    return Promise.resolve({
+      model: {
+        api: 'openai-responses',
+        provider: 'librechat-openai',
+        id: 'gpt-4o-mini',
+      } as PiModelBinding['model'],
+      modelRuntime: {} as PiModelBinding['modelRuntime'],
+      dispose: jest.fn(),
+    });
+  }
+
+  it('executes the approved host result once and continues the exact Pi tool call', async () => {
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      expect(value.operation).toEqual({ kind: 'continue_tool_result', toolCallId: 'pi-call-1' });
+      expect(value.history?.map(({ role }) => role)).toEqual(['user', 'assistant', 'toolResult']);
+      return { status: 'completed' as const };
+    });
+    const executeApprovedTool = jest.fn(async () => ({
+      content: [{ type: 'text' as const, text: 'Found two manuals.' }],
+      isError: false,
+    }));
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage('Find the maintenance manual.')],
+          createModelBinding,
+          resumeToolResult: {
+            continuation,
+            toolArguments: continuation.args,
+            execute: executeApprovedTool,
+          },
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    expect(executeApprovedTool).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when the approved host tool does not produce a result', async () => {
+    const execute = jest.fn(async (_value: PiGenerationExecutorInput) => ({
+      status: 'completed' as const,
+    }));
+    const executeApprovedTool = jest.fn(async () => undefined as never);
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage('Find the maintenance manual.')],
+          createModelBinding,
+          resumeToolResult: {
+            continuation,
+            toolArguments: continuation.args,
+            execute: executeApprovedTool,
+          },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
+    expect(executeApprovedTool).toHaveBeenCalledTimes(1);
     expect(execute).not.toHaveBeenCalled();
   });
 });

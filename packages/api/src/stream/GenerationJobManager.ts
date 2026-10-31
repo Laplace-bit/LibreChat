@@ -3200,6 +3200,7 @@ class GenerationJobManagerClass {
         // Surface the pending review so status/resume routes built on the
         // facade can render the prompt for a `requires_action` job.
         pendingAction: jobData.pendingAction,
+        piResumeContinuation: jobData.piResumeContinuation,
         resolvedAskUserQuestions: jobData.resolvedAskUserQuestions,
       },
       readyPromise: runtime.readyPromise,
@@ -4161,6 +4162,7 @@ class GenerationJobManagerClass {
         clear: [
           'pendingAction',
           'pendingActionId',
+          'piResumeContinuation',
           ...(failedPauseBarrierId != null
             ? ['terminalPersistencePending', 'terminalPersistenceStartedAt']
             : []),
@@ -4870,6 +4872,7 @@ class GenerationJobManagerClass {
               terminalHostActionPending: true,
             }),
         },
+        clear: ['pendingAction', 'pendingActionId', 'piResumeContinuation'],
       });
       if (drainedSteers != null) {
         break;

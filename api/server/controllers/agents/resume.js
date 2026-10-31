@@ -12,6 +12,9 @@ const {
   checkAccess,
   GenerationJobManager,
   resolveResumableAgentRuntime,
+  resolvePiApprovalContinuation,
+  matchesPiApprovalHostState,
+  resolvePiApprovalDecision,
   GENERATION_RECOVERY_FAILED_ERROR,
   isPendingActionStale,
   resolveToolApprovalResume,
@@ -819,9 +822,18 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   }
 
   // A resumed generation uses the engine recorded when it first started. Old jobs
-  // without this field are legacy. Unknown or not-yet-resumable engines fail before
-  // the approval, schedule slot, or running state can be claimed.
-  const runtimeResolution = resolveResumableAgentRuntime(job.metadata?.agentRuntime);
+  // without this field are legacy. Pi is resumable only when its server-only envelope
+  // decodes against the exact pending action and immutable run identities.
+  const piContinuation = resolvePiApprovalContinuation({
+    value: job.metadata?.piResumeContinuation,
+    pendingAction: job.metadata?.pendingAction,
+    responseMessageId: job.metadata?.responseMessageId,
+    agentId: job.metadata?.agent_id,
+  });
+  const runtimeResolution = resolveResumableAgentRuntime(
+    job.metadata?.agentRuntime,
+    piContinuation != null,
+  );
   if (runtimeResolution.status === 'unavailable') {
     return sendGenerationJson(
       res,
@@ -1022,6 +1034,21 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       generationProtocolVersion,
     );
   }
+  const piDecision =
+    runtimeResolution.selection.engine === 'pi'
+      ? resolvePiApprovalDecision({
+          continuation: piContinuation,
+          resolutions: Array.isArray(req.body.decisions) ? req.body.decisions : [],
+        })
+      : undefined;
+  if (runtimeResolution.selection.engine === 'pi' && piDecision == null) {
+    return sendGenerationJson(
+      res,
+      400,
+      { code: 'INVALID_PI_APPROVAL_DECISION', error: 'The Pi tool decision is invalid.' },
+      generationProtocolVersion,
+    );
+  }
   let resolvedAskContentIndex;
   let resolvedAskContentMissing = false;
   if (pendingAction.payload.type === 'ask_user_question' && !pendingAction.payload.tool_call_id) {
@@ -1126,6 +1153,24 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt, {
       validateEarlyBufferRecovery: true,
     });
+    if (
+      runtimeResolution.selection.engine === 'pi' &&
+      (resumeState == null ||
+        !matchesPiApprovalHostState({
+          continuation: piContinuation,
+          runSteps: resumeState.runSteps,
+          aggregatedContent: resumeState.aggregatedContent,
+          responseMessageId: job.metadata.responseMessageId,
+          agentId: job.metadata.agent_id,
+        }))
+    ) {
+      return sendGenerationJson(
+        res,
+        409,
+        { code: 'PI_CONTINUATION_STALE', error: 'The paused Pi tool step is no longer available.' },
+        generationProtocolVersion,
+      );
+    }
     const batchedAnswer =
       mapped.resumeValue?.answers != null &&
       typeof mapped.resumeValue.answers === 'object' &&
@@ -1978,6 +2023,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         // replays it rather than repeating it, so linked-prompt usage is not
         // recorded again. Resolution itself still runs, cache-first.
         isResume: true,
+        agentRuntime: runtimeResolution.selection,
       });
       client = result.client;
 
@@ -2011,6 +2057,8 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
             bindings: pendingAction.toolApprovalBindings,
             decisions: req.body.decisions ?? [],
           },
+          piApprovalContinuation: piContinuation,
+          piApprovalDecision: piDecision,
           seedContent,
           runSteps: resumeState?.runSteps ?? [],
           storedMessages,

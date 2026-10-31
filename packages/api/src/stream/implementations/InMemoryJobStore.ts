@@ -1284,6 +1284,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
           clear: [
             'pendingAction',
             'pendingActionId',
+            'piResumeContinuation',
             'terminalPersistencePending',
             'terminalPersistenceStartedAt',
           ],
@@ -1342,6 +1343,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
         job.terminalHostActionPending = true;
         delete job.pendingAction;
         delete job.pendingActionId;
+        delete job.piResumeContinuation;
       } else if (this.staleJobTimeout > 0 && job.status === 'running') {
         // Failsafe: reap jobs stuck in "running" with no generation activity for
         // longer than the stale timeout. These are crashed/hung generations that

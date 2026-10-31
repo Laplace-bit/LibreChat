@@ -8,8 +8,9 @@ import { executePiHostSession } from './bridge';
 import { createHostPiSession } from './session';
 
 export interface PiGenerationExecutorInput extends HostPiSessionOptions {
-  prompt: string;
-  promptOptions?: PromptOptions;
+  operation:
+    | { kind: 'prompt'; text: string; options?: PromptOptions }
+    | { kind: 'continue_tool_result'; toolCallId: string };
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   eventSequencer?: PiHostEventSequencer;
@@ -29,14 +30,7 @@ export function createPiGenerationExecutor(
       return { status: 'cancelled' };
     }
 
-    const {
-      prompt,
-      promptOptions,
-      translateEvent,
-      handleHostEvent,
-      eventSequencer,
-      ...sessionOptions
-    } = input;
+    const { operation, translateEvent, handleHostEvent, eventSequencer, ...sessionOptions } = input;
     let session: HostPiSession;
     try {
       session = await dependencies.createSession(sessionOptions);
@@ -54,8 +48,7 @@ export function createPiGenerationExecutor(
     try {
       const outcome = await executePiHostSession({
         session,
-        prompt,
-        promptOptions,
+        operation,
         signal: input.signal,
         pauseController,
         translateEvent,

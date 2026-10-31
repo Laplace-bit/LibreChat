@@ -8,13 +8,20 @@ import type {
   PiFileSearchArguments,
   PiHostToolExecutionInput,
   PiReadFileArguments,
+  PiWebSearchArguments,
   PiToolArguments,
 } from './tools';
 import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostEvent } from './events';
-import { PI_BASH_TOOL_NAME, PI_CALCULATOR_TOOL_NAME, PI_READ_FILE_TOOL_NAME } from './toolNames';
+import {
+  PI_BASH_TOOL_NAME,
+  PI_CALCULATOR_TOOL_NAME,
+  PI_READ_FILE_TOOL_NAME,
+  PI_WEB_SEARCH_TOOL_NAME,
+  isPiSupportedHostToolName,
+} from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
 
 export type PiToolExecutionInput = PiHostToolExecutionInput;
@@ -41,6 +48,14 @@ export type PiHostToolCall =
       id: string;
       name: typeof Tools.file_search;
       args: PiFileSearchArguments;
+      stepId: string;
+      turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      id: string;
+      name: typeof PI_WEB_SEARCH_TOOL_NAME;
+      args: PiWebSearchArguments;
       stepId: string;
       turn?: number;
       codeSessionContext?: PiCodeSessionSnapshot;
@@ -75,6 +90,8 @@ export interface PiToolExecutionOptions {
   createToolCallId(): string;
   executeHostToolCall(call: PiHostToolCall, signal?: AbortSignal): Promise<ToolExecuteResult>;
   getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
+  /** Per-tool call counts reconstructed from the current generation on resume. */
+  initialToolUsageCounts?: Readonly<Record<string, number>>;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   pauseGate?: {
     controller: PiPauseController;
@@ -87,6 +104,42 @@ type HostToolStatus = 'success' | 'error' | 'cancelled';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Rebuild per-tool turn offsets from the durable steps that precede a Pi resume. */
+export function buildPiToolUsageCounts(input: {
+  runSteps: readonly unknown[];
+  pendingTool?: { name: string; turn: number };
+}): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const step of input.runSteps) {
+    if (
+      !isRecord(step) ||
+      !isRecord(step.stepDetails) ||
+      !Array.isArray(step.stepDetails.tool_calls)
+    ) {
+      continue;
+    }
+    for (const toolCall of step.stepDetails.tool_calls) {
+      if (!isRecord(toolCall) || !isRecord(toolCall.function)) {
+        continue;
+      }
+      const name = toolCall.function.name;
+      if (typeof name === 'string' && isPiSupportedHostToolName(name)) {
+        counts[name] = (counts[name] ?? 0) + 1;
+      }
+    }
+  }
+  const pendingTool = input.pendingTool;
+  if (
+    pendingTool != null &&
+    isPiSupportedHostToolName(pendingTool.name) &&
+    Number.isSafeInteger(pendingTool.turn) &&
+    pendingTool.turn >= 0
+  ) {
+    counts[pendingTool.name] = Math.max(counts[pendingTool.name] ?? 0, pendingTool.turn + 1);
+  }
+  return counts;
 }
 
 function hostContentToText(content: ToolExecuteResult['content']): string | undefined {
@@ -207,6 +260,15 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    case PI_WEB_SEARCH_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: input.name,
+        args: input.args,
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
+        hostExecution,
+        review,
+      };
     case PI_CALCULATOR_TOOL_NAME:
       return {
         toolCallId: input.toolCallId,
@@ -243,6 +305,14 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
       return {
         id,
         name: Tools.file_search,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_WEB_SEARCH_TOOL_NAME:
+      return {
+        id,
+        name: PI_WEB_SEARCH_TOOL_NAME,
         args: input.args,
         stepId,
         turn: input.turn,
@@ -510,7 +580,17 @@ export function createPiHostToolExecutor(
   signal?: AbortSignal,
 ) => Promise<AgentToolResult<{ status: HostToolStatus | 'paused' | 'unsupported_batch' }>> {
   const now = options.now ?? Date.now;
-  let nextTurn = 0;
+  const nextTurnByTool = new Map<string, number>();
+  for (const [name, count] of Object.entries(options.initialToolUsageCounts ?? {})) {
+    if (isPiSupportedHostToolName(name) && Number.isSafeInteger(count) && count >= 0) {
+      nextTurnByTool.set(name, count);
+    }
+  }
+  const takeNextToolTurn = (name: string): number => {
+    const turn = nextTurnByTool.get(name) ?? 0;
+    nextTurnByTool.set(name, turn + 1);
+    return turn;
+  };
   const seenPiToolCallIds = new Set<string>();
   const createPauseResult = (signal: PiPauseSignal) =>
     signal.kind === 'tool_approval'
@@ -535,7 +615,7 @@ export function createPiHostToolExecutor(
     }
     seenPiToolCallIds.add(input.toolCallId);
 
-    const toolInput: PiToolExecutionContext = { ...input, turn: nextTurn++ };
+    const toolInput: PiToolExecutionContext = { ...input, turn: takeNextToolTurn(input.name) };
     let executionInput = toolInput;
 
     if (options.pauseGate != null) {

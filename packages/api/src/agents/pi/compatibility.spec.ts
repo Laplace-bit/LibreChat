@@ -57,8 +57,8 @@ describe('assertPiCompatible', () => {
     },
     {
       ...supported,
-      callableToolNames: ['web_search'],
-      supportedToolNames: ['web_search'],
+      callableToolNames: ['search_mcp_docs'],
+      supportedToolNames: ['search_mcp_docs'],
     },
     {
       ...supported,

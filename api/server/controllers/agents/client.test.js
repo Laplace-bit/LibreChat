@@ -10267,6 +10267,23 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['input'],
     },
   };
+  const webSearchDefinition = {
+    name: Tools.web_search,
+    description: 'Search the administrator-configured web provider.',
+    parameters: {
+      type: 'object',
+      properties: {
+        intent: { type: 'string', description: 'Describe the current search.' },
+        query: { type: 'string', description: 'Search query.' },
+        date: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y'] },
+        country: { type: 'string' },
+        images: { type: 'boolean' },
+        videos: { type: 'boolean' },
+        news: { type: 'boolean' },
+      },
+      required: ['query'],
+    },
+  };
   const bashDefinition = {
     name: 'bash_tool',
     description: 'Run a command in the managed Code API environment.',
@@ -10671,6 +10688,71 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
       calculatorDefinition,
     ]);
+  });
+
+  it('routes web_search through the host handler with its citation turn', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'The configured search provider returned results.',
+            artifact: { web_search: { turn: batch.toolCalls[0].turn, organic: [] } },
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: Tools.web_search }],
+        toolDefinitions: [webSearchDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      toolResult = await input.executeHostToolCall(
+        {
+          id: 'host-web-search-call',
+          name: Tools.web_search,
+          args: { query: 'pump standard', date: 'y', country: 'us' },
+          stepId: 'host-web-search-step',
+          turn: 2,
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch, metadata] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-web-search-call',
+        name: Tools.web_search,
+        args: { query: 'pump standard', date: 'y', country: 'us' },
+        stepId: 'host-web-search-step',
+        turn: 2,
+      },
+    ]);
+    expect(batch.configurable).toMatchObject({ req, user_id: 'user-pi' });
+    expect(metadata).toMatchObject({ thread_id: 'conversation-pi', run_id: 'response-pi' });
+    expect(toolResult).toMatchObject({
+      toolCallId: 'host-web-search-call',
+      status: 'success',
+      content: 'The configured search provider returned results.',
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([webSearchDefinition]);
   });
 
   it('routes managed Code API calls through the host and folds session artifacts per run', async () => {

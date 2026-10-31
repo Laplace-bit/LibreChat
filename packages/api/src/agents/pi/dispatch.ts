@@ -47,6 +47,8 @@ export interface PiGenerationDispatchInput {
   executeHostToolCall?: (call: PiHostToolCall, signal?: AbortSignal) => Promise<ToolExecuteResult>;
   /** Server-owned context persisted if a Code API tool waits for approval. */
   getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
+  /** Per-tool call counts reconstructed from the current generation on resume. */
+  initialToolUsageCounts?: Readonly<Record<string, number>>;
   /** Optional internal gate. Production request wiring does not supply this yet. */
   toolExecutionGate?: PiToolExecutionGate;
   /** Host-generated identities for LibreChat tool call steps. */
@@ -113,6 +115,9 @@ export function createPiGenerationDispatcher(
           ...(input.getCodeSessionContext == null
             ? {}
             : { getCodeSessionContext: input.getCodeSessionContext }),
+          ...(input.initialToolUsageCounts == null
+            ? {}
+            : { initialToolUsageCounts: input.initialToolUsageCounts }),
           handleHostEvent: eventSequencer.enqueue,
           ...(input.toolExecutionGate == null
             ? {}

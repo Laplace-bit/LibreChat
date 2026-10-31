@@ -1,4 +1,5 @@
 import { Tools } from 'librechat-data-provider';
+import { WebSearchToolDefinition } from '@librechat/agents';
 import { CalculatorToolDefinition, Constants } from '@librechat/agents';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
@@ -66,6 +67,24 @@ const readFileDefinition: PiHostToolDefinition = {
       max_lines: { type: 'integer', minimum: 1, maximum: 500 },
     },
     required: ['path'],
+  },
+};
+
+const webSearchDefinition: PiHostToolDefinition = {
+  name: Tools.web_search,
+  description: 'Search the web using the administrator-configured provider.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string', description: 'Describe the current search.' },
+      query: { type: 'string', description: 'Search query.' },
+      date: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y'], description: 'Date range.' },
+      country: { type: 'string', description: 'Two-letter country code.' },
+      images: { type: 'boolean' },
+      videos: { type: 'boolean' },
+      news: { type: 'boolean' },
+    },
+    required: ['query'],
   },
 };
 
@@ -181,6 +200,91 @@ describe('createPiTools', () => {
     });
   });
 
+  it('creates strict web_search parameters and forwards only the reviewed argument shape', async () => {
+    const execute = hostExecutor();
+    const [tool] = createPiTools({ definitions: [webSearchDefinition], execute });
+    const args = {
+      intent: 'Searching for the current pump standard',
+      query: 'ISO pump vibration standard',
+      date: 'y',
+      country: 'us',
+      images: false,
+      videos: true,
+      news: false,
+    };
+
+    expect(tool).toMatchObject({
+      name: Tools.web_search,
+      executionMode: 'sequential',
+      parameters: {
+        additionalProperties: false,
+        required: ['query'],
+        properties: {
+          intent: { type: 'string' },
+          query: { type: 'string' },
+          date: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y'] },
+          country: { type: 'string' },
+          images: { type: 'boolean' },
+          videos: { type: 'boolean' },
+          news: { type: 'boolean' },
+        },
+      },
+    });
+
+    await tool.execute('pi-search-1', args);
+
+    expect(execute).toHaveBeenCalledWith(
+      { toolCallId: 'pi-search-1', name: Tools.web_search, args },
+      undefined,
+    );
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['unknown field', { query: 'pump', unexpected: true }],
+    ['invalid date range', { query: 'pump', date: 'tomorrow' }],
+    ['invalid country code', { query: 'pump', country: 'usa' }],
+    ['non-boolean media filter', { query: 'pump', images: 'yes' }],
+  ])('rejects web_search %s before host execution', async (_label, args) => {
+    const execute = hostExecutor();
+    const [tool] = createPiTools({ definitions: [webSearchDefinition], execute });
+
+    await expect(tool.execute('pi-search-invalid', args)).rejects.toThrow(
+      new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID'),
+    );
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('rejects a web_search host schema with an expanded date enum', () => {
+    expect(() =>
+      convertPiToolSchema(Tools.web_search, {
+        ...WebSearchToolDefinition.schema,
+        properties: {
+          ...WebSearchToolDefinition.schema.properties,
+          date: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y', 'all'] },
+        },
+      }),
+    ).toThrow(new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED'));
+  });
+
+  it('accepts the canonical host web_search schema', () => {
+    expect(() =>
+      convertPiToolSchema(Tools.web_search, WebSearchToolDefinition.schema),
+    ).not.toThrow();
+  });
+
+  it('rejects a web_search schema with duplicate date values', () => {
+    expect(() =>
+      convertPiToolSchema(Tools.web_search, {
+        ...WebSearchToolDefinition.schema,
+        properties: {
+          ...WebSearchToolDefinition.schema.properties,
+          date: { type: 'string', enum: ['h', 'h', 'w', 'm', 'y'] },
+        },
+      }),
+    ).toThrow(new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED'));
+  });
+
   it('routes execute through the injected host callback and forwards cancellation', async () => {
     const controller = new AbortController();
     const execute = hostExecutor();
@@ -237,7 +341,7 @@ describe('createPiTools', () => {
   it('rejects any callable tool outside the reviewed host adapters', () => {
     expect(() =>
       createPiTools({
-        definitions: [{ name: 'web_search' }],
+        definitions: [{ name: 'search_mcp_docs' }],
         execute: async () => successfulResult(),
       }),
     ).toThrow(new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED'));
@@ -246,7 +350,7 @@ describe('createPiTools', () => {
   it('rejects a set containing a supported tool and an unsupported tool', () => {
     expect(() =>
       createPiTools({
-        definitions: [fileSearchDefinition, { name: 'web_search' }],
+        definitions: [fileSearchDefinition, { name: 'search_mcp_docs' }],
         execute: async () => successfulResult(),
       }),
     ).toThrow(new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED'));

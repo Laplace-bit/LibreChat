@@ -1,8 +1,22 @@
 import { z } from 'zod';
-import { StepEvents, Tools } from 'librechat-data-provider';
+import http from 'node:http';
 import { tool as createStructuredTool } from '@librechat/agents/langchain/tools';
-import { GraphEvents, type EventHandler, type ToolExecuteBatchRequest } from '@librechat/agents';
+import {
+  StepEvents,
+  Tools,
+  SearchProviders,
+  ScraperProviders,
+  RerankerTypes,
+} from 'librechat-data-provider';
+import {
+  createSearchTool,
+  GraphEvents,
+  WebSearchToolDefinition,
+  type EventHandler,
+  type ToolExecuteBatchRequest,
+} from '@librechat/agents';
 import type { LCTool } from '@librechat/agents';
+import type { AddressInfo } from 'node:net';
 import type { PiHostEvent } from './events';
 import {
   createToolExecuteHandler,
@@ -38,6 +52,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+function getToolCallTurn(value: unknown): number | undefined {
+  if (!isRecord(value) || !isRecord(value.toolCall)) {
+    return undefined;
+  }
+  const turn = value.toolCall.turn;
+  return Number.isSafeInteger(turn) && typeof turn === 'number' && turn >= 0 ? turn : undefined;
+}
+
 function isToolExecuteBatchRequest(value: unknown): value is ToolExecuteBatchRequest {
   return (
     isRecord(value) &&
@@ -66,6 +88,177 @@ function getMessageEnvelopes(writes: readonly string[]): MessageEnvelope[] {
 }
 
 describe('Pi host tool batch integration', () => {
+  it('preserves citation turns through the real web_search tool and host handler', async () => {
+    const userId = 'user-pi-search';
+    const agentId = 'agent-pi-search';
+    const threadId = 'thread-pi-search';
+    const runId = 'run-pi-search';
+    const callId = 'host-call-pi-search';
+    const stepId = 'host-step-pi-search';
+    const sourceUrl = 'https://example.test/pump-standard';
+    const receivedPaths: string[] = [];
+    const server = http.createServer((req, res) => {
+      receivedPaths.push(req.url ?? '');
+      req.resume();
+      req.on('end', () => {
+        res.setHeader('Content-Type', 'application/json');
+        if (req.url?.startsWith('/v1/search')) {
+          res.end(
+            JSON.stringify({
+              results: [
+                {
+                  title: 'Pump vibration standard',
+                  url: sourceUrl,
+                  snippet: 'The standard covers pump vibration severity.',
+                },
+              ],
+            }),
+          );
+          return;
+        }
+        if (req.url?.startsWith('/v1/fetch')) {
+          res.end(
+            JSON.stringify({
+              url: sourceUrl,
+              title: 'Pump vibration standard',
+              content: 'The standard covers pump vibration severity.',
+            }),
+          );
+          return;
+        }
+        res.statusCode = 404;
+        res.end(JSON.stringify({ error: 'Unexpected test request.' }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+    try {
+      const { port } = server.address() as AddressInfo;
+      const baseUrl = `http://127.0.0.1:${port}`;
+      const searchObservations: Array<{ turn: number | undefined; result: unknown }> = [];
+      const searchTool = createSearchTool({
+        searchProvider: SearchProviders.KEENABLE,
+        keenableApiUrl: `${baseUrl}/v1/search`,
+        keenableSearchOptions: { timeout: 2_000 },
+        scraperProvider: ScraperProviders.KEENABLE,
+        keenableScraperOptions: { apiUrl: `${baseUrl}/v1/fetch`, timeout: 2_000 },
+        rerankerType: RerankerTypes.NONE,
+        topResults: 1,
+        onSearchResults: (result, runnableConfig) => {
+          searchObservations.push({ turn: getToolCallTurn(runnableConfig), result });
+        },
+      });
+      const callbackCalls: Array<{
+        data: Parameters<NonNullable<ToolExecuteOptions['toolEndCallback']>>[0];
+        metadata: Parameters<NonNullable<ToolExecuteOptions['toolEndCallback']>>[1];
+      }> = [];
+      const toolEndCallback: NonNullable<ToolExecuteOptions['toolEndCallback']> = async (
+        data,
+        metadata,
+      ) => {
+        callbackCalls.push({ data, metadata });
+      };
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async (toolNames) => {
+        expect(toolNames).toEqual([Tools.web_search]);
+        return { loadedTools: [searchTool] };
+      });
+      const hostToolHandler = createToolExecuteHandler({ loadTools, toolEndCallback });
+      const batches: ToolExecuteBatchRequest[] = [];
+      const instrumentedHandler: EventHandler = {
+        handle: (event, data, metadata, graph) => {
+          if (event === GraphEvents.ON_TOOL_EXECUTE && isToolExecuteBatchRequest(data)) {
+            batches.push(data);
+          }
+          return hostToolHandler.handle(event, data, metadata, graph);
+        },
+      };
+      const metadata = {
+        thread_id: threadId,
+        user_id: userId,
+        run_id: runId,
+        agent_id: agentId,
+        agentId,
+        last_agent_id: agentId,
+        langgraph_node: `agent=${agentId}`,
+      };
+      const request = {
+        user: { id: userId },
+        body: { conversationId: threadId },
+        config: { endpoints: { agents: {} } },
+      };
+      const eventSequencer = createPiHostEventSequencer(() => undefined);
+      const executeHostToolCall = createPiHostToolBatchExecutor({
+        handler: instrumentedHandler,
+        userId,
+        agentId,
+        request,
+        threadId,
+        runId,
+        metadata,
+      });
+      const executePiTool = createPiHostToolExecutor({
+        createStepIdentity: () => ({
+          id: stepId,
+          index: 0,
+          messageId: 'assistant-message-pi-search',
+          runId,
+          agentId,
+        }),
+        createToolCallId: () => callId,
+        executeHostToolCall,
+        initialToolUsageCounts: { [Tools.web_search]: 2 },
+        handleHostEvent: eventSequencer.enqueue,
+      });
+      const [piTool] = createPiTools({
+        definitions: [
+          {
+            name: Tools.web_search,
+            description: WebSearchToolDefinition.description,
+            parameters: WebSearchToolDefinition.schema,
+          },
+        ],
+        execute: executePiTool,
+      });
+      if (piTool == null) {
+        throw new Error('Expected the web_search Pi tool definition.');
+      }
+
+      const piResult = await piTool.execute('pi-provider-search-call', {
+        query: 'pump vibration standard',
+        date: 'y',
+      });
+      await eventSequencer.drain();
+
+      expect(JSON.stringify(piResult.content)).toContain(String.raw`\ue202turn2search0`);
+      expect(receivedPaths).toEqual(['/v1/search', expect.stringContaining('/v1/fetch')]);
+      expect(searchObservations).toHaveLength(1);
+      expect(searchObservations[0]?.turn).toBe(2);
+      expect(batches).toHaveLength(1);
+      expect(batches[0]?.toolCalls).toMatchObject([
+        { id: callId, name: Tools.web_search, stepId, turn: 2 },
+      ]);
+      expect(callbackCalls).toHaveLength(1);
+      const outputArtifact: unknown = callbackCalls[0]?.data.output.artifact;
+      if (!isRecord(outputArtifact)) {
+        throw new Error('Expected a web_search tool artifact.');
+      }
+      expect(outputArtifact[Tools.web_search]).toMatchObject({
+        turn: 2,
+        organic: [{ link: sourceUrl }],
+      });
+      expect(callbackCalls[0]?.metadata).toMatchObject({
+        run_id: runId,
+        thread_id: threadId,
+        executingAgentId: agentId,
+        stepId,
+      });
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
   it('executes file_search through the real handler and preserves SSE and artifact ownership', async () => {
     const userId = 'user-pi-1';
     const agentId = 'agent-pi-1';
@@ -244,6 +437,7 @@ describe('Pi host tool batch integration', () => {
         name: Tools.file_search,
         args: { query },
         stepId,
+        turn: 0,
       },
     ]);
     expect(batch.userId).toBe(userId);

@@ -1,5 +1,5 @@
-import { Constants } from '@librechat/agents';
 import { Tools } from 'librechat-data-provider';
+import { DATE_RANGE, Constants } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type { PiPauseToolCall } from './pause';
 import {
@@ -204,6 +204,43 @@ describe('Pi approval continuation', () => {
         agentId: 'agent-1',
       }),
     ).toBeUndefined();
+  });
+
+  it('restores a web_search approval with its citation turn and reviewed arguments', () => {
+    const toolCall: PiPauseToolCall = {
+      ...createApproval().toolCall,
+      name: Tools.web_search,
+      args: { query: 'pump reliability', date: DATE_RANGE.PAST_YEAR, country: 'us' },
+      hostExecution: { ...createApproval().toolCall.hostExecution, toolTurn: 2 },
+    };
+    const payload = buildPiApprovalInterruptPayload({
+      hostToolCallId: toolCall.hostExecution.toolCallId,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      allowedDecisions: toolCall.review.allowedDecisions,
+    });
+    const pendingAction = buildPendingAction(payload, {
+      streamId: 'conversation-1',
+      conversationId: 'conversation-1',
+      runId: 'response-1',
+      responseMessageId: 'response-1',
+    });
+    const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(continuation.toolTurn).toBe(2);
+    expect(continuation.args).toEqual({
+      query: 'pump reliability',
+      date: 'y',
+      country: 'us',
+    });
   });
 
   it('validates the server envelope against the exact pending action and generation', () => {

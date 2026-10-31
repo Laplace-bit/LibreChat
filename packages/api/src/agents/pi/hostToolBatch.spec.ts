@@ -61,6 +61,7 @@ function hostCall(): PiHostToolCall {
     name: Tools.file_search,
     args: { query: 'machine manual' },
     stepId: 'pi-step-1',
+    turn: 2,
   };
 }
 

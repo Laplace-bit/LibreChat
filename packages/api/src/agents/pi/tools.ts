@@ -1,3 +1,4 @@
+import { DATE_RANGE } from '@librechat/agents';
 import { Tools } from 'librechat-data-provider';
 import type { AgentToolResult, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
@@ -7,9 +8,20 @@ import {
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
 
 export type PiFileSearchArguments = { query: string };
+
+export type PiWebSearchArguments = {
+  intent?: string;
+  query: string;
+  date?: DATE_RANGE;
+  country?: string;
+  images?: boolean;
+  videos?: boolean;
+  news?: boolean;
+};
 
 export type PiCalculatorArguments = { input: string };
 
@@ -28,6 +40,7 @@ export type PiReadFileArguments = {
 
 export type PiToolArguments =
   | PiFileSearchArguments
+  | PiWebSearchArguments
   | PiCalculatorArguments
   | PiBashArguments
   | PiReadFileArguments;
@@ -39,6 +52,11 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof Tools.file_search;
       args: PiFileSearchArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_WEB_SEARCH_TOOL_NAME;
+      args: PiWebSearchArguments;
     }
   | {
       toolCallId: string;
@@ -93,6 +111,10 @@ const TOOL_FIELDS = {
     argument: 'query',
     label: 'File Search',
     description: 'Search files the current agent is authorized to access.',
+  },
+  [PI_WEB_SEARCH_TOOL_NAME]: {
+    label: 'Web Search',
+    description: 'Search the web using the administrator-configured provider.',
   },
   [PI_CALCULATOR_TOOL_NAME]: {
     argument: 'input',
@@ -164,6 +186,90 @@ function isReadFileMaxLinesProperty(value: unknown): value is Record<string, unk
     Number.isSafeInteger(value.maximum) &&
     (value.maximum as number) <= MAX_PI_READ_FILE_LINES
   );
+}
+
+function isBooleanProperty(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && hasOnlyKeys(value, ['type', 'description']) && value.type === 'boolean';
+}
+
+const WEB_SEARCH_DATE_RANGES = Object.values(DATE_RANGE);
+const WEB_SEARCH_DATE_RANGE_SET = new Set<string>(WEB_SEARCH_DATE_RANGES);
+
+function isWebSearchDateRange(value: unknown): value is DATE_RANGE {
+  return typeof value === 'string' && WEB_SEARCH_DATE_RANGE_SET.has(value);
+}
+
+function convertPiWebSearchSchema(schema: Record<string, unknown>): TSchema {
+  const properties = schema.properties;
+  const required = schema.required;
+  if (
+    !isRecord(properties) ||
+    !hasOnlyKeys(properties, ['intent', 'query', 'date', 'country', 'images', 'videos', 'news']) ||
+    !Array.isArray(required) ||
+    required.length !== 1 ||
+    required[0] !== 'query' ||
+    !isStringProperty(properties.query) ||
+    (properties.intent !== undefined && !isStringProperty(properties.intent)) ||
+    (properties.country !== undefined && !isStringProperty(properties.country)) ||
+    (properties.images !== undefined && !isBooleanProperty(properties.images)) ||
+    (properties.videos !== undefined && !isBooleanProperty(properties.videos)) ||
+    (properties.news !== undefined && !isBooleanProperty(properties.news)) ||
+    (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  const dateSchema = properties.date;
+  if (
+    dateSchema !== undefined &&
+    (!isRecord(dateSchema) ||
+      !hasOnlyKeys(dateSchema, ['type', 'enum', 'description']) ||
+      dateSchema.type !== 'string' ||
+      !Array.isArray(dateSchema.enum) ||
+      dateSchema.enum.length !== WEB_SEARCH_DATE_RANGES.length ||
+      new Set(dateSchema.enum).size !== WEB_SEARCH_DATE_RANGES.length ||
+      !dateSchema.enum.every(isWebSearchDateRange))
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  const stringProperty = (property: Record<string, unknown> | undefined) => ({
+    type: 'string' as const,
+    ...(optionalDescription(property ?? {}) == null
+      ? {}
+      : { description: optionalDescription(property ?? {}) }),
+  });
+  const booleanProperty = (property: Record<string, unknown> | undefined) => ({
+    type: 'boolean' as const,
+    ...(optionalDescription(property ?? {}) == null
+      ? {}
+      : { description: optionalDescription(property ?? {}) }),
+  });
+  const dateDescription = isRecord(dateSchema) ? optionalDescription(dateSchema) : undefined;
+
+  return {
+    type: 'object',
+    required: ['query'],
+    properties: {
+      ...(properties.intent == null ? {} : { intent: stringProperty(properties.intent) }),
+      query: stringProperty(properties.query),
+      ...(dateSchema == null
+        ? {}
+        : {
+            date: {
+              type: 'string' as const,
+              enum: WEB_SEARCH_DATE_RANGES,
+              ...(dateDescription == null ? {} : { description: dateDescription }),
+            },
+          }),
+      ...(properties.country == null ? {} : { country: stringProperty(properties.country) }),
+      ...(properties.images == null ? {} : { images: booleanProperty(properties.images) }),
+      ...(properties.videos == null ? {} : { videos: booleanProperty(properties.videos) }),
+      ...(properties.news == null ? {} : { news: booleanProperty(properties.news) }),
+    },
+    additionalProperties: false,
+    ...(optionalDescription(schema) == null ? {} : { description: optionalDescription(schema) }),
+  } satisfies TSchema;
 }
 
 function convertPiCodeToolSchema(name: string, schema: Record<string, unknown>): TSchema {
@@ -323,6 +429,9 @@ export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   if (name === PI_BASH_TOOL_NAME || name === PI_READ_FILE_TOOL_NAME) {
     return convertPiCodeToolSchema(name, schema);
   }
+  if (name === PI_WEB_SEARCH_TOOL_NAME) {
+    return convertPiWebSearchSchema(schema);
+  }
 
   const { argument } = TOOL_FIELDS[name];
   const propertySchema = schema.properties[argument];
@@ -400,6 +509,41 @@ export function validatePiCalculatorArguments(value: unknown): PiCalculatorArgum
   return { input: value.input };
 }
 
+export function validatePiWebSearchArguments(value: unknown): PiWebSearchArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['intent', 'query', 'date', 'country', 'images', 'videos', 'news'])
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+
+  const { intent, query, date, country, images, videos, news } = value;
+  if (
+    typeof query !== 'string' ||
+    query.length === 0 ||
+    query.length > 16_384 ||
+    (intent !== undefined &&
+      (typeof intent !== 'string' || intent.length === 0 || intent.length > 1_000)) ||
+    (date !== undefined && !isWebSearchDateRange(date)) ||
+    (country !== undefined && (typeof country !== 'string' || !/^[a-z]{2}$/i.test(country))) ||
+    (images !== undefined && typeof images !== 'boolean') ||
+    (videos !== undefined && typeof videos !== 'boolean') ||
+    (news !== undefined && typeof news !== 'boolean')
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+
+  return {
+    ...(intent === undefined ? {} : { intent }),
+    query,
+    ...(date === undefined ? {} : { date }),
+    ...(country === undefined ? {} : { country }),
+    ...(images === undefined ? {} : { images }),
+    ...(videos === undefined ? {} : { videos }),
+    ...(news === undefined ? {} : { news }),
+  };
+}
+
 export function validatePiBashArguments(value: unknown): PiBashArguments {
   if (
     !isRecord(value) ||
@@ -464,6 +608,12 @@ export function validatePiToolExecutionInput(
         toolCallId,
         name: Tools.file_search,
         args: validatePiFileSearchArguments(args),
+      };
+    case PI_WEB_SEARCH_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_WEB_SEARCH_TOOL_NAME,
+        args: validatePiWebSearchArguments(args),
       };
     case PI_CALCULATOR_TOOL_NAME:
       return {

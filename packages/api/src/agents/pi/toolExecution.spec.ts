@@ -10,8 +10,8 @@ import type { LCTool } from '@librechat/agents';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionBridge } from './codeSession';
 import type { PiHostEvent } from './events';
+import { buildPiToolUsageCounts, createPiHostToolExecutor } from './toolExecution';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
-import { createPiHostToolExecutor } from './toolExecution';
 import { createPiCodeSessionBridge } from './codeSession';
 import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiHostEventSequencer } from './bridge';
@@ -35,6 +35,24 @@ const calculatorDefinition: LCTool = {
     type: 'object',
     properties: { input: { type: 'string' } },
     required: ['input'],
+  },
+};
+
+const webSearchDefinition: LCTool = {
+  name: Tools.web_search,
+  description: 'Search the configured web provider.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string' },
+      query: { type: 'string' },
+      date: { type: 'string', enum: ['h', 'd', 'w', 'm', 'y'] },
+      country: { type: 'string' },
+      images: { type: 'boolean' },
+      videos: { type: 'boolean' },
+      news: { type: 'boolean' },
+    },
+    required: ['query'],
   },
 };
 
@@ -130,6 +148,89 @@ function createHarness(
 }
 
 describe('createPiHostToolExecutor', () => {
+  it('uses independent per-tool turns for web citation anchors and restores offsets on resume', async () => {
+    const batches: ToolExecuteBatchRequest[] = [];
+    const eventSequencer = createPiHostEventSequencer(() => undefined);
+    const step = { value: 0 };
+    const executeHostToolCall = createPiHostToolBatchExecutor({
+      handler: createAuthorizedHandler(
+        { toolCallId: '', status: 'success', content: 'Tool result' },
+        batches,
+      ),
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: { user: { id: 'user-1' } },
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+    });
+    const execute = createPiHostToolExecutor({
+      createStepIdentity: () => {
+        const index = step.value++;
+        return {
+          id: `step-${index}`,
+          index,
+          messageId: 'response-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        };
+      },
+      createToolCallId: () => `host-${step.value}`,
+      executeHostToolCall,
+      handleHostEvent: eventSequencer.enqueue,
+    });
+    const [webSearch, calculator] = createPiTools({
+      definitions: [webSearchDefinition, calculatorDefinition],
+      execute,
+    });
+
+    await webSearch.execute('pi-search-1', { query: 'pump standard' });
+    await calculator.execute('pi-calculator-1', { input: '2 + 2' });
+    await webSearch.execute('pi-search-2', { query: 'latest pump standard' });
+    await eventSequencer.drain();
+
+    expect(batches.map(({ toolCalls }) => [toolCalls[0]?.name, toolCalls[0]?.turn])).toEqual([
+      [Tools.web_search, 0],
+      [PI_CALCULATOR_TOOL_NAME, 0],
+      [Tools.web_search, 1],
+    ]);
+
+    const restoredCounts = buildPiToolUsageCounts({
+      runSteps: [
+        { stepDetails: { tool_calls: [{ function: { name: Tools.web_search } }] } },
+        { stepDetails: { tool_calls: [{ function: { name: PI_CALCULATOR_TOOL_NAME } }] } },
+        { stepDetails: { tool_calls: [{ function: { name: Tools.web_search } }] } },
+      ],
+      pendingTool: { name: Tools.web_search, turn: 2 },
+    });
+    expect(restoredCounts).toEqual({ [Tools.web_search]: 3, [PI_CALCULATOR_TOOL_NAME]: 1 });
+
+    const resumeSequencer = createPiHostEventSequencer(() => undefined);
+    const resumedExecute = createPiHostToolExecutor({
+      createStepIdentity: () => {
+        const index = step.value++;
+        return {
+          id: `step-${index}`,
+          index,
+          messageId: 'response-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        };
+      },
+      createToolCallId: () => `host-${step.value}`,
+      executeHostToolCall,
+      initialToolUsageCounts: restoredCounts,
+      handleHostEvent: resumeSequencer.enqueue,
+    });
+    const [resumedWebSearch] = createPiTools({
+      definitions: [webSearchDefinition],
+      execute: resumedExecute,
+    });
+    await resumedWebSearch.execute('pi-search-3', { query: 'new pump standard' });
+    await resumeSequencer.drain();
+    expect(batches[3]?.toolCalls[0]).toMatchObject({ name: Tools.web_search, turn: 3 });
+  });
+
   it('routes calculator calls through the host authorization and step lifecycle', async () => {
     const { batches, events, eventSequencer, tool } = createHarness(
       {

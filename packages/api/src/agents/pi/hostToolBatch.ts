@@ -148,6 +148,7 @@ export function createPiHostToolBatchExecutor(
               name: hostCall.name,
               args: hostCall.args,
               stepId: hostCall.stepId,
+              ...(hostCall.turn == null ? {} : { turn: hostCall.turn }),
               ...(hostCall.codeSessionContext == null
                 ? {}
                 : { codeSessionContext: hostCall.codeSessionContext }),

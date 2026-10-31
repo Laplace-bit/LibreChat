@@ -36,7 +36,7 @@ describe('createOnSearchResults', () => {
         id: 'tool-call-1',
         name: 'web_search',
         stepId: 'step-search-1',
-        turn: 0,
+        turn: 2,
       },
     };
 
@@ -53,6 +53,11 @@ describe('createOnSearchResults', () => {
     callbacks.onGetHighlights('https://example.com');
 
     expect(mockEmitChunk).toHaveBeenCalledTimes(2);
+    expect(mockEmitChunk.mock.calls.map(([, { data }]) => data.web_search.turn)).toEqual([2, 2]);
+    expect(mockEmitChunk.mock.calls[1][1].data.web_search.organic[0]).toMatchObject({
+      link: 'https://example.com',
+      processed: true,
+    });
     for (const call of mockEmitChunk.mock.calls) {
       expect(call).toEqual([
         'conversation-1',

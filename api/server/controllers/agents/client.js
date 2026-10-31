@@ -232,6 +232,7 @@ const {
   createPiCodeSessionBridge,
   createPiToolApprovalGate,
   createPiHostToolBatchExecutor,
+  buildPiToolUsageCounts,
   settlePiHostToolResult,
   settlePiHostToolStep,
   generateAgentConversationTitle,
@@ -6197,6 +6198,13 @@ class AgentClient extends BaseClient {
         createModelBinding,
         toolDefinitions: piToolDefinitions,
         executeHostToolCall: executePiHostToolCall,
+        initialToolUsageCounts: buildPiToolUsageCounts({
+          runSteps,
+          pendingTool: {
+            name: piApprovalContinuation.toolName,
+            turn: piApprovalContinuation.toolTurn,
+          },
+        }),
         ...(piCodeSessionBridge == null
           ? {}
           : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),

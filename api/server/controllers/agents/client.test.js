@@ -1,4 +1,7 @@
 const mockCreateRun = jest.fn();
+const mockGenerateAgentConversationTitle = jest
+  .fn()
+  .mockResolvedValue({ title: 'Generated Pi Title' });
 const mockExecutePiGeneration = jest.fn();
 const mockGetAgentPiModelBindingFactory = jest.fn();
 const mockAssertPiTextOnlyCompatible = jest.fn();
@@ -289,6 +292,7 @@ jest.mock('@librechat/api', () => ({
   checkAccess: jest.fn(),
   createRun: (...args) => mockCreateRun(...args),
   assertPiTextOnlyCompatible: (...args) => mockAssertPiTextOnlyCompatible(...args),
+  generateAgentConversationTitle: (...args) => mockGenerateAgentConversationTitle(...args),
   executePiGeneration: (...args) => mockExecutePiGeneration(...args),
   getAgentPiModelBindingFactory: (...args) => mockGetAgentPiModelBindingFactory(...args),
   countFormattedMessageTokens: jest.fn(() => 42),
@@ -4354,6 +4358,101 @@ describe('AgentClient - titleConvo', () => {
 
       const call = mockRun.generateTitle.mock.calls[0][0];
       expect(call.contentParts).toEqual([{ type: 'text', text: 'Full response' }]);
+    });
+
+    it('generates immediate and final Pi titles without creating or waiting for an AgentRun', async () => {
+      client.run = null;
+      client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
+      client._waitForRun = jest.fn(() => {
+        throw new Error('Pi title generation must not wait for an AgentRun');
+      });
+      client.contentParts = [{ type: 'text', text: 'The line is back online.' }];
+
+      await client.titleConvo({
+        text: 'Why did the line stop?',
+        abortController: new AbortController(),
+        immediate: true,
+      });
+      expect(mockGenerateAgentConversationTitle).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          inputText: 'Why did the line stop?',
+          contentParts: [],
+          runId: 'response-123',
+          titleMethod: 'structured',
+        }),
+      );
+
+      await client.titleConvo({
+        text: 'Why did the line stop?',
+        abortController: new AbortController(),
+        immediate: false,
+      });
+      expect(mockGenerateAgentConversationTitle).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          contentParts: [{ type: 'text', text: 'The line is back online.' }],
+          runId: 'response-123',
+        }),
+      );
+      expect(client._waitForRun).not.toHaveBeenCalled();
+      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(client.recordCollectedUsage).toHaveBeenCalledTimes(2);
+      expect(client.recordCollectedUsage).toHaveBeenCalledWith(
+        expect.objectContaining({ context: 'title' }),
+      );
+    });
+
+    it('waits for protected private-text persistence before generating a Pi title', async () => {
+      const api = jest.requireActual('@librechat/api');
+      const filters = {
+        messages: {
+          pii: {
+            action: 'redact',
+            fields: ['text'],
+            starterPatterns: [],
+            customPatterns: [
+              { id: 'email', label: 'Email', regex: 'alice@example\\.com', category: 'email' },
+            ],
+          },
+        },
+      };
+      client.run = null;
+      client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
+      mockReq.path = '/';
+      mockReq.body.text = 'alice@example.com';
+      mockReq.body.clientRequestId = 'pi-protected-title';
+      const next = jest.fn();
+      api.createPrivateTextIngress({
+        getFilters: () => filters,
+        getLegacyPii: () => undefined,
+        getKey: () => 'cd'.repeat(32),
+      })(mockReq, { status: jest.fn().mockReturnThis(), json: jest.fn() }, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      const message = api.stampPrivateTextMessage(mockReq, {
+        messageId: 'pi-title-user',
+        conversationId: 'pi-title-conversation',
+        text: mockReq.body.text,
+        isCreatedByUser: true,
+      });
+      const title = client.titleConvo({
+        text: message.text,
+        abortController: new AbortController(),
+        immediate: true,
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
+      expect(client.recordCollectedUsage).not.toHaveBeenCalled();
+
+      const write = deferred();
+      const admission = api.requirePrivateTextPersistence(mockReq, () => write.promise);
+      await Promise.resolve();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
+      write.resolve({ message });
+      await admission;
+      await title;
+
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledTimes(1);
+      expect(client.recordCollectedUsage).toHaveBeenCalledTimes(1);
     });
 
     it('rejects promptly when aborted before the run initializes in immediate mode', async () => {
@@ -10050,14 +10149,25 @@ describe('AgentClient - Pi generation dispatch', () => {
       model: 'gpt-4o',
       provider: 'openai',
       agentId: 'agent-pi',
+      runId: 'response-pi',
     };
+    const contextUsage = {
+      runId: 'response-pi',
+      agentId: 'agent-pi',
+      breakdown: { messageTokens: 1 },
+    };
+    const eventOrder = [];
     const usageHandler = jest.fn();
+    const contextUsageHandler = jest.fn(() => eventOrder.push(UsageEvents.ON_CONTEXT_USAGE));
+    usageHandler.mockImplementation(() => eventOrder.push(UsageEvents.ON_TOKEN_USAGE));
     const client = createPiClient({
       eventHandlers: {
         [UsageEvents.ON_TOKEN_USAGE]: { handle: usageHandler },
+        [UsageEvents.ON_CONTEXT_USAGE]: { handle: contextUsageHandler },
       },
     });
     mockExecutePiGeneration.mockImplementation(async ({ handleHostEvent }) => {
+      await handleHostEvent({ event: UsageEvents.ON_CONTEXT_USAGE, data: contextUsage });
       await handleHostEvent({ event: UsageEvents.ON_TOKEN_USAGE, data: usage });
       return { status: 'completed', usage: [usage] };
     });
@@ -10069,10 +10179,24 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration).toHaveBeenCalledWith(
       expect.objectContaining({
         messages: formattedMessages,
-        usageAttribution: { provider: EModelEndpoint.openAI, agentId: 'agent-pi' },
+        usageAttribution: {
+          provider: EModelEndpoint.openAI,
+          agentId: 'agent-pi',
+          runId: 'response-pi',
+        },
+        contextUsage: expect.objectContaining({
+          runId: 'response-pi',
+          agentId: 'agent-pi',
+        }),
       }),
     );
+    expect(contextUsageHandler).toHaveBeenCalledWith(
+      UsageEvents.ON_CONTEXT_USAGE,
+      contextUsage,
+      expect.anything(),
+    );
     expect(usageHandler).toHaveBeenCalledWith(UsageEvents.ON_TOKEN_USAGE, usage, expect.anything());
+    expect(eventOrder).toEqual([UsageEvents.ON_CONTEXT_USAGE, UsageEvents.ON_TOKEN_USAGE]);
     expect(client.executionOutcome).toEqual({ engine: 'pi', status: 'completed' });
     expect(client.run).toBeUndefined();
     expect(mockCreateRun).not.toHaveBeenCalled();

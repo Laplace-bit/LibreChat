@@ -216,6 +216,7 @@ const {
   AgentRuntimeUnavailableError,
   resolveStoredAgentRuntime,
   assertPiTextOnlyCompatible,
+  generateAgentConversationTitle,
   getAgentPiModelBindingFactory,
   executePiGeneration,
 } = require('@librechat/api');
@@ -5159,6 +5160,15 @@ class AgentClient extends BaseClient {
             usageAttribution: {
               provider: this.options.agent.provider,
               agentId: this.options.agent.id,
+              runId: this.responseMessageId,
+            },
+            contextUsage: {
+              tokenCounter,
+              runId: this.responseMessageId,
+              agentId: this.options.agent.id,
+              maxContextTokens: this.maxContextTokens,
+              reserveRatio: appConfig?.summarization?.reserveRatio,
+              calibrationRatio,
             },
             createStepIdentity: () => {
               const sequence = nextStepIndex++;
@@ -6274,12 +6284,15 @@ class AgentClient extends BaseClient {
    * @param {Object} params
    * @param {string} params.text
    * @param {AbortController} params.abortController
-   * @param {boolean} [params.immediate] When true, the title is generated as soon
-   *   as the request is made — the run is awaited (instead of throwing) and the
-   *   title derives from the user's input only (`contentParts` is empty).
+   * @param {boolean} [params.immediate] When true, title generation starts with
+   *   the request and uses only the user's input (`contentParts` is empty).
+   *   Legacy waits for run initialization. Pi uses its host title adapter directly.
    */
   async titleConvo({ text, abortController, immediate = false }) {
-    if (!this.run) {
+    const runtimeResolution = resolveStoredAgentRuntime(this.options.agentRuntime);
+    const isPiRuntime =
+      runtimeResolution.status === 'resolved' && runtimeResolution.selection.engine === 'pi';
+    if (!this.run && !isPiRuntime) {
       if (!immediate) {
         throw new Error('Run not initialized');
       }
@@ -6432,7 +6445,7 @@ class AgentClient extends BaseClient {
 
     try {
       await requirePrivateTextAdmission(req, abortController.signal);
-      const titleResult = await this.run.generateTitle({
+      const titleOptions = {
         provider,
         clientOptions,
         inputText: text,
@@ -6453,7 +6466,10 @@ class AgentClient extends BaseClient {
             user_id: this.user ?? this.options.req.user?.id,
           },
         },
-      });
+      };
+      const titleResult = isPiRuntime
+        ? await generateAgentConversationTitle({ ...titleOptions, runId: this.responseMessageId })
+        : await this.run.generateTitle(titleOptions);
 
       const collectedUsage = collectedMetadata.map((item) => {
         let input_tokens, output_tokens;

@@ -33,7 +33,7 @@ describe('createPiContentEventTranslator usage mapping', () => {
         runId: 'run-1',
         agentId: 'agent-1',
       }),
-      usageAttribution: { provider: 'openAI', agentId: 'agent-1' },
+      usageAttribution: { provider: 'openAI', agentId: 'agent-1', runId: 'response-1' },
     });
 
     expect(
@@ -52,6 +52,7 @@ describe('createPiContentEventTranslator usage mapping', () => {
           model: 'gpt-4o-mini',
           provider: 'openAI',
           agentId: 'agent-1',
+          runId: 'response-1',
           input_token_details: { cache_read: 20 },
         },
       },

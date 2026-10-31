@@ -2,7 +2,7 @@ import { GraphEvents } from '@librechat/agents';
 import { ContentTypes, StepTypes, UsageEvents } from 'librechat-data-provider';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent';
-import type { Agents } from 'librechat-data-provider';
+import type { Agents, TContextUsageEvent } from 'librechat-data-provider';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 
 export type PiContentType = 'text' | 'think';
@@ -25,7 +25,7 @@ export interface PiContentEventTranslatorOptions {
   /** The host supplies job-scoped IDs and offsets; Pi never owns product identities. */
   createStepIdentity(input: PiMessageStepIdentityInput): PiMessageStepIdentity;
   /** Host-owned billing attribution; Pi's provider id is deliberately not authoritative. */
-  usageAttribution?: { provider?: string; agentId?: string };
+  usageAttribution?: { provider?: string; agentId?: string; runId?: string };
   now?: () => number;
 }
 
@@ -40,7 +40,12 @@ export interface PiHostUsageEvent {
   data: UsageMetadata;
 }
 
-export type PiHostEvent = PiHostContentEvent | PiHostUsageEvent;
+export interface PiHostContextUsageEvent {
+  event: typeof UsageEvents.ON_CONTEXT_USAGE;
+  data: TContextUsageEvent;
+}
+
+export type PiHostEvent = PiHostContentEvent | PiHostUsageEvent | PiHostContextUsageEvent;
 
 export class PiRuntimeResponseError extends Error {
   readonly code = 'PI_RESPONSE_UNSUPPORTED';
@@ -123,6 +128,7 @@ function translateAssistantUsage(
       model: message.model,
       provider: attribution?.provider ?? message.provider,
       ...(attribution?.agentId == null ? {} : { agentId: attribution.agentId }),
+      ...(attribution?.runId == null ? {} : { runId: attribution.runId }),
       ...(cacheReadTokens === 0 && cacheWriteTokens === 0
         ? {}
         : {

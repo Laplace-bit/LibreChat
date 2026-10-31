@@ -5,6 +5,7 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { UsageEvents } from 'librechat-data-provider';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
 import {
   AIMessage,
@@ -18,6 +19,7 @@ const {
   convertLibreChatHistoryToPi,
   createHostPiSession,
   executePiGeneration,
+  PiContextUsageUnavailableError,
   createPiContentEventTranslator,
   LEGACY_AGENT_RUNTIME,
   PINNED_PI_AGENT_RUNTIME,
@@ -86,7 +88,11 @@ async function createFakeOpenAIModelBinding(baseUrl, onDispose) {
   return { model, modelRuntime, dispose: onDispose };
 }
 
-async function createFakeChatServer({ toolCallOnFirst = false, responseDelayMs = 0 } = {}) {
+async function createFakeChatServer({
+  toolCallOnFirst = false,
+  responseDelayMs = 0,
+  onRequest,
+} = {}) {
   let requestCount = 0;
   const requestBodies = [];
   let authorization;
@@ -109,6 +115,7 @@ async function createFakeChatServer({ toolCallOnFirst = false, responseDelayMs =
       requestCount += 1;
       requestBodies.push(JSON.parse(body));
       authorization = request.headers.authorization;
+      onRequest?.();
       const sendResponse = () => {
         response.writeHead(200, {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -672,9 +679,16 @@ test('Pi host session sends a prompt through its bound provider and streams the 
 });
 
 test('Pi generation dispatcher streams a host-formatted turn and reports provider usage', async () => {
-  const fakeProvider = await createFakeChatServer();
-  let bindingDisposals = 0;
   const hostEvents = [];
+  let contextUsagePrecededProviderRequest = false;
+  const fakeProvider = await createFakeChatServer({
+    onRequest: () => {
+      contextUsagePrecededProviderRequest = hostEvents.some(
+        (event) => event.event === UsageEvents.ON_CONTEXT_USAGE,
+      );
+    },
+  });
+  let bindingDisposals = 0;
   let stepIndex = 0;
 
   try {
@@ -695,13 +709,28 @@ test('Pi generation dispatcher streams a host-formatted turn and reports provide
         agentId: 'dispatch-agent-1',
       }),
       usageAttribution: { provider: 'openAI', agentId: 'dispatch-agent-1' },
+      contextUsage: {
+        tokenCounter: (message) => (message._getType() === 'system' ? 18 : 27),
+        runId: 'dispatch-run-1',
+        agentId: 'dispatch-agent-1',
+        calibrationRatio: 1,
+      },
       handleHostEvent: (event) => hostEvents.push(event),
     });
 
     assert.equal(outcome.status, 'completed');
     assert.equal(fakeProvider.getRequestCount(), 1);
+    assert.equal(contextUsagePrecededProviderRequest, true);
     assert.equal(bindingDisposals, 1, 'the dispatched generation disposes its provider binding');
     assert.equal(outcome.usage.length, 1, 'provider usage is collected once per model call');
+    assert.equal(outcome.usage[0].runId, 'dispatch-run-1');
+    const contextUsageIndex = hostEvents.findIndex(
+      (event) => event.event === UsageEvents.ON_CONTEXT_USAGE,
+    );
+    const tokenUsageIndex = hostEvents.findIndex(
+      (event) => event.event === UsageEvents.ON_TOKEN_USAGE,
+    );
+    assert.ok(contextUsageIndex >= 0 && contextUsageIndex < tokenUsageIndex);
     assert.ok(
       hostEvents.some(
         (event) =>
@@ -709,6 +738,45 @@ test('Pi generation dispatcher streams a host-formatted turn and reports provide
           event.data.delta.content.some((part) => part.text === 'Pi adapter stream'),
       ),
     );
+  } finally {
+    await fakeProvider.close();
+  }
+});
+
+test('Pi dispatch fails closed before provider invocation when host context usage cannot be measured', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  const hostEvents = [];
+
+  try {
+    await assert.rejects(
+      executePiGeneration({
+        messages: [new SystemMessage('Context usage boundary.'), new HumanMessage('Say hello.')],
+        createModelBinding: () =>
+          createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+            bindingDisposals += 1;
+          }),
+        createStepIdentity: () => ({
+          id: 'unmeasured-step',
+          index: 0,
+          messageId: 'unmeasured-message',
+          runId: 'unmeasured-run',
+          agentId: 'unmeasured-agent',
+        }),
+        usageAttribution: { provider: 'openAI', agentId: 'unmeasured-agent' },
+        contextUsage: {
+          tokenCounter: () => Number.NaN,
+          runId: 'unmeasured-run',
+          agentId: 'unmeasured-agent',
+        },
+        handleHostEvent: (event) => hostEvents.push(event),
+      }),
+      (error) => error instanceof PiContextUsageUnavailableError,
+    );
+
+    assert.equal(fakeProvider.getRequestCount(), 0, 'Pi fails before contacting the provider');
+    assert.equal(hostEvents.length, 0, 'the host does not receive a false context snapshot');
+    assert.equal(bindingDisposals, 1, 'the untransferred binding is disposed after the failure');
   } finally {
     await fakeProvider.close();
   }

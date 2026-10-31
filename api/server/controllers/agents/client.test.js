@@ -37,6 +37,7 @@ const {
 const {
   GenerationJobManager,
   PINNED_PI_AGENT_RUNTIME,
+  PI_SET_MEMORY_TOOL_NAME,
   createStreamServices,
   createToolExecuteHandler,
   registerToolApprovalHook,
@@ -10325,6 +10326,18 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['skillName'],
     },
   };
+  const setMemoryDefinition = {
+    name: PI_SET_MEMORY_TOOL_NAME,
+    description: 'Save user memory.',
+    parameters: {
+      type: 'object',
+      properties: {
+        key: { type: 'string', description: 'Memory key.' },
+        value: { type: 'string', description: 'Memory value.' },
+      },
+      required: ['key', 'value'],
+    },
+  };
   const mcpToolName = `lookup${Constants.mcp_delimiter}inventory`;
   const mcpToolDefinition = {
     name: mcpToolName,
@@ -10768,6 +10781,80 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
       calculatorDefinition,
     ]);
+  });
+
+  it('routes inline memory writes through the authorized host tool handler', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+    };
+    const memoryArtifact = {
+      [Tools.memory]: {
+        key: 'preferred_line',
+        type: 'update',
+        value: 'The operator prefers summaries before detailed tables.',
+      },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Memory set for key "preferred_line"',
+            artifact: memoryArtifact,
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: Tools.memory }],
+        toolDefinitions: [setMemoryDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      toolResult = await input.executeHostToolCall(
+        {
+          id: 'host-memory-call',
+          name: PI_SET_MEMORY_TOOL_NAME,
+          args: {
+            key: 'preferred_line',
+            value: 'The operator prefers summaries before detailed tables.',
+          },
+          stepId: 'host-memory-step',
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-memory-call',
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: {
+          key: 'preferred_line',
+          value: 'The operator prefers summaries before detailed tables.',
+        },
+        stepId: 'host-memory-step',
+      },
+    ]);
+    expect(toolResult).toMatchObject({
+      status: 'success',
+      content: 'Memory set for key "preferred_line"',
+      artifact: memoryArtifact,
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([setMemoryDefinition]);
   });
 
   it('loads an authorized LibreChat skill into Pi through the host handler', async () => {

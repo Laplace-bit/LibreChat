@@ -15,7 +15,9 @@ import {
 import {
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
+  PI_DELETE_MEMORY_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
 } from './toolNames';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
@@ -87,6 +89,29 @@ const skillDefinition: LCTool = {
       args: { type: 'string' },
     },
     required: ['skillName'],
+  },
+};
+
+const setMemoryDefinition: LCTool = {
+  name: PI_SET_MEMORY_TOOL_NAME,
+  description: 'Save user memory.',
+  parameters: {
+    type: 'object',
+    properties: {
+      key: { type: 'string', description: 'Memory key.' },
+      value: { type: 'string', description: 'Memory value.' },
+    },
+    required: ['key', 'value'],
+  },
+};
+
+const deleteMemoryDefinition: LCTool = {
+  name: PI_DELETE_MEMORY_TOOL_NAME,
+  description: 'Delete user memory.',
+  parameters: {
+    type: 'object',
+    properties: { key: { type: 'string', description: 'Memory key.' } },
+    required: ['key'],
   },
 };
 
@@ -230,6 +255,61 @@ describe('createPiTools', () => {
       },
       undefined,
     );
+  });
+
+  it('adapts inline memory tools with strict schemas and host-only arguments', async () => {
+    const execute = hostExecutor();
+    const [setMemory, deleteMemory] = createPiTools({
+      definitions: [setMemoryDefinition, deleteMemoryDefinition],
+      execute,
+    });
+
+    expect(setMemory).toMatchObject({
+      name: PI_SET_MEMORY_TOOL_NAME,
+      executionMode: 'sequential',
+      parameters: {
+        type: 'object',
+        required: ['key', 'value'],
+        additionalProperties: false,
+      },
+    });
+    expect(deleteMemory).toMatchObject({
+      name: PI_DELETE_MEMORY_TOOL_NAME,
+      executionMode: 'sequential',
+      parameters: { type: 'object', required: ['key'], additionalProperties: false },
+    });
+
+    await setMemory.execute('pi-memory-set', {
+      key: 'preferred_line',
+      value: 'The operator prefers summaries before detailed tables.',
+    });
+    await deleteMemory.execute('pi-memory-delete', { key: 'obsolete_line' });
+
+    expect(execute).toHaveBeenNthCalledWith(
+      1,
+      {
+        toolCallId: 'pi-memory-set',
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: {
+          key: 'preferred_line',
+          value: 'The operator prefers summaries before detailed tables.',
+        },
+      },
+      undefined,
+    );
+    expect(execute).toHaveBeenNthCalledWith(
+      2,
+      {
+        toolCallId: 'pi-memory-delete',
+        name: PI_DELETE_MEMORY_TOOL_NAME,
+        args: { key: 'obsolete_line' },
+      },
+      undefined,
+    );
+    await expect(
+      setMemory.execute('pi-memory-extra', { key: 'x', value: 'y', extra: true }),
+    ).rejects.toMatchObject({ code: 'PI_TOOL_ARGUMENTS_INVALID' });
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 
   it('routes the host skill tool with bounded arguments and no Pi-local skill lookup', async () => {

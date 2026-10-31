@@ -10,8 +10,8 @@ import type { LCTool } from '@librechat/agents';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionBridge } from './codeSession';
 import type { PiHostEvent } from './events';
+import { PI_CALCULATOR_TOOL_NAME, PI_SET_MEMORY_TOOL_NAME, PI_SKILL_TOOL_NAME } from './toolNames';
 import { buildPiToolUsageCounts, createPiHostToolExecutor } from './toolExecution';
-import { PI_CALCULATOR_TOOL_NAME, PI_SKILL_TOOL_NAME } from './toolNames';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiCodeSessionBridge } from './codeSession';
 import { createPiHostEventSequencer } from './bridge';
@@ -77,6 +77,19 @@ const skillDefinition: LCTool = {
       args: { type: 'string' },
     },
     required: ['skillName'],
+  },
+};
+
+const setMemoryDefinition: LCTool = {
+  name: PI_SET_MEMORY_TOOL_NAME,
+  description: 'Save user memory.',
+  parameters: {
+    type: 'object',
+    properties: {
+      key: { type: 'string' },
+      value: { type: 'string' },
+    },
+    required: ['key', 'value'],
   },
 };
 
@@ -195,6 +208,49 @@ describe('createPiHostToolExecutor', () => {
       (event) => event.event === GraphEvents.ON_RUN_STEP_COMPLETED,
     );
     expect(completed?.data.result.tool_call?.output).toBe('Skill "maintenance" loaded.');
+  });
+
+  it('sends inline memory writes through the host executor and keeps artifacts out of model text', async () => {
+    const memoryArtifact = {
+      [Tools.memory]: {
+        key: 'preferred_line',
+        type: 'update',
+        value: 'The operator prefers summaries before detailed tables.',
+      },
+    };
+    const harness = createHarness(
+      {
+        toolCallId: '',
+        status: 'success',
+        content: 'Memory set for key "preferred_line"',
+        artifact: memoryArtifact,
+      },
+      undefined,
+      setMemoryDefinition,
+    );
+
+    const toolResult = await harness.tool.execute('pi-memory-set', {
+      key: 'preferred_line',
+      value: 'The operator prefers summaries before detailed tables.',
+    });
+    await harness.eventSequencer.drain();
+
+    expect(harness.batches[0]?.toolCalls).toMatchObject([
+      {
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: {
+          key: 'preferred_line',
+          value: 'The operator prefers summaries before detailed tables.',
+        },
+      },
+    ]);
+    expect(toolResult.content).toEqual([
+      { type: 'text', text: 'Memory set for key "preferred_line"' },
+    ]);
+    const completed = harness.events.find(
+      (event) => event.event === GraphEvents.ON_RUN_STEP_COMPLETED,
+    );
+    expect(completed?.data.result.tool_call?.output).toBe('Memory set for key "preferred_line"');
   });
 
   it('fails closed when a host tool returns an unsupported injected message', async () => {

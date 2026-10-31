@@ -7,7 +7,9 @@ import type {
   PiCalculatorArguments,
   PiFileSearchArguments,
   PiHostToolExecutionInput,
+  PiDeleteMemoryArguments,
   PiReadFileArguments,
+  PiSetMemoryArguments,
   PiSkillArguments,
   PiWebSearchArguments,
   PiToolArguments,
@@ -25,7 +27,9 @@ import type { PiHostEvent } from './events';
 import {
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
+  PI_DELETE_MEMORY_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
   isPiSupportedHostToolName,
@@ -100,6 +104,20 @@ export type PiHostToolCall =
       stepId: string;
       turn?: number;
       codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      id: string;
+      name: typeof PI_SET_MEMORY_TOOL_NAME;
+      args: PiSetMemoryArguments;
+      stepId: string;
+      turn?: number;
+    }
+  | {
+      id: string;
+      name: typeof PI_DELETE_MEMORY_TOOL_NAME;
+      args: PiDeleteMemoryArguments;
+      stepId: string;
+      turn?: number;
     }
   | {
       kind: 'mcp';
@@ -372,6 +390,22 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    case PI_SET_MEMORY_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: input.args,
+        hostExecution,
+        review,
+      };
+    case PI_DELETE_MEMORY_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_DELETE_MEMORY_TOOL_NAME,
+        args: input.args,
+        hostExecution,
+        review,
+      };
     default:
       throw new Error('The Pi approval call has no host tool adapter.');
   }
@@ -434,6 +468,22 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
       return {
         id,
         name: PI_SKILL_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_SET_MEMORY_TOOL_NAME:
+      return {
+        id,
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_DELETE_MEMORY_TOOL_NAME:
+      return {
+        id,
+        name: PI_DELETE_MEMORY_TOOL_NAME,
         args: input.args,
         stepId,
         turn: input.turn,

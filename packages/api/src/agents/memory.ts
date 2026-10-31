@@ -38,6 +38,7 @@ import type { Response as ServerResponse } from 'express';
 import type { ServerRequest, RunLLMConfig } from '~/types';
 import { resolveConfigHeaders, createSafeUser, getSafeErrorMetadata, writeGuarded } from '~/utils';
 import { contentFilterModelBoundBlockResponse } from '~/middleware/contentFilter';
+import { DELETE_MEMORY_TOOL_NAME, SET_MEMORY_TOOL_NAME } from './memoryToolNames';
 import { extractMemoryContent } from '~/protection/adapters/submissions';
 import { assertModelBoundContent } from '~/middleware/modelBoundContent';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
@@ -45,6 +46,8 @@ import { inspectContent } from '~/protection/runtime';
 import { checkAccess } from '~/middleware/access';
 import { isMemoryEnabled } from '~/memory';
 import Tokenizer from '~/utils/tokenizer';
+
+export { DELETE_MEMORY_TOOL_NAME, SET_MEMORY_TOOL_NAME } from './memoryToolNames';
 
 type RequiredMemoryMethods = Pick<
   MemoryMethods,
@@ -89,9 +92,6 @@ export function formatMemoryContext(
   }
   return `${memoryInstructions}\n\n# Existing memory about the user:\n${memory}`;
 }
-
-export const SET_MEMORY_TOOL_NAME = 'set_memory';
-export const DELETE_MEMORY_TOOL_NAME = 'delete_memory';
 
 /** Maximum memory key length, matching the REST memory routes. */
 const MEMORY_KEY_CHAR_LIMIT = 1000;

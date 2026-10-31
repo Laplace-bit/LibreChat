@@ -1,6 +1,7 @@
 import { DATE_RANGE, Constants } from '@librechat/agents';
 import { Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
+import type { PiDeleteMemoryArguments, PiSetMemoryArguments } from './tools';
 import type { PiPauseToolCall } from './pause';
 import {
   appendPiToolResultContinuation,
@@ -11,10 +12,14 @@ import {
   resolvePiApprovalContinuation,
   resolvePiApprovalDecision,
 } from './resume';
+import {
+  PI_DELETE_MEMORY_TOOL_NAME,
+  PI_SET_MEMORY_TOOL_NAME,
+  PI_SKILL_TOOL_NAME,
+} from './toolNames';
 import { createPiMcpToolSchemaRegistry } from './mcpSchema';
 import { buildPendingAction } from '~/agents/hitl/policy';
 import { createPiPauseController } from './pause';
-import { PI_SKILL_TOOL_NAME } from './toolNames';
 
 function createApproval() {
   const toolCall: PiPauseToolCall = {
@@ -225,6 +230,99 @@ describe('Pi approval continuation', () => {
               stepId: 'skill-step',
               name: PI_SKILL_TOOL_NAME,
               args: JSON.stringify(toolCall.args),
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it.each([
+    [PI_SET_MEMORY_TOOL_NAME, { key: 'preferred_line', value: 'Summaries first.' }],
+    [PI_DELETE_MEMORY_TOOL_NAME, { key: 'obsolete_line' }],
+  ])('preserves %s through the existing approval continuation shape', (name, args) => {
+    const toolCall = {
+      toolCallId: `pi-${name}-call`,
+      name,
+      args,
+      hostExecution: {
+        toolCallId: `host-${name}-call`,
+        toolTurn: 0,
+        stepIdentity: {
+          id: `${name}-step`,
+          index: 0,
+          messageId: 'response-1',
+          runId: 'response-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 100,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] as const },
+    } as PiPauseToolCall;
+    const payload =
+      name === PI_SET_MEMORY_TOOL_NAME
+        ? buildPiApprovalInterruptPayload({
+            hostToolCallId: toolCall.hostExecution.toolCallId,
+            toolName: PI_SET_MEMORY_TOOL_NAME,
+            args: args as PiSetMemoryArguments,
+            allowedDecisions: toolCall.review.allowedDecisions,
+          })
+        : buildPiApprovalInterruptPayload({
+            hostToolCallId: toolCall.hostExecution.toolCallId,
+            toolName: PI_DELETE_MEMORY_TOOL_NAME,
+            args: args as PiDeleteMemoryArguments,
+            allowedDecisions: toolCall.review.allowedDecisions,
+          });
+    const pendingAction = buildPendingAction(payload, {
+      streamId: 'conversation-1',
+      conversationId: 'conversation-1',
+      runId: 'response-1',
+      responseMessageId: 'response-1',
+    });
+    const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+    const serializedArgs = JSON.stringify(toolCall.args);
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      matchesPiApprovalHostState({
+        continuation,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+        runSteps: [
+          {
+            id: `${name}-step`,
+            runId: 'response-1',
+            agentId: 'agent-1',
+            type: 'tool_calls',
+            index: 0,
+            created_at: 100,
+            status: 'in_progress',
+            stepDetails: {
+              type: 'tool_calls',
+              tool_calls: [
+                {
+                  id: `host-${name}-call`,
+                  function: { name, arguments: args },
+                },
+              ],
+            },
+          },
+        ],
+        aggregatedContent: [
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: `host-${name}-call`,
+              stepId: `${name}-step`,
+              name,
+              args: serializedArgs,
             },
           },
         ],

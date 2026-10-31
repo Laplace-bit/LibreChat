@@ -18,7 +18,9 @@ import {
   isPiSupportedHostToolName,
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
+  PI_DELETE_MEMORY_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
@@ -56,13 +58,18 @@ export type PiSkillArguments = {
   args?: string;
 };
 
+export type PiSetMemoryArguments = { key: string; value: string };
+export type PiDeleteMemoryArguments = { key: string };
+
 export type PiBuiltInToolArguments =
   | PiFileSearchArguments
   | PiWebSearchArguments
   | PiCalculatorArguments
   | PiBashArguments
   | PiReadFileArguments
-  | PiSkillArguments;
+  | PiSkillArguments
+  | PiSetMemoryArguments
+  | PiDeleteMemoryArguments;
 
 export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments;
 
@@ -98,6 +105,16 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof PI_SKILL_TOOL_NAME;
       args: PiSkillArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_SET_MEMORY_TOOL_NAME;
+      args: PiSetMemoryArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_DELETE_MEMORY_TOOL_NAME;
+      args: PiDeleteMemoryArguments;
     }
   | {
       kind: 'mcp';
@@ -165,6 +182,14 @@ const TOOL_FIELDS = {
   [PI_SKILL_TOOL_NAME]: {
     label: 'Load skill',
     description: 'Load an accessible LibreChat skill into this conversation.',
+  },
+  [PI_SET_MEMORY_TOOL_NAME]: {
+    label: 'Save memory',
+    description: 'Save user memory through LibreChat’s authorized memory service.',
+  },
+  [PI_DELETE_MEMORY_TOOL_NAME]: {
+    label: 'Delete memory',
+    description: 'Delete user memory through LibreChat’s authorized memory service.',
   },
 } as const;
 
@@ -506,6 +531,41 @@ function convertPiSkillSchema(schema: Record<string, unknown>): TSchema {
   } satisfies TSchema;
 }
 
+function convertPiMemorySchema(name: string, schema: Record<string, unknown>): TSchema {
+  const expectedFields =
+    name === PI_SET_MEMORY_TOOL_NAME ? (['key', 'value'] as const) : (['key'] as const);
+  const properties = schema.properties;
+  const required = schema.required;
+  if (
+    !isRecord(properties) ||
+    !hasOnlyKeys(properties, expectedFields) ||
+    !Array.isArray(required) ||
+    required.length !== expectedFields.length ||
+    expectedFields.some((field) => !required.includes(field)) ||
+    expectedFields.some((field) => !isStringProperty(properties[field])) ||
+    (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  const description = optionalDescription(schema);
+  const convertedProperties: Record<string, { type: 'string'; description?: string }> = {};
+  for (const field of expectedFields) {
+    const propertyDescription = optionalDescription(properties[field] as Record<string, unknown>);
+    convertedProperties[field] = {
+      type: 'string',
+      ...(propertyDescription == null ? {} : { description: propertyDescription }),
+    };
+  }
+  return {
+    type: 'object',
+    required: [...expectedFields],
+    properties: convertedProperties,
+    additionalProperties: false,
+    ...(description == null ? {} : { description }),
+  } satisfies TSchema;
+}
+
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   if (isPiMcpToolName(name)) {
@@ -532,6 +592,9 @@ export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   }
   if (name === PI_SKILL_TOOL_NAME) {
     return convertPiSkillSchema(schema);
+  }
+  if (name === PI_SET_MEMORY_TOOL_NAME || name === PI_DELETE_MEMORY_TOOL_NAME) {
+    return convertPiMemorySchema(name, schema);
   }
   if (name === PI_WEB_SEARCH_TOOL_NAME) {
     return convertPiWebSearchSchema(schema);
@@ -717,6 +780,35 @@ export function validatePiSkillArguments(value: unknown): PiSkillArguments {
   };
 }
 
+const MAX_PI_MEMORY_KEY_CHARS = 1_000;
+const MAX_PI_MEMORY_VALUE_CHARS = 10_000_000;
+
+export function validatePiSetMemoryArguments(value: unknown): PiSetMemoryArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['key', 'value']) ||
+    typeof value.key !== 'string' ||
+    value.key.length > MAX_PI_MEMORY_KEY_CHARS ||
+    typeof value.value !== 'string' ||
+    value.value.length > MAX_PI_MEMORY_VALUE_CHARS
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return { key: value.key, value: value.value };
+}
+
+export function validatePiDeleteMemoryArguments(value: unknown): PiDeleteMemoryArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['key']) ||
+    typeof value.key !== 'string' ||
+    value.key.length > MAX_PI_MEMORY_KEY_CHARS
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return { key: value.key };
+}
+
 export function validatePiToolExecutionInput(
   name: string,
   toolCallId: string,
@@ -763,6 +855,18 @@ export function validatePiToolExecutionInput(
         toolCallId,
         name: PI_SKILL_TOOL_NAME,
         args: validatePiSkillArguments(args),
+      };
+    case PI_SET_MEMORY_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_SET_MEMORY_TOOL_NAME,
+        args: validatePiSetMemoryArguments(args),
+      };
+    case PI_DELETE_MEMORY_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_DELETE_MEMORY_TOOL_NAME,
+        args: validatePiDeleteMemoryArguments(args),
       };
     default: {
       if (!isPiMcpToolName(name)) {

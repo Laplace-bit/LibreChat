@@ -1,14 +1,16 @@
-import { StandardGraph } from '@librechat/agents';
+import { Constants, StandardGraph } from '@librechat/agents';
 import { StepTypes, readScheduleMCPReceipts } from 'librechat-data-provider';
+import type { ToolExecuteResult } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type { Redis, Cluster } from 'ioredis';
 import type { SteerQueueItem, SteerReceipt } from '../interfaces/IJobStore';
+import type { PiPauseToolCall } from '~/agents/pi/pause';
 import {
   JobStatusTransitionDeadlineError,
   PAUSE_PERSISTENCE_TIMEOUT_ERROR,
   STEER_ENQUEUE_RECEIPT_FULL,
 } from '../interfaces/IJobStore';
-import { clearRedisTestPrefix } from './helpers/redis';
+import { clearRedisTestPrefix, createRedisTestClient } from './helpers/redis';
 
 /** Suppress winston Console transport output (survives jest.resetModules) */
 jest.spyOn(console, 'log').mockImplementation();
@@ -3741,101 +3743,314 @@ describe('RedisJobStore Integration Tests', () => {
     });
 
     describe('Pi approval lifecycle concurrency', () => {
-      test('allows only one Redis-backed replica to resume a Pi approval action', async () => {
+      test('only the Redis CAS winner resumes Pi and invokes Code API with the saved session', async () => {
         if (!ioredisClient) {
           return;
         }
 
-        const [{ RedisJobStore }, { ApprovalLifecycle }] = await Promise.all([
+        const [
+          { RedisJobStore },
+          { ApprovalLifecycle },
+          {
+            buildPiApprovalInterruptPayload,
+            createPiApprovalContinuation,
+            resolvePiApprovalContinuation,
+          },
+          { createPiCodeSessionBridge },
+          { assertCodeExecutionApprovalBinding, captureCodeExecutionApprovalBinding },
+          { buildPendingAction: buildToolPendingAction },
+        ] = await Promise.all([
           import('../implementations/RedisJobStore'),
           import('../ApprovalLifecycle'),
+          import('../../agents/pi/resume'),
+          import('../../agents/pi/codeSession'),
+          import('../../agents/execution'),
+          import('../../agents/hitl/policy'),
         ]);
-        const replicaAClient = ioredisClient.duplicate();
-        const replicaBClient = ioredisClient.duplicate();
+        const keyPrefix = String(ioredisClient.options.keyPrefix ?? '');
+        const replicaAClient = createRedisTestClient(keyPrefix);
+        const replicaBClient = createRedisTestClient(keyPrefix);
         const replicaAStore = new RedisJobStore(replicaAClient);
         const replicaBStore = new RedisJobStore(replicaBClient);
 
         try {
+          await Promise.all([replicaAClient.connect(), replicaBClient.connect()]);
           await Promise.all([replicaAStore.initialize(), replicaBStore.initialize()]);
 
           const streamId = `pi-approval-race-${Date.now()}`;
-          const job = await replicaAStore.createJob(streamId, 'resume-user', streamId, 'tenant-1');
-          const pendingAction: Agents.PendingAction = {
-            ...buildPendingAction(streamId),
-            payload: {
-              type: 'tool_approval',
-              action_requests: [
-                {
-                  name: 'bash_tool',
-                  arguments: { command: 'echo approved' },
-                  tool_call_id: 'pi-tool-call',
-                },
-              ],
-              review_configs: [
-                {
-                  action_name: 'bash_tool',
-                  tool_call_id: 'pi-tool-call',
-                  allowed_decisions: ['approve'],
-                },
-              ],
+          const agentId = 'agent-managed-code';
+          const responseMessageId = `response-${streamId}`;
+          const managedCodeAgent = {
+            id: agentId,
+            codeExecutionContext: {
+              baseUrl: 'https://managed-code.example/v1',
+              codeSessionKey: 'execute_code',
+              executionProfile: 'default' as const,
+              statefulSessions: false,
             },
           };
-          const piResumeContinuation = {
-            version: 1,
-            actionId: pendingAction.actionId,
-          };
-          expect(
-            await replicaAStore.transitionStatus(streamId, {
-              from: 'running',
-              to: 'requires_action',
-              expectCreatedAt: job.createdAt,
-              patch: {
-                pendingAction,
-                pendingActionId: pendingAction.actionId,
-                piResumeContinuation,
+          const codeExecutionBinding = captureCodeExecutionApprovalBinding([managedCodeAgent], {
+            includeManagedStateless: true,
+          });
+          if (codeExecutionBinding == null) {
+            throw new Error('The managed stateless Code API target did not produce a binding');
+          }
+          const codeSessionContext = {
+            session_id: `managed-session-${streamId}`,
+            files: [
+              {
+                id: 'input-file',
+                resource_id: 'resume-user',
+                name: 'input.csv',
+                storage_session_id: 'upload-session',
+                kind: 'user' as const,
               },
+            ],
+          };
+          const toolCall: PiPauseToolCall = {
+            toolCallId: 'pi-bash-call',
+            name: Constants.BASH_TOOL,
+            args: { command: 'python analyze.py input.csv' },
+            codeSessionContext,
+            hostExecution: {
+              toolCallId: 'host-bash-call',
+              toolTurn: 0,
+              stepIdentity: {
+                id: 'pi-bash-step',
+                index: 0,
+                messageId: responseMessageId,
+                runId: responseMessageId,
+                agentId,
+              },
+              createdAt: Date.now(),
+            },
+            review: { allowedDecisions: ['approve', 'reject'] },
+          };
+          const pendingAction = buildToolPendingAction(
+            buildPiApprovalInterruptPayload({
+              hostToolCallId: toolCall.hostExecution.toolCallId,
+              toolName: toolCall.name,
+              args: toolCall.args,
+              allowedDecisions: toolCall.review.allowedDecisions,
+            }),
+            {
+              streamId,
+              conversationId: streamId,
+              runId: responseMessageId,
+              responseMessageId,
+              codeExecutionBinding,
+            },
+          );
+          const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+          const job = await replicaAStore.createJob(streamId, 'resume-user', streamId, 'tenant-1', {
+            agent_id: agentId,
+            responseMessageId,
+          });
+          const replicaA = new ApprovalLifecycle(replicaAStore);
+          const replicaB = new ApprovalLifecycle(replicaBStore);
+          expect(
+            await replicaA.pause(streamId, pendingAction, {
+              expectedCreatedAt: job.createdAt,
+              piResumeContinuation: continuation,
             }),
           ).toBe(true);
 
-          const onResumedA = jest.fn();
-          const onResumedB = jest.fn();
-          const replicaA = new ApprovalLifecycle(replicaAStore, { onResumed: onResumedA });
-          const replicaB = new ApprovalLifecycle(replicaBStore, { onResumed: onResumedB });
-          let hostToolSideEffects = 0;
-          const resolveOnReplica = async (
-            replica: InstanceType<typeof ApprovalLifecycle>,
+          const readValidatedContinuation = async (store: InstanceType<typeof RedisJobStore>) => {
+            const pausedJob = await store.getJob(streamId);
+            if (pausedJob?.status !== 'requires_action' || pausedJob.pendingAction == null) {
+              throw new Error('Replica did not observe the paused Pi approval');
+            }
+            const validatedContinuation = resolvePiApprovalContinuation({
+              value: pausedJob.piResumeContinuation,
+              pendingAction: pausedJob.pendingAction,
+              responseMessageId,
+              agentId,
+            });
+            if (
+              validatedContinuation == null ||
+              pausedJob.pendingAction.codeExecutionBinding == null
+            ) {
+              throw new Error('Replica could not validate the Pi approval envelope');
+            }
+            return {
+              pendingAction: pausedJob.pendingAction,
+              continuation: validatedContinuation,
+              binding: pausedJob.pendingAction.codeExecutionBinding,
+            };
+          };
+          const [preparedA, preparedB] = await Promise.all([
+            readValidatedContinuation(replicaAStore),
+            readValidatedContinuation(replicaBStore),
+          ]);
+          expect(preparedA.continuation).toEqual(continuation);
+          expect(preparedB.continuation).toEqual(continuation);
+          expect(preparedA.binding).toEqual(codeExecutionBinding);
+          expect(preparedB.binding).toEqual(codeExecutionBinding);
+
+          let arrivals = 0;
+          let releaseRace!: () => void;
+          const raceBarrier = new Promise<void>((resolve) => {
+            releaseRace = resolve;
+          });
+          const awaitRaceBarrier = async () => {
+            arrivals += 1;
+            if (arrivals === 2) {
+              releaseRace();
+            }
+            await raceBarrier;
+          };
+          let casAttempts = 0;
+          let releaseCasRace!: () => void;
+          const casRaceBarrier = new Promise<void>((resolve) => {
+            releaseCasRace = resolve;
+          });
+          const holdApprovalCasUntilBothReplicasArrive = async () => {
+            casAttempts += 1;
+            if (casAttempts === 2) {
+              releaseCasRace();
+            }
+            await casRaceBarrier;
+          };
+          for (const store of [replicaAStore, replicaBStore]) {
+            const transitionStatus = store.transitionStatus.bind(store);
+            jest
+              .spyOn(store, 'transitionStatus')
+              .mockImplementation(async (targetStreamId, args) => {
+                if (
+                  targetStreamId === streamId &&
+                  args.from === 'requires_action' &&
+                  args.to === 'running'
+                ) {
+                  await holdApprovalCasUntilBothReplicasArrive();
+                }
+                return transitionStatus(targetStreamId, args);
+              });
+          }
+          const providerStarts: string[] = [];
+          const hostCodeApiCalls: Array<{
+            providerExecutionId: string;
+            hostToolCall: unknown;
+            sessionContext: unknown;
+            binding: unknown;
+          }> = [];
+          const resumeOnReplica = async (
+            store: InstanceType<typeof RedisJobStore>,
+            approvals: InstanceType<typeof ApprovalLifecycle>,
+            prepared: Awaited<ReturnType<typeof readValidatedContinuation>>,
             providerExecutionId: string,
           ) => {
-            const won = await replica.resolve(
+            await awaitRaceBarrier();
+            const won = await approvals.resolve(
               streamId,
               pendingAction.actionId,
-              { providerExecutionId },
+              { providerExecutionId, providerDrained: true },
               job.createdAt,
             );
-            if (won) {
-              hostToolSideEffects += 1;
+            if (!won) {
+              return false;
             }
-            return won;
+
+            assertCodeExecutionApprovalBinding(prepared.binding, [managedCodeAgent], {
+              includeManagedStateless: true,
+            });
+            if (
+              !(await store.beginProviderExecution(streamId, job.createdAt, providerExecutionId))
+            ) {
+              throw new Error('The winning Pi approval could not start its provider segment');
+            }
+            providerStarts.push(providerExecutionId);
+            try {
+              const codeSessionBridge = createPiCodeSessionBridge(
+                prepared.continuation.codeSessionContext,
+              );
+              expect(codeSessionBridge.snapshot()).toEqual(codeSessionContext);
+              await codeSessionBridge.execute(
+                {
+                  id: prepared.continuation.hostToolCallId,
+                  name: prepared.continuation.toolName,
+                  args: prepared.continuation.args,
+                  stepId: prepared.continuation.stepIdentity.id,
+                },
+                async (call) => {
+                  hostCodeApiCalls.push({
+                    providerExecutionId,
+                    hostToolCall: {
+                      id: call.id,
+                      name: call.name,
+                      args: call.args,
+                      stepId: call.stepId,
+                    },
+                    sessionContext: call.codeSessionContext,
+                    binding: prepared.binding,
+                  });
+                  return {
+                    toolCallId: call.id,
+                    status: 'success',
+                    content: 'analysis complete',
+                    artifact: { session_id: codeSessionContext.session_id, files: [] },
+                  } satisfies ToolExecuteResult;
+                },
+              );
+            } finally {
+              await store.markProviderExecutionDrained(
+                streamId,
+                job.createdAt,
+                providerExecutionId,
+              );
+            }
+            return true;
           };
 
           const results = await Promise.all([
-            resolveOnReplica(replicaA, 'provider-replica-a'),
-            resolveOnReplica(replicaB, 'provider-replica-b'),
+            resumeOnReplica(replicaAStore, replicaA, preparedA, 'provider-replica-a'),
+            resumeOnReplica(replicaBStore, replicaB, preparedB, 'provider-replica-b'),
           ]);
           const resumedJob = await replicaAStore.getJob(streamId);
 
           expect(results.filter(Boolean)).toHaveLength(1);
-          expect(hostToolSideEffects).toBe(1);
-          expect(onResumedA.mock.calls.length + onResumedB.mock.calls.length).toBe(1);
-          expect(resumedJob).toMatchObject({ status: 'running' });
-          expect(resumedJob?.providerExecutionId).toBe(
-            results[0] ? 'provider-replica-a' : 'provider-replica-b',
-          );
+          expect(casAttempts).toBe(2);
+          const winningProviderExecutionId = results[0]
+            ? 'provider-replica-a'
+            : 'provider-replica-b';
+          expect(providerStarts).toEqual([winningProviderExecutionId]);
+          expect(hostCodeApiCalls).toEqual([
+            {
+              providerExecutionId: winningProviderExecutionId,
+              hostToolCall: {
+                id: toolCall.hostExecution.toolCallId,
+                name: toolCall.name,
+                args: toolCall.args,
+                stepId: toolCall.hostExecution.stepIdentity.id,
+              },
+              sessionContext: codeSessionContext,
+              binding: codeExecutionBinding,
+            },
+          ]);
+          expect(resumedJob).toMatchObject({ status: 'running', providerDrained: true });
+          expect(resumedJob?.providerExecutionId).toBe(winningProviderExecutionId);
           expect(resumedJob?.pendingAction).toBeUndefined();
           expect(resumedJob?.piResumeContinuation).toBeUndefined();
+
+          const replayingReplica = results[0] ? replicaA : replicaB;
+          expect(
+            await replayingReplica.resolve(
+              streamId,
+              pendingAction.actionId,
+              { providerExecutionId: 'provider-replay', providerDrained: true },
+              job.createdAt,
+            ),
+          ).toBe(false);
+          expect(providerStarts).toHaveLength(1);
+          expect(hostCodeApiCalls).toHaveLength(1);
         } finally {
-          await Promise.all([replicaAStore.destroy(), replicaBStore.destroy()]);
-          await Promise.all([replicaAClient.quit(), replicaBClient.quit()]);
+          try {
+            await Promise.all([replicaAStore.destroy(), replicaBStore.destroy()]);
+          } finally {
+            await Promise.all([
+              replicaAClient.quit().catch(() => replicaAClient.disconnect()),
+              replicaBClient.quit().catch(() => replicaBClient.disconnect()),
+            ]);
+          }
         }
       });
     });

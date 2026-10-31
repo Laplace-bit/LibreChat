@@ -5064,6 +5064,7 @@ class AgentClient extends BaseClient {
             loadedAgentIds: agents.map((agent) => agent?.id),
             callableToolNames,
             supportedToolNames: piToolDefinitions.map((definition) => definition.name),
+            toolApprovalRequired: effectiveToolApprovalPolicy?.enabled === true,
             unsupportedModes,
           });
           piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);

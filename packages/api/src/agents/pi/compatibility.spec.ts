@@ -7,6 +7,7 @@ describe('assertPiCompatible', () => {
     loadedAgentIds: ['agent-root'],
     callableToolNames: [],
     supportedToolNames: [],
+    toolApprovalRequired: false,
     unsupportedModes: [],
   } as const;
 
@@ -22,6 +23,21 @@ describe('assertPiCompatible', () => {
         supportedToolNames: ['file_search'],
       }),
     ).not.toThrow();
+  });
+
+  it('rejects callable tools when host approval policy must run', () => {
+    expect(() =>
+      assertPiCompatible({
+        ...supported,
+        callableToolNames: ['file_search'],
+        supportedToolNames: ['file_search'],
+        toolApprovalRequired: true,
+      }),
+    ).toThrow(AgentRuntimeUnavailableError);
+  });
+
+  it('does not block a tool-free turn when host approval policy is enabled', () => {
+    expect(() => assertPiCompatible({ ...supported, toolApprovalRequired: true })).not.toThrow();
   });
 
   it.each([

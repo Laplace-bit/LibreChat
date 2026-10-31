@@ -10116,6 +10116,38 @@ describe('AgentClient - Pi generation dispatch', () => {
     return client;
   };
 
+  const fileSearchDefinition = {
+    name: Tools.file_search,
+    description: 'Search the agent files.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  };
+  const createPiFileSearchClient = ({
+    toolApproval,
+    agentOverrides = {},
+    eventHandlers = {},
+  } = {}) =>
+    createPiClient({
+      req: {
+        user: { id: 'user-pi' },
+        body: {},
+        config: {
+          endpoints: {
+            [EModelEndpoint.agents]: toolApproval == null ? {} : { toolApproval },
+          },
+        },
+      },
+      agent: {
+        tools: [{ name: Tools.file_search }],
+        toolDefinitions: [fileSearchDefinition],
+        ...agentOverrides,
+      },
+      eventHandlers,
+    });
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
@@ -10219,16 +10251,87 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
-  it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {
-    const definition = {
-      name: Tools.file_search,
-      description: 'Search the agent files.',
-      parameters: {
-        type: 'object',
-        properties: { query: { type: 'string' } },
-        required: ['query'],
+  it.each([
+    ['default ask policy', { enabled: true }],
+    ['deny-only policy', { enabled: true, mode: 'dontAsk', deny: ['file_search'] }],
+    ['explicit ask policy', { enabled: true, mode: 'bypass', ask: ['file_search'] }],
+  ])(
+    'rejects Pi tool execution before provider or host effects under %s',
+    async (_label, toolApproval) => {
+      const toolExecuteHandler = { handle: jest.fn() };
+      const client = createPiFileSearchClient({
+        toolApproval,
+        eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+      });
+
+      await client.chatCompletion({ payload: [] });
+
+      expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
+      expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+      expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+      expect(client.contentParts).toContainEqual(
+        expect.objectContaining({ type: ContentTypes.ERROR }),
+      );
+      expect(mockCreateRun).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects Pi before executing a registered PreToolUse hook when approval is enabled', async () => {
+    mockIsHITLEnabled.mockReturnValue(true);
+    const hook = jest.fn(async () => ({ decision: 'deny' }));
+    const unregister = registerToolApprovalHook(() => hook);
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiFileSearchClient({
+      toolApproval: { enabled: true, mode: 'bypass' },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+
+    try {
+      await client.chatCompletion({ payload: [] });
+    } finally {
+      unregister();
+    }
+
+    expect(hook).not.toHaveBeenCalled();
+    expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+  });
+
+  it('rejects Pi tools when an attached code environment activates default approval', async () => {
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiFileSearchClient({
+      agentOverrides: {
+        codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
       },
-    };
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+  });
+
+  it('honors the explicit disabled-policy override for an attached code environment', async () => {
+    const client = createPiFileSearchClient({
+      toolApproval: { enabled: false },
+      agentOverrides: {
+        codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
+      },
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {
     const req = {
       user: { id: 'user-pi' },
       body: {},
@@ -10249,7 +10352,7 @@ describe('AgentClient - Pi generation dispatch', () => {
       req,
       agent: {
         tools: [{ name: Tools.file_search }],
-        toolDefinitions: [definition],
+        toolDefinitions: [fileSearchDefinition],
       },
       eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
     });
@@ -10294,7 +10397,9 @@ describe('AgentClient - Pi generation dispatch', () => {
       status: 'success',
       content: 'Found the manual.',
     });
-    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([definition]);
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
+      fileSearchDefinition,
+    ]);
     expect(mockExecutePiGeneration.mock.calls[0][0].createToolStepIdentity).toEqual(
       expect.any(Function),
     );

@@ -2812,6 +2812,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           seedContent: resumeState.aggregatedContent,
         }),
       );
+      const [resumeInput] = resumedClient.resumeCompletion.mock.calls[0];
+      // The route forwards a tool-result continuation. AgentClient/dispatcher turns that into
+      // Pi's continue_tool_result operation; the route must not send a fresh prompt or a
+      // replacement transcript that could replay the original user request.
+      expect(resumeInput).not.toHaveProperty('prompt');
+      expect(resumeInput).not.toHaveProperty('messages');
       expect(mockSaveMessage).toHaveBeenCalledWith(
         expect.anything(),
         expect.objectContaining({
@@ -2822,6 +2828,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         expect.anything(),
       );
       expect(mockGenerationJobManager.publishTerminalClaim).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.finishTerminalJob).toHaveBeenCalledTimes(1);
     });
 
     it('rejects stale Pi host state before claiming the approval or rebuilding a client', async () => {

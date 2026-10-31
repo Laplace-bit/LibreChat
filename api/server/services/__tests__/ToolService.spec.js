@@ -5057,4 +5057,245 @@ describe('ToolService - Action Capability Gating', () => {
       expect(callArgs.tools).toEqual(['calculator']);
     });
   });
+
+  describe('Pi Action local HTTP integration', () => {
+    it('runs an authorized non-OAuth Action through Pi and the host ActionService boundary', async () => {
+      const http = require('node:http');
+      const { GraphEvents } = require('@librechat/agents');
+      const {
+        AuthTypeEnum,
+        actionDomainSeparator,
+        openapiToFunction,
+        validateAndParseOpenAPISpec,
+      } = require('librechat-data-provider');
+      const {
+        createPiTools,
+        createPiHostToolExecutor,
+        createPiHostToolBatchExecutor,
+        createPiHostEventSequencer,
+        createToolExecuteHandler,
+      } = jest.requireActual('@librechat/api');
+
+      const receivedRequests = [];
+      const server = http.createServer((request, response) => {
+        receivedRequests.push({
+          method: request.method,
+          path: request.url,
+          remoteAddress: request.socket.remoteAddress,
+        });
+        request.resume();
+        request.on('end', () => {
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ sku: 'P-100', available: 7 }));
+        });
+      });
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+
+      try {
+        const { port } = server.address();
+        const baseUrl = `http://127.0.0.1:${port}`;
+        const rawSpec = JSON.stringify({
+          openapi: '3.0.0',
+          info: { title: 'Local inventory fixture', version: '1.0.0' },
+          servers: [{ url: baseUrl }],
+          paths: {
+            '/inventory/{sku}': {
+              get: {
+                operationId: 'getInventoryItem',
+                summary: 'Get an inventory item',
+                parameters: [
+                  {
+                    name: 'sku',
+                    in: 'path',
+                    required: true,
+                    schema: { type: 'string', enum: ['P-100'] },
+                  },
+                ],
+                responses: {
+                  200: {
+                    description: 'Inventory item',
+                    content: {
+                      'application/json': {
+                        schema: {
+                          type: 'object',
+                          properties: {
+                            sku: { type: 'string' },
+                            available: { type: 'integer' },
+                          },
+                          required: ['sku', 'available'],
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        });
+        const parsedSpec = validateAndParseOpenAPISpec(rawSpec);
+        expect(parsedSpec.spec).toBeDefined();
+        const signature = openapiToFunction(parsedSpec.spec, true).functionSignatures[0];
+        expect(signature).toBeDefined();
+
+        const parsedHost = new URL(baseUrl).host;
+        const encodedDomain = parsedHost.replace(/\./g, actionDomainSeparator);
+        const normalizedDomain = encodedDomain.split(actionDomainSeparator).join('_');
+        const actionToolName = `${signature.name}${actionDelimiter}${normalizedDomain}`;
+        const agentId = 'agent-pi-action-http';
+        const storedAction = {
+          action_id: 'action-local-http-fixture',
+          metadata: {
+            domain: baseUrl,
+            raw_spec: rawSpec,
+            auth: { type: AuthTypeEnum.None },
+          },
+        };
+        const appConfig = { actions: { allowedDomains: [baseUrl] } };
+        const req = createMockReq([AgentCapabilities.actions]);
+        req.body = { conversationId: 'thread-pi-action-http' };
+        req.config.actions = appConfig.actions;
+        mockLoadActionSets.mockResolvedValue([storedAction]);
+        mockDomainParser.mockImplementation(async (domain) =>
+          new URL(domain).host.replace(/\./g, actionDomainSeparator),
+        );
+        mockLegacyDomainEncode.mockReturnValue(encodedDomain);
+        mockGetEndpointsConfig.mockResolvedValue(
+          createEndpointsConfig([AgentCapabilities.actions]),
+        );
+        mockLoadToolDefinitions.mockImplementationOnce(async (_options, dependencies) => ({
+          toolDefinitions: await dependencies.getActionToolDefinitions(agentId, [actionToolName]),
+          toolRegistry: new Map(),
+          hasDeferredTools: false,
+        }));
+        const definitionResult = await loadAgentTools({
+          req,
+          res: {},
+          agent: { id: agentId, tools: [actionToolName] },
+          definitionsOnly: true,
+        });
+        expect(definitionResult.toolDefinitions).toMatchObject([
+          {
+            name: actionToolName,
+            parameters: signature.parameters,
+            oauth: false,
+          },
+        ]);
+        mockCreateActionTool.mockImplementationOnce(async (options) =>
+          jest.requireActual('../ActionService').createActionTool(options),
+        );
+
+        const loadTools = jest.fn(async (toolNames, agentId, configurable) => {
+          const result = await loadToolsForExecution({
+            req: configurable.req,
+            res: {},
+            agent: { id: agentId, tools: toolNames },
+            toolNames,
+            actionsEnabled: true,
+            appConfig,
+          });
+          return { loadedTools: result.loadedTools };
+        });
+        const hostHandler = createToolExecuteHandler({ loadTools });
+        const hostBatchExecutor = createPiHostToolBatchExecutor({
+          handler: hostHandler,
+          userId: req.user.id,
+          agentId,
+          request: req,
+          threadId: 'thread-pi-action-http',
+          runId: 'run-pi-action-http',
+          metadata: {},
+          authorizedToolNames: [actionToolName],
+        });
+        const hostEvents = [];
+        const eventSequencer = createPiHostEventSequencer((event) => {
+          hostEvents.push(event);
+        });
+        let nextCallId = 0;
+        const executePiTool = createPiHostToolExecutor({
+          createStepIdentity: () => ({
+            id: `step-pi-action-http-${nextCallId}`,
+            index: nextCallId,
+            messageId: 'message-pi-action-http',
+            runId: 'run-pi-action-http',
+            agentId,
+          }),
+          createToolCallId: () => `host-call-pi-action-http-${nextCallId++}`,
+          executeHostToolCall: hostBatchExecutor,
+          handleHostEvent: eventSequencer.enqueue,
+        });
+        const [piTool] = createPiTools({
+          definitions: definitionResult.toolDefinitions,
+          execute: executePiTool,
+        });
+        expect(piTool).toBeDefined();
+
+        await expect(
+          piTool.execute('pi-call-invalid-enum', { sku: 'P-999' }),
+        ).rejects.toMatchObject({ code: 'PI_TOOL_ARGUMENTS_INVALID' });
+        await expect(
+          piTool.execute('pi-call-invalid-extra', { sku: 'P-100', host: 'localhost' }),
+        ).rejects.toMatchObject({ code: 'PI_TOOL_ARGUMENTS_INVALID' });
+        expect(loadTools).not.toHaveBeenCalled();
+        expect(receivedRequests).toEqual([]);
+
+        const result = await piTool.execute('pi-call-valid', { sku: 'P-100' });
+        await eventSequencer.drain();
+
+        expect(loadTools).toHaveBeenCalledTimes(1);
+        expect(loadTools.mock.calls[0][0]).toEqual([actionToolName]);
+        expect(loadTools.mock.calls[0][1]).toBe(agentId);
+        expect(loadTools.mock.calls[0][2].req).toBe(req);
+        expect(mockCreateActionTool).toHaveBeenCalledTimes(1);
+        expect(mockCreateActionTool.mock.calls[0][0]).toMatchObject({
+          name: actionToolName,
+          action: { action_id: 'action-local-http-fixture' },
+          useSSRFProtection: false,
+        });
+        expect(receivedRequests).toEqual([
+          expect.objectContaining({
+            method: 'GET',
+            path: '/inventory/P-100',
+          }),
+        ]);
+        expect(receivedRequests[0].remoteAddress).toMatch(/^127\./);
+        expect(result.content).toContainEqual({
+          type: 'text',
+          text: '{"sku":"P-100","available":7}',
+        });
+        expect(hostEvents.some((event) => event.event === GraphEvents.ON_RUN_STEP_COMPLETED)).toBe(
+          true,
+        );
+
+        const unauthorizedExecutor = createPiHostToolBatchExecutor({
+          handler: hostHandler,
+          userId: req.user.id,
+          agentId,
+          request: req,
+          threadId: 'thread-pi-action-http',
+          runId: 'run-pi-action-http',
+          metadata: {},
+          authorizedToolNames: [],
+        });
+        await expect(
+          unauthorizedExecutor({
+            kind: 'action',
+            id: 'host-call-unauthorized-action',
+            name: actionToolName,
+            args: { sku: 'P-100' },
+            schemaFingerprint: 'not-used-by-host-boundary',
+            stepId: 'step-unauthorized-action',
+          }),
+        ).rejects.toMatchObject({ status: 503 });
+        expect(loadTools).toHaveBeenCalledTimes(1);
+        expect(receivedRequests).toHaveLength(1);
+      } finally {
+        await new Promise((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    });
+  });
 });

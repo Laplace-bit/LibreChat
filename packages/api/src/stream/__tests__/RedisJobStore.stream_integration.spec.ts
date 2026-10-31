@@ -4053,6 +4053,144 @@ describe('RedisJobStore Integration Tests', () => {
           }
         }
       });
+
+      test('durably consumes a Pi approval when provider start never occurs', async () => {
+        if (!ioredisClient) {
+          return;
+        }
+
+        const [
+          { RedisJobStore },
+          { ApprovalLifecycle },
+          { buildPiApprovalInterruptPayload, createPiApprovalContinuation },
+          { buildPendingAction: buildToolPendingAction },
+        ] = await Promise.all([
+          import('../implementations/RedisJobStore'),
+          import('../ApprovalLifecycle'),
+          import('../../agents/pi/resume'),
+          import('../../agents/hitl/policy'),
+        ]);
+        const keyPrefix = String(ioredisClient.options.keyPrefix ?? '');
+        const replicaAClient = createRedisTestClient(keyPrefix);
+        const replicaBClient = createRedisTestClient(keyPrefix);
+        const replicaAStore = new RedisJobStore(replicaAClient);
+        const replicaBStore = new RedisJobStore(replicaBClient);
+
+        try {
+          await Promise.all([replicaAClient.connect(), replicaBClient.connect()]);
+          await Promise.all([replicaAStore.initialize(), replicaBStore.initialize()]);
+
+          const streamId = `pi-approval-crash-${Date.now()}`;
+          const agentId = 'agent-managed-code';
+          const responseMessageId = `response-${streamId}`;
+          const toolCall: PiPauseToolCall = {
+            toolCallId: 'pi-crash-call',
+            name: Constants.BASH_TOOL,
+            args: { command: 'python analyze.py' },
+            hostExecution: {
+              toolCallId: 'host-pi-crash-call',
+              toolTurn: 0,
+              stepIdentity: {
+                id: 'pi-crash-step',
+                index: 0,
+                messageId: responseMessageId,
+                runId: responseMessageId,
+                agentId,
+              },
+              createdAt: Date.now(),
+            },
+            review: { allowedDecisions: ['approve', 'reject'] },
+          };
+          const pendingAction = buildToolPendingAction(
+            buildPiApprovalInterruptPayload({
+              hostToolCallId: toolCall.hostExecution.toolCallId,
+              toolName: toolCall.name,
+              args: toolCall.args,
+              allowedDecisions: toolCall.review.allowedDecisions,
+            }),
+            {
+              streamId,
+              conversationId: streamId,
+              runId: responseMessageId,
+              responseMessageId,
+            },
+          );
+          const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+          const job = await replicaAStore.createJob(streamId, 'resume-user', streamId, 'tenant-1', {
+            agent_id: agentId,
+            responseMessageId,
+          });
+          const replicaA = new ApprovalLifecycle(replicaAStore);
+          const replicaB = new ApprovalLifecycle(replicaBStore);
+
+          expect(
+            await replicaA.pause(streamId, pendingAction, {
+              expectedCreatedAt: job.createdAt,
+              piResumeContinuation: continuation,
+            }),
+          ).toBe(true);
+          expect(await replicaBStore.getJob(streamId)).toMatchObject({
+            userId: 'resume-user',
+            tenantId: 'tenant-1',
+            status: 'requires_action',
+            pendingAction: {
+              actionId: pendingAction.actionId,
+              payload: { type: 'tool_approval' },
+            },
+            piResumeContinuation: continuation,
+          });
+
+          // A replacement generation cannot consume the action. This represents the
+          // generation fence the HTTP route supplies to the lifecycle CAS.
+          expect(
+            await replicaB.resolve(
+              streamId,
+              pendingAction.actionId,
+              { providerExecutionId: 'stale-provider', providerDrained: true },
+              job.createdAt + 1,
+            ),
+          ).toBe(false);
+          expect((await replicaAStore.getJob(streamId))?.status).toBe('requires_action');
+
+          // Stop at the durable CAS to model the crash point before beginProviderExecution or
+          // any host tool call. The test does not restart a manager/process; it verifies that
+          // the other lifecycle can no longer reclaim the action. Arbitrary MCP/Action tools
+          // can have side effects, so replaying this approval would be unsafe.
+          expect(
+            await replicaB.resolve(
+              streamId,
+              pendingAction.actionId,
+              { providerExecutionId: 'provider-crashed-after-cas', providerDrained: true },
+              job.createdAt,
+            ),
+          ).toBe(true);
+          expect(
+            await replicaA.resolve(
+              streamId,
+              pendingAction.actionId,
+              { providerExecutionId: 'provider-retry', providerDrained: true },
+              job.createdAt,
+            ),
+          ).toBe(false);
+
+          const recovered = await replicaBStore.getJob(streamId);
+          expect(recovered).toMatchObject({
+            status: 'running',
+            providerExecutionId: 'provider-crashed-after-cas',
+          });
+          expect(recovered?.pendingAction).toBeUndefined();
+          expect(recovered?.piResumeContinuation).toBeUndefined();
+        } finally {
+          try {
+            await Promise.all([replicaAStore.destroy(), replicaBStore.destroy()]);
+          } finally {
+            await Promise.all([
+              replicaAClient.quit().catch(() => replicaAClient.disconnect()),
+              replicaBClient.quit().catch(() => replicaBClient.disconnect()),
+            ]);
+          }
+        }
+      });
     });
 
     test('terminal transitions and deleteJob remove the steers key', async () => {

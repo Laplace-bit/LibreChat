@@ -7,6 +7,7 @@ import {
   convertOfficeToPdf,
   isLibreOfficeEnabled,
   isLibreOfficeEnabledFor,
+  isLibreOfficeInProcessEnabled,
   LibreOfficeConversionError,
   LibreOfficeUnavailableError,
   LIBREOFFICE_TIMEOUT_MS,
@@ -31,6 +32,8 @@ function hasLibreOfficeOnPath(): boolean {
 }
 const LIBREOFFICE_INSTALLED = hasLibreOfficeOnPath();
 const itIfLibreOffice = LIBREOFFICE_INSTALLED ? it : it.skip;
+const itIfLibreOfficeConversion =
+  LIBREOFFICE_INSTALLED && isLibreOfficeInProcessEnabled() ? it : it.skip;
 
 /* Fixtures sit next to the source files (matches `html.spec.ts` resolution). */
 const FIXTURES_DIR = __dirname;
@@ -273,6 +276,17 @@ describe('libreoffice (env gating + wrapper)', () => {
     });
   });
 
+  it('fails closed when this build disables in-process conversion', async () => {
+    process.env.OFFICE_PREVIEW_LIBREOFFICE = 'true';
+    expect(isLibreOfficeInProcessEnabled()).toBe(false);
+    await expect(convertOfficeToPdf(readFixture('sample.docx'), 'docx')).rejects.toBeInstanceOf(
+      LibreOfficeUnavailableError,
+    );
+    await expect(
+      tryLibreOfficePreview(readFixture('sample.docx'), 'docx', 512 * 1024),
+    ).resolves.toBe(null);
+  });
+
   describe('error tagging', () => {
     it('LibreOfficeUnavailableError preserves the .name tag for callers', () => {
       const err = new LibreOfficeUnavailableError('binary missing');
@@ -293,16 +307,15 @@ describe('libreoffice (env gating + wrapper)', () => {
   });
 });
 
-/* eslint-disable jest/no-standalone-expect -- the `itIfLibreOffice` alias
- * collapses to `it.skip` when LibreOffice isn't installed; the lint rule
+/* eslint-disable jest/no-standalone-expect -- the conditional `it` aliases
+ * collapse to `it.skip` when LibreOffice isn't installed or conversion is
+ * disabled by this build; the lint rule
  * doesn't realize the `expect`s below are still scoped to a real test
  * block via the alias. Disabling locally is cleaner than restructuring
  * to satisfy a static check that's wrong about this pattern. */
-describe('libreoffice integration (skipped unless LibreOffice is on $PATH)', () => {
-  /* These tests engage only when `soffice` (or `libreoffice`) is
-   * actually installed. Local dev with the binary present runs them;
-   * stock CI runners skip. The skip is per-test rather than describe-
-   * level so a printout makes the gating visible. */
+describe('libreoffice integration (requires binary and enabled conversion capability)', () => {
+  /* Binary probing runs wherever the binary is installed. Actual conversion
+   * tests additionally require the build-time in-process capability. */
   const ORIGINAL_FLAG = process.env.OFFICE_PREVIEW_LIBREOFFICE;
 
   beforeEach(() => {
@@ -324,7 +337,7 @@ describe('libreoffice integration (skipped unless LibreOffice is on $PATH)', () 
     expect(probe.versionLine).toMatch(/LibreOffice/i);
   });
 
-  itIfLibreOffice(
+  itIfLibreOfficeConversion(
     'convertOfficeToPdf converts a DOCX to PDF bytes',
     async () => {
       const buf = readFixture('sample.docx');
@@ -336,7 +349,7 @@ describe('libreoffice integration (skipped unless LibreOffice is on $PATH)', () 
     35_000,
   );
 
-  itIfLibreOffice(
+  itIfLibreOfficeConversion(
     'convertOfficeToPdf converts a PPTX to PDF bytes',
     async () => {
       const buf = readFixture('sample.pptx');
@@ -346,7 +359,7 @@ describe('libreoffice integration (skipped unless LibreOffice is on $PATH)', () 
     35_000,
   );
 
-  itIfLibreOffice(
+  itIfLibreOfficeConversion(
     'tryLibreOfficePreview produces a PDF embed doc when env=true and binary is available',
     async () => {
       process.env.OFFICE_PREVIEW_LIBREOFFICE = 'true';
@@ -366,7 +379,7 @@ describe('libreoffice integration (skipped unless LibreOffice is on $PATH)', () 
     35_000,
   );
 
-  itIfLibreOffice(
+  itIfLibreOfficeConversion(
     'returns null when the embedded PDF would exceed the output cap',
     async () => {
       /* Force the cap below the smallest possible PDF so the size

@@ -10,6 +10,7 @@ import {
   getShellHandlerIssue,
   getCommandShellIssue,
 } from './executor';
+import { isProcessGone } from './processTest';
 
 let pluginRoot: string;
 let pluginData: string;
@@ -548,19 +549,6 @@ describe('createCommandExecutor', () => {
     await expect(execute(handler)).resolves.toEqual({});
   });
 
-  const isGone = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return true;
-    }
-    try {
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-      return stat.slice(stat.lastIndexOf(')') + 2, stat.lastIndexOf(')') + 3) === 'Z';
-    } catch {
-      return true;
-    }
-  };
   const waitFor = async (condition: () => boolean): Promise<void> => {
     const deadline = Date.now() + 5_000;
     while (!condition() && Date.now() < deadline) {
@@ -596,9 +584,9 @@ describe('createCommandExecutor', () => {
     controller.abort();
     /** The wrapper exits on SIGTERM while the trap-protected descendant survives. */
     await expect(pending).resolves.toEqual({});
-    expect(isGone(survivorPid)).toBe(false);
-    await waitFor(() => isGone(survivorPid));
-    expect(isGone(survivorPid)).toBe(true);
+    expect(isProcessGone(survivorPid)).toBe(false);
+    await waitFor(() => isProcessGone(survivorPid));
+    expect(isProcessGone(survivorPid)).toBe(true);
   });
 
   test('reaps a pipe-holding worker at root exit instead of stalling until close', async () => {
@@ -624,8 +612,8 @@ describe('createCommandExecutor', () => {
     expect(output).toEqual({ reason: 'scheduled' });
     const holderPid = Number((await fs.promises.readFile(pidFile, 'utf8')).trim());
     expect(holderPid).toBeGreaterThan(0);
-    await waitFor(() => isGone(holderPid));
-    expect(isGone(holderPid)).toBe(true);
+    await waitFor(() => isProcessGone(holderPid));
+    expect(isProcessGone(holderPid)).toBe(true);
   });
 
   test('reaps a backgrounded worker that outlives a successful hook', async () => {
@@ -651,8 +639,8 @@ describe('createCommandExecutor', () => {
     await waitFor(() => fs.existsSync(pidFile));
     const workerPid = Number((await fs.promises.readFile(pidFile, 'utf8')).trim());
     expect(workerPid).toBeGreaterThan(0);
-    await waitFor(() => isGone(workerPid));
-    expect(isGone(workerPid)).toBe(true);
+    await waitFor(() => isProcessGone(workerPid));
+    expect(isProcessGone(workerPid)).toBe(true);
   });
 
   test('returns an empty output when the signal aborts a running command', async () => {

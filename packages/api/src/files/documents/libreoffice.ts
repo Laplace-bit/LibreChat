@@ -72,6 +72,11 @@ type LibreOfficeFormatEnablement = 'all' | ReadonlySet<string> | null;
 
 const IN_PROCESS_LIBREOFFICE_DISABLED: boolean = true;
 
+/** Exposes the build-time capability to callers and tests without probing a binary. */
+export function isLibreOfficeInProcessEnabled(): boolean {
+  return !IN_PROCESS_LIBREOFFICE_DISABLED;
+}
+
 function parseLibreOfficeEnablement(value: string | undefined): LibreOfficeFormatEnablement {
   if (value == null) {
     return null;
@@ -231,7 +236,7 @@ export class LibreOfficeConversionError extends Error {
  *     oversized output
  */
 export async function convertOfficeToPdf(buffer: Buffer, extensionHint: string): Promise<Buffer> {
-  if (IN_PROCESS_LIBREOFFICE_DISABLED) {
+  if (!isLibreOfficeInProcessEnabled()) {
     throw new LibreOfficeUnavailableError(
       'In-process LibreOffice conversion is temporarily disabled',
     );
@@ -541,7 +546,7 @@ export async function tryLibreOfficePreview(
   extensionHint: string,
   outputCap: number,
 ): Promise<string | null> {
-  if (IN_PROCESS_LIBREOFFICE_DISABLED) {
+  if (!isLibreOfficeInProcessEnabled()) {
     return null;
   }
   if (!isLibreOfficeEnabledFor(extensionHint)) {

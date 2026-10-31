@@ -33,6 +33,12 @@ jest.mock('../../mcp/oauth/resourceHint', () => ({
   probeResourceMetadataHint: jest.fn().mockResolvedValue(null),
 }));
 
+/** Keep DNS deterministic while leaving address classification and SSRF checks real. */
+jest.mock('node:dns/promises', () => ({
+  ...jest.requireActual('node:dns/promises'),
+  lookup: jest.fn(async () => [{ address: '93.184.216.34', family: 4 }]),
+}));
+
 import {
   startAuthorization,
   discoverAuthorizationServerMetadata,

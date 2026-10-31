@@ -9,6 +9,12 @@ import { detectOAuthRequirement } from '~/mcp/oauth';
 jest.mock('../../oauth/detectOAuth');
 jest.mock('../../MCPConnectionFactory');
 
+/** Keep DNS deterministic while leaving address classification and SSRF checks real. */
+jest.mock('node:dns/promises', () => ({
+  ...jest.requireActual('node:dns/promises'),
+  lookup: jest.fn(async () => [{ address: '93.184.216.34', family: 4 }]),
+}));
+
 const mockDetectOAuthRequirement = detectOAuthRequirement as jest.MockedFunction<
   typeof detectOAuthRequirement
 >;

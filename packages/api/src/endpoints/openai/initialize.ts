@@ -1,11 +1,16 @@
-import { ErrorTypes, EModelEndpoint, mapModelToAzureConfig } from 'librechat-data-provider';
+import {
+  ErrorTypes,
+  EModelEndpoint,
+  ReasoningEffort,
+  mapModelToAzureConfig,
+} from 'librechat-data-provider';
 import type {
   InitializeResultBase,
   OpenAIConfigOptions,
   ProviderInitializeParams,
   UserKeyValues,
 } from '~/types';
-import type { AuthorizedPiOpenAIModelCandidate } from '~/agents/pi/model';
+import type { AuthorizedPiOpenAIModelCandidate, PiOpenAIReasoningEffort } from '~/agents/pi/model';
 import {
   mergeHeaders,
   resolveHeaders,
@@ -26,6 +31,7 @@ import { getOpenAIConfig } from './config';
 const PI_SUPPORTED_MODEL_PARAMETER_KEYS = new Set([
   'model',
   'useResponsesApi',
+  'reasoning_effort',
   'temperature',
   'top_p',
   'topP',
@@ -39,6 +45,7 @@ const PI_SUPPORTED_LLM_CONFIG_KEYS = new Set([
   'user',
   'streaming',
   'useResponsesApi',
+  'reasoning',
   'temperature',
   'topP',
   'maxTokens',
@@ -47,6 +54,40 @@ const PI_SUPPORTED_LLM_CONFIG_KEYS = new Set([
 
 function readProperty(value: object, key: string): unknown {
   return Object.entries(value).find(([entryKey]) => entryKey === key)?.[1];
+}
+
+const PI_SUPPORTED_REASONING_EFFORTS = new Set<string>([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
+
+function isPiOpenAIReasoningEffort(value: unknown): value is PiOpenAIReasoningEffort {
+  return typeof value === 'string' && PI_SUPPORTED_REASONING_EFFORTS.has(value);
+}
+
+function hasMatchingPiReasoningConfig(llmConfig: object, requestedEffort: unknown): boolean {
+  const configuredReasoning = readProperty(llmConfig, 'reasoning');
+  if (requestedEffort == null || requestedEffort === ReasoningEffort.unset) {
+    return configuredReasoning == null;
+  }
+  if (!isPiOpenAIReasoningEffort(requestedEffort)) {
+    return false;
+  }
+  if (
+    typeof configuredReasoning !== 'object' ||
+    configuredReasoning === null ||
+    Array.isArray(configuredReasoning)
+  ) {
+    return false;
+  }
+  return (
+    Object.keys(configuredReasoning).length === 1 &&
+    readProperty(configuredReasoning, 'effort') === requestedEffort
+  );
 }
 
 function hasOnlySupportedParameters(parameters: Readonly<Record<string, unknown>>): boolean {
@@ -211,6 +252,7 @@ function createAuthorizedPiOpenAIModelCandidate({
     modelParameters == null ||
     modelParameters.model !== modelName ||
     !hasOnlySupportedParameters(modelParameters) ||
+    !hasMatchingPiReasoningConfig(options.llmConfig, modelParameters.reasoning_effort) ||
     hasEntries(options.tools) ||
     options.provider != null ||
     hasEntries(readProperty(options.llmConfig, 'modelKwargs')) ||
@@ -252,6 +294,10 @@ function createAuthorizedPiOpenAIModelCandidate({
     return undefined;
   }
 
+  const reasoningEffort = isPiOpenAIReasoningEffort(modelParameters.reasoning_effort)
+    ? modelParameters.reasoning_effort
+    : undefined;
+
   return {
     source: 'server-admin-config',
     provider: 'openai',
@@ -265,6 +311,7 @@ function createAuthorizedPiOpenAIModelCandidate({
       headersTimeout: transportTimeouts.headersTimeout,
       ...(typeof proxy === 'string' && proxy.trim() !== '' ? { proxy: proxy.trim() } : {}),
     },
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(sampling === undefined ? {} : { sampling }),
   };
 }

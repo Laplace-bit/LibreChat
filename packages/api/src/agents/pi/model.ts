@@ -1,12 +1,29 @@
 import { fetch as undiciFetch } from 'undici';
+import type {
+  Api,
+  CredentialStore,
+  Model,
+  OpenAIResponsesOptions,
+  SimpleStreamOptions,
+} from '@earendil-works/pi-ai';
 import type { CreateModelRuntimeOptions, ModelRuntime } from '@earendil-works/pi-coding-agent';
-import type { Api, CredentialStore, Model } from '@earendil-works/pi-ai';
 import type { PiModelBinding } from './session';
 import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
 
 export const PI_OPENAI_PROVIDER_ID = 'librechat-openai' as const;
 export const OPENAI_API = 'openai-responses' as const;
 export const OPENAI_BASE_URL = 'https://api.openai.com/v1' as const;
+
+export type PiOpenAIReasoningEffort = NonNullable<OpenAIResponsesOptions['reasoningEffort']>;
+
+const PI_OPENAI_REASONING_EFFORTS = new Set<string>([
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
 
 const CANDIDATE_SOURCE = 'server-admin-config' as const;
 const MAX_MODEL_ID_LENGTH = 128;
@@ -42,6 +59,7 @@ export interface AuthorizedPiOpenAIModelCandidate {
   /** Server-authenticated user.id from the resolver; never take this from request parameters. */
   readonly requestUserId?: string;
   readonly transport: PiOpenAITransport;
+  readonly reasoningEffort?: PiOpenAIReasoningEffort;
   readonly sampling?: {
     readonly temperature?: number;
     readonly topP?: number;
@@ -75,6 +93,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasOnlyKeys(value: Record<string, unknown>, allowedKeys: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowedKeys.includes(key));
+}
+
+function isPiOpenAIReasoningEffort(value: unknown): value is PiOpenAIReasoningEffort {
+  return typeof value === 'string' && PI_OPENAI_REASONING_EFFORTS.has(value);
 }
 
 function containsControlCharacter(value: string): boolean {
@@ -178,13 +200,23 @@ function validateCandidate(candidate: unknown): AuthorizedPiOpenAIModelCandidate
       'serverAdminApiKey',
       'requestUserId',
       'transport',
+      'reasoningEffort',
       'sampling',
     ])
   ) {
     throw new PiOpenAIModelBindingError('INVALID_CANDIDATE');
   }
 
-  const { source, provider, api, baseUrl, modelId, serverAdminApiKey, requestUserId } = candidate;
+  const {
+    source,
+    provider,
+    api,
+    baseUrl,
+    modelId,
+    serverAdminApiKey,
+    requestUserId,
+    reasoningEffort,
+  } = candidate;
   if (
     source !== CANDIDATE_SOURCE ||
     provider !== 'openai' ||
@@ -200,7 +232,8 @@ function validateCandidate(candidate: unknown): AuthorizedPiOpenAIModelCandidate
       (typeof requestUserId !== 'string' ||
         requestUserId.trim().length === 0 ||
         requestUserId.length > 256 ||
-        containsControlCharacter(requestUserId)))
+        containsControlCharacter(requestUserId))) ||
+    (reasoningEffort !== undefined && !isPiOpenAIReasoningEffort(reasoningEffort))
   ) {
     throw new PiOpenAIModelBindingError('INVALID_CANDIDATE');
   }
@@ -220,6 +253,7 @@ function validateCandidate(candidate: unknown): AuthorizedPiOpenAIModelCandidate
     serverAdminApiKey,
     ...(requestUserId === undefined ? {} : { requestUserId }),
     transport,
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(sampling === undefined ? {} : { sampling }),
   };
 }
@@ -373,6 +407,12 @@ export async function createPiOpenAIModelBinding(
     if (!isSupportedCatalogModel(catalogModel, candidate.modelId)) {
       throw new PiOpenAIModelBindingError('UNSUPPORTED_MODEL');
     }
+    if (candidate.reasoningEffort !== undefined) {
+      const { getSupportedThinkingLevels } = await import('@earendil-works/pi-ai');
+      if (!getSupportedThinkingLevels(catalogModel).includes(candidate.reasoningEffort)) {
+        throw new PiOpenAIModelBindingError('UNSUPPORTED_MODEL');
+      }
+    }
     if (
       candidate.sampling?.maxTokens !== undefined &&
       candidate.sampling.maxTokens > catalogModel.maxTokens
@@ -388,6 +428,7 @@ export async function createPiOpenAIModelBinding(
       ...(candidate.sampling?.topP === undefined ? {} : { top_p: candidate.sampling.topP }),
       ...(candidate.requestUserId === undefined ? {} : { user: candidate.requestUserId }),
     };
+    const reasoningEffort = candidate.reasoningEffort;
     runtime.registerProvider(PI_OPENAI_PROVIDER_ID, {
       name: 'OpenAI',
       api: OPENAI_API,
@@ -395,6 +436,18 @@ export async function createPiOpenAIModelBinding(
       streamSimple: (model, context, options) => {
         if (!isBoundOpenAIResponsesModel(model)) {
           throw new PiOpenAIModelBindingError('UNSUPPORTED_MODEL');
+        }
+        if (reasoningEffort !== undefined) {
+          const requestOptions: SimpleStreamOptions = options ?? {};
+          return openAIResponsesStreamSimple(model, context, {
+            ...requestOptions,
+            reasoning: reasoningEffort,
+            onPayload: async (payload, payloadModel) => {
+              const transformedPayload = await requestOptions.onPayload?.(payload, payloadModel);
+              return stripPiDefaultReasoningSummary(transformedPayload ?? payload, reasoningEffort);
+            },
+            fetch,
+          });
         }
         return openAIResponsesStreamSimple(model, context, {
           ...options,
@@ -448,4 +501,23 @@ export async function createPiOpenAIModelBinding(
     }
     throw new PiOpenAIModelBindingError('RUNTIME_UNAVAILABLE');
   }
+}
+
+function stripPiDefaultReasoningSummary(
+  payload: unknown,
+  expectedEffort: PiOpenAIReasoningEffort,
+): unknown {
+  if (!isRecord(payload)) {
+    throw new PiOpenAIModelBindingError('RUNTIME_UNAVAILABLE');
+  }
+  const reasoning = payload.reasoning;
+  if (
+    !isRecord(reasoning) ||
+    !hasOnlyKeys(reasoning, ['effort', 'summary']) ||
+    reasoning.effort !== expectedEffort ||
+    reasoning.summary !== 'auto'
+  ) {
+    throw new PiOpenAIModelBindingError('RUNTIME_UNAVAILABLE');
+  }
+  return { ...payload, reasoning: { effort: expectedEffort } };
 }

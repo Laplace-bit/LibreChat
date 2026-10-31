@@ -1,4 +1,4 @@
-import { AuthType, EModelEndpoint } from 'librechat-data-provider';
+import { AuthType, EModelEndpoint, ReasoningEffort } from 'librechat-data-provider';
 import type { BaseInitializeParams } from '~/types';
 import {
   getAgentPiModelBindingFactory,
@@ -407,6 +407,46 @@ describe('initializeOpenAI – Pi provider authorization', () => {
     }
   });
 
+  it('creates a Pi factory when the authorized OpenAI Responses reasoning effort matches', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = {
+      model: 'gpt-4o',
+      useResponsesApi: true,
+      reasoning_effort: ReasoningEffort.high,
+    };
+
+    try {
+      const options = await initializeOpenAI(params);
+
+      expect((options.llmConfig as Record<string, unknown>).reasoning).toEqual({
+        effort: ReasoningEffort.high,
+      });
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeDefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it('does not create a Pi factory for reasoning effort `none`, which the binding cannot map', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = {
+      model: 'gpt-4o',
+      useResponsesApi: true,
+      reasoning_effort: ReasoningEffort.none,
+    };
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
   it.each([
     ['user-provided API key', { OPENAI_API_KEY: AuthType.USER_PROVIDED }, undefined],
     [
@@ -492,6 +532,11 @@ describe('initializeOpenAI – Pi provider authorization', () => {
       { model: 'gpt-4o', useResponsesApi: true, presence_penalty: 0.5 },
       undefined,
     ],
+    [
+      'reasoning effort that does not match server configuration',
+      { model: 'gpt-4o', useResponsesApi: true, reasoning_effort: ReasoningEffort.high },
+      'reasoningMismatch',
+    ],
     ['Chat Completions mode', { model: 'gpt-4o', useResponsesApi: false }, undefined],
     ['provider-native OpenRouter mode', { model: 'gpt-4o', useResponsesApi: true }, 'openrouter'],
     ['default query override', { model: 'gpt-4o', useResponsesApi: true }, 'defaultQuery'],
@@ -514,6 +559,7 @@ describe('initializeOpenAI – Pi provider authorization', () => {
           user: 'user-1',
           streaming: true,
           useResponsesApi: true,
+          ...(outputMode === 'reasoningMismatch' ? { reasoning: { effort: 'low' } } : {}),
           firstPartyEndpoint: true,
         },
         configOptions,

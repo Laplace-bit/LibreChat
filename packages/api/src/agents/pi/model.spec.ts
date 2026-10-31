@@ -131,15 +131,22 @@ interface TransportServerHarness {
   url: string;
   paths: string[];
   requestHeaders: Array<Record<string, string | string[] | undefined>>;
+  requestBodies: string[];
 }
 
 async function startTransportServer(mode: TransportResponseMode): Promise<TransportServerHarness> {
   const paths: string[] = [];
   const requestHeaders: Array<Record<string, string | string[] | undefined>> = [];
+  const requestBodies: string[] = [];
   const server = createServer((request, response) => {
     paths.push(request.url ?? '');
     requestHeaders.push(request.headers);
-    request.resume();
+    request.setEncoding('utf8');
+    let requestBody = '';
+    request.on('data', (chunk: string) => {
+      requestBody += chunk;
+    });
+    request.on('end', () => requestBodies.push(requestBody));
     if (mode === 'headers-timeout') {
       const timer = setTimeout(() => {
         response.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -162,6 +169,7 @@ async function startTransportServer(mode: TransportResponseMode): Promise<Transp
     url: `http://127.0.0.1:${port}`,
     paths,
     requestHeaders,
+    requestBodies,
   };
 }
 
@@ -248,9 +256,13 @@ async function startForwardProxy(originUrl: string): Promise<TransportProxyHarne
 async function runPiTransportRequest({
   proxyMode,
   responseMode,
+  modelId,
+  reasoningEffort,
 }: {
   proxyMode: TransportProxyMode;
   responseMode: TransportResponseMode;
+  modelId?: string;
+  reasoningEffort?: AuthorizedPiOpenAIModelCandidate['reasoningEffort'];
 }) {
   const bodyTimeout = responseMode === 'body-timeout' ? 1_000 : 5_000;
   const headersTimeout = responseMode === 'headers-timeout' ? 1_000 : 5_000;
@@ -267,10 +279,12 @@ async function runPiTransportRequest({
   let requestedCanonicalUrl: string | undefined;
   const binding = await createPiOpenAIModelBinding(
     candidate({
+      modelId: modelId ?? MODEL_ID,
       transport: {
         ...dispatcherOptions,
         ...(explicitProxy === undefined ? {} : { proxy: explicitProxy }),
       },
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     }),
     {
       rewriteRequestUrlForTest: (url) => {
@@ -323,6 +337,7 @@ async function runPiTransportRequest({
     requestedCanonicalUrl,
     paths: origin.paths,
     requestHeaders: origin.requestHeaders,
+    requestBodies: origin.requestBodies,
     proxyTraffic: (proxy?.requests.length ?? 0) + (proxy?.connects.length ?? 0),
     transportErrors,
   };
@@ -427,6 +442,21 @@ describe('createPiOpenAIModelBinding', () => {
     },
   );
 
+  it('maps LibreChat reasoning effort to only the matching Responses API request field', async () => {
+    const result = await runPiTransportRequest({
+      proxyMode: 'direct',
+      responseMode: 'headers-timeout',
+      modelId: 'gpt-5',
+      reasoningEffort: 'high',
+    });
+
+    expect(result.failure).toBeDefined();
+    expect(result.transportErrors).toContain('UND_ERR_HEADERS_TIMEOUT');
+    expect(result.paths).toEqual(['/responses']);
+    expect(result.requestBodies).toHaveLength(1);
+    expect(JSON.parse(result.requestBodies[0] ?? '{}').reasoning).toEqual({ effort: 'high' });
+  });
+
   it('registers one fixed OpenAI Responses catalog model with isolated credentials', async () => {
     const harness = createHarness();
     const binding = await createPiOpenAIModelBinding(
@@ -506,6 +536,15 @@ describe('createPiOpenAIModelBinding', () => {
 
     await expect(
       createPiOpenAIModelBinding({ ...candidate(), ...override }, harness.dependencies),
+    ).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' });
+    expect(harness.dependencies.createRuntime).not.toHaveBeenCalled();
+  });
+
+  it('rejects reasoning effort values the OpenAI Responses SDK cannot represent', async () => {
+    const harness = createHarness();
+
+    await expect(
+      createPiOpenAIModelBinding({ ...candidate(), reasoningEffort: 'none' }, harness.dependencies),
     ).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' });
     expect(harness.dependencies.createRuntime).not.toHaveBeenCalled();
   });

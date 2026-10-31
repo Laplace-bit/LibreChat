@@ -1,3 +1,4 @@
+import { Constants } from 'librechat-data-provider';
 import { assertPiCompatible, isPiManagedCodeExecutionCompatible } from './compatibility';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
@@ -21,6 +22,17 @@ describe('assertPiCompatible', () => {
         ...supported,
         callableToolNames: [...PI_SUPPORTED_HOST_TOOLS],
         supportedToolNames: [...PI_SUPPORTED_HOST_TOOLS],
+      }),
+    ).not.toThrow();
+  });
+
+  it('allows only server-loaded MCP names present in the authorized tool-definition set', () => {
+    const toolName = `lookup${Constants.mcp_delimiter}inventory`;
+    expect(() =>
+      assertPiCompatible({
+        ...supported,
+        callableToolNames: [toolName],
+        supportedToolNames: [toolName],
       }),
     ).not.toThrow();
   });
@@ -57,8 +69,8 @@ describe('assertPiCompatible', () => {
     },
     {
       ...supported,
-      callableToolNames: ['search_mcp_docs'],
-      supportedToolNames: ['search_mcp_docs'],
+      callableToolNames: ['invented_tool'],
+      supportedToolNames: ['invented_tool'],
     },
     {
       ...supported,

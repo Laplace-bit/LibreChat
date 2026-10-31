@@ -6,8 +6,8 @@ import {
 } from '@librechat/agents';
 import type { PiCodeSessionBridge, PiCodeSessionSnapshot } from './codeSession';
 import type { PiHostToolCall } from './toolExecution';
+import { isPiCodeExecutionToolName, PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { isPiCodeExecutionToolName } from './toolNames';
 
 export interface PiHostToolBatchOptions {
   handler?: EventHandler;
@@ -17,6 +17,8 @@ export interface PiHostToolBatchOptions {
   threadId: string;
   runId: string;
   metadata: Record<string, unknown>;
+  /** Exact tool definitions admitted for this isolated Pi generation. */
+  authorizedToolNames?: readonly string[];
   codeSessionBridge?: PiCodeSessionBridge;
   onError?: (error: AgentRuntimeUnavailableError) => void;
 }
@@ -71,6 +73,7 @@ export function createPiHostToolBatchExecutor(
     throw reportUnavailable(options.onError);
   }
   const handler = options.handler;
+  const authorizedToolNames = new Set(options.authorizedToolNames ?? PI_SUPPORTED_HOST_TOOLS);
   const metadata = {
     ...options.metadata,
     thread_id: options.threadId,
@@ -81,6 +84,9 @@ export function createPiHostToolBatchExecutor(
     hostCall: PiHostToolCall & { codeSessionContext?: PiCodeSessionSnapshot },
     signal?: AbortSignal,
   ): Promise<ToolExecuteResult> => {
+    if (!authorizedToolNames.has(hostCall.name)) {
+      return Promise.reject(reportUnavailable(options.onError));
+    }
     if (signal?.aborted === true) {
       return Promise.reject(createAbortError());
     }

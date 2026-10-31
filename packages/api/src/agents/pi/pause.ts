@@ -1,6 +1,7 @@
 import type { Agents } from 'librechat-data-provider';
 import type { PiProviderEventFailure } from './providerEvents';
 import type { PiCodeSessionSnapshot } from './codeSession';
+import type { PiMcpToolSchemaRegistry } from './mcpSchema';
 import type { PiHostToolExecutionInput } from './tools';
 import type { PiMessageStepIdentity } from './events';
 import { parsePiCodeSessionSnapshot } from './codeSession';
@@ -52,7 +53,11 @@ const SUPPORTED_DECISIONS = new Set<Agents.ToolApprovalDecisionType>([
 ]);
 
 /** Collects one ordered tool batch that must be reviewed before any call runs. */
-export function createPiPauseController(): PiPauseController {
+export function createPiPauseController(
+  options: {
+    mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  } = {},
+): PiPauseController {
   let signal: PiPauseSignal | undefined;
   const requestedCalls = new Map<string, PiPauseToolCall>();
 
@@ -68,6 +73,12 @@ export function createPiPauseController(): PiPauseController {
         toolCall.name,
         toolCall.toolCallId,
         toolCall.args,
+        {
+          ...(options.mcpToolSchemas == null ? {} : { mcpToolSchemas: options.mcpToolSchemas }),
+          ...('kind' in toolCall && toolCall.kind === 'mcp'
+            ? { expectedSchemaFingerprint: toolCall.schemaFingerprint }
+            : {}),
+        },
       );
       let codeSessionContext: PiCodeSessionSnapshot | undefined;
       try {
@@ -102,6 +113,10 @@ export function createPiPauseController(): PiPauseController {
         if (
           previousCall.name !== toolCall.name ||
           JSON.stringify(previousCall.args) !== JSON.stringify(validatedCall.args) ||
+          ('kind' in previousCall ? previousCall.kind : undefined) !==
+            ('kind' in validatedCall ? validatedCall.kind : undefined) ||
+          ('schemaFingerprint' in previousCall ? previousCall.schemaFingerprint : undefined) !==
+            ('schemaFingerprint' in validatedCall ? validatedCall.schemaFingerprint : undefined) ||
           previousCall.hostExecution.toolCallId !== toolCall.hostExecution.toolCallId ||
           previousCall.hostExecution.toolTurn !== toolCall.hostExecution.toolTurn ||
           JSON.stringify(previousCall.hostExecution.stepIdentity) !==

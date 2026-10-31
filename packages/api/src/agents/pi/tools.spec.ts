@@ -1,6 +1,6 @@
-import { Tools } from 'librechat-data-provider';
 import { WebSearchToolDefinition } from '@librechat/agents';
 import { CalculatorToolDefinition, Constants } from '@librechat/agents';
+import { Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
 import {
@@ -13,6 +13,7 @@ import {
   type PiHostToolExecutor,
 } from './tools';
 import { PI_BASH_TOOL_NAME, PI_CALCULATOR_TOOL_NAME, PI_READ_FILE_TOOL_NAME } from './toolNames';
+import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 
 const fileSearchParameters: NonNullable<LCTool['parameters']> = {
   type: 'object',
@@ -100,6 +101,55 @@ function hostExecutor(implementation: PiHostToolExecutor = async () => successfu
 }
 
 describe('createPiTools', () => {
+  it('creates a schema-bound host adapter for an authorized MCP definition', async () => {
+    const nameValue = `lookup${DataConstants.mcp_delimiter}inventory`;
+    if (!isPiMcpToolName(nameValue)) {
+      throw new Error('Expected a valid MCP tool name.');
+    }
+    const parameters = {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 2, maxLength: 40 },
+        includeInactive: { type: 'boolean' },
+      },
+      required: ['query'],
+    };
+    const schema = createPiMcpToolSchema(nameValue, parameters);
+    const execute = hostExecutor();
+    const [tool] = createPiTools({
+      definitions: [
+        {
+          name: nameValue,
+          description: 'Look up inventory records.',
+          parameters,
+        },
+      ],
+      execute,
+    });
+
+    expect(tool).toMatchObject({
+      name: nameValue,
+      label: nameValue,
+      executionMode: 'sequential',
+      parameters: { type: 'object', required: ['query'], additionalProperties: false },
+    });
+    await tool.execute('pi-mcp-call-1', { query: 'motor', includeInactive: false });
+    expect(execute).toHaveBeenCalledWith(
+      {
+        kind: 'mcp',
+        toolCallId: 'pi-mcp-call-1',
+        name: nameValue,
+        args: { query: 'motor', includeInactive: false },
+        schemaFingerprint: schema.fingerprint,
+      },
+      undefined,
+    );
+    await expect(tool.execute('pi-mcp-invalid', { query: 'x', extra: true })).rejects.toMatchObject(
+      { code: 'PI_TOOL_ARGUMENTS_INVALID' },
+    );
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('creates strict managed Code API tool schemas and forwards only validated args', async () => {
     const execute = hostExecutor();
     const tools = createPiTools({ definitions: [bashDefinition, readFileDefinition], execute });
@@ -341,7 +391,7 @@ describe('createPiTools', () => {
   it('rejects any callable tool outside the reviewed host adapters', () => {
     expect(() =>
       createPiTools({
-        definitions: [{ name: 'search_mcp_docs' }],
+        definitions: [{ name: 'search_docs' }],
         execute: async () => successfulResult(),
       }),
     ).toThrow(new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED'));
@@ -350,7 +400,7 @@ describe('createPiTools', () => {
   it('rejects a set containing a supported tool and an unsupported tool', () => {
     expect(() =>
       createPiTools({
-        definitions: [fileSearchDefinition, { name: 'search_mcp_docs' }],
+        definitions: [fileSearchDefinition, { name: 'search_docs' }],
         execute: async () => successfulResult(),
       }),
     ).toThrow(new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED'));

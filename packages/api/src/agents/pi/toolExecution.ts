@@ -11,6 +11,12 @@ import type {
   PiWebSearchArguments,
   PiToolArguments,
 } from './tools';
+import type {
+  PiMcpToolArguments,
+  PiMcpSchemaFingerprint,
+  PiMcpToolName,
+  PiMcpToolSchemaRegistry,
+} from './mcpSchema';
 import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
@@ -23,6 +29,7 @@ import {
   isPiSupportedHostToolName,
 } from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
+import { isPiMcpToolName } from './mcpSchema';
 
 export type PiToolExecutionInput = PiHostToolExecutionInput;
 
@@ -83,12 +90,22 @@ export type PiHostToolCall =
       stepId: string;
       turn?: number;
       codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      kind: 'mcp';
+      id: string;
+      name: PiMcpToolName;
+      args: PiMcpToolArguments;
+      schemaFingerprint: PiMcpSchemaFingerprint;
+      stepId: string;
+      turn?: number;
     };
 
 export interface PiToolExecutionOptions {
   createStepIdentity(): PiMessageStepIdentity;
   createToolCallId(): string;
   executeHostToolCall(call: PiHostToolCall, signal?: AbortSignal): Promise<ToolExecuteResult>;
+  mcpToolSchemas?: PiMcpToolSchemaRegistry;
   getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
   /** Per-tool call counts reconstructed from the current generation on resume. */
   initialToolUsageCounts?: Readonly<Record<string, number>>;
@@ -125,7 +142,7 @@ export function buildPiToolUsageCounts(input: {
         continue;
       }
       const name = toolCall.function.name;
-      if (typeof name === 'string' && isPiSupportedHostToolName(name)) {
+      if (typeof name === 'string' && (isPiSupportedHostToolName(name) || isPiMcpToolName(name))) {
         counts[name] = (counts[name] ?? 0) + 1;
       }
     }
@@ -133,7 +150,7 @@ export function buildPiToolUsageCounts(input: {
   const pendingTool = input.pendingTool;
   if (
     pendingTool != null &&
-    isPiSupportedHostToolName(pendingTool.name) &&
+    (isPiSupportedHostToolName(pendingTool.name) || isPiMcpToolName(pendingTool.name)) &&
     Number.isSafeInteger(pendingTool.turn) &&
     pendingTool.turn >= 0
   ) {
@@ -250,6 +267,18 @@ function toPauseToolCall(
   review: PiPauseToolCall['review'],
   codeSessionContext?: PiCodeSessionSnapshot,
 ): PiPauseToolCall {
+  if ('kind' in input && input.kind === 'mcp') {
+    return {
+      kind: 'mcp',
+      toolCallId: input.toolCallId,
+      name: input.name,
+      args: input.args,
+      schemaFingerprint: input.schemaFingerprint,
+      ...(codeSessionContext == null ? {} : { codeSessionContext }),
+      hostExecution,
+      review,
+    };
+  }
   switch (input.name) {
     case Tools.file_search:
       return {
@@ -296,10 +325,23 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    default:
+      throw new Error('The Pi approval call has no host tool adapter.');
   }
 }
 
 function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: string): PiHostToolCall {
+  if ('kind' in input && input.kind === 'mcp') {
+    return {
+      kind: 'mcp',
+      id,
+      name: input.name,
+      args: input.args,
+      schemaFingerprint: input.schemaFingerprint,
+      stepId,
+      turn: input.turn,
+    };
+  }
   switch (input.name) {
     case Tools.file_search:
       return {
@@ -341,6 +383,8 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
         stepId,
         turn: input.turn,
       };
+    default:
+      throw new Error('The Pi execution call has no host tool adapter.');
   }
 }
 
@@ -582,7 +626,11 @@ export function createPiHostToolExecutor(
   const now = options.now ?? Date.now;
   const nextTurnByTool = new Map<string, number>();
   for (const [name, count] of Object.entries(options.initialToolUsageCounts ?? {})) {
-    if (isPiSupportedHostToolName(name) && Number.isSafeInteger(count) && count >= 0) {
+    if (
+      (isPiSupportedHostToolName(name) || isPiMcpToolName(name)) &&
+      Number.isSafeInteger(count) &&
+      count >= 0
+    ) {
       nextTurnByTool.set(name, count);
     }
   }
@@ -617,6 +665,15 @@ export function createPiHostToolExecutor(
 
     const toolInput: PiToolExecutionContext = { ...input, turn: takeNextToolTurn(input.name) };
     let executionInput = toolInput;
+    const validateGateArguments = (args: PiToolArguments): PiToolExecutionContext => ({
+      ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, args, {
+        ...(options.mcpToolSchemas == null ? {} : { mcpToolSchemas: options.mcpToolSchemas }),
+        ...('kind' in toolInput && toolInput.kind === 'mcp'
+          ? { expectedSchemaFingerprint: toolInput.schemaFingerprint }
+          : {}),
+      }),
+      turn: toolInput.turn,
+    });
 
     if (options.pauseGate != null) {
       const pendingPause = options.pauseGate.controller.signal;
@@ -650,10 +707,7 @@ export function createPiHostToolExecutor(
       switch (decision.kind) {
         case 'execute':
           if (decision.args != null) {
-            executionInput = {
-              ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, decision.args),
-              turn: toolInput.turn,
-            };
+            executionInput = validateGateArguments(decision.args);
           }
           break;
         case 'deny': {
@@ -674,10 +728,7 @@ export function createPiHostToolExecutor(
         }
         case 'pause': {
           if (decision.args != null) {
-            executionInput = {
-              ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, decision.args),
-              turn: toolInput.turn,
-            };
+            executionInput = validateGateArguments(decision.args);
           }
           const pausedStep = await startPiToolStep(options, executionInput, now(), now);
           return createPauseResult(

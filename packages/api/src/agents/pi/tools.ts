@@ -4,6 +4,17 @@ import type { AgentToolResult, ToolDefinition } from '@earendil-works/pi-coding-
 import type { LCTool } from '@librechat/agents';
 import type { TSchema } from 'typebox';
 import {
+  createPiMcpToolSchema,
+  createPiMcpToolSchemaRegistry,
+  isPiMcpToolName,
+  PiMcpSchemaCompatibilityError,
+  type PiMcpSchemaFingerprint,
+  type PiMcpToolArguments,
+  type PiMcpToolName,
+  type PiMcpToolSchema,
+  type PiMcpToolSchemaRegistry,
+} from './mcpSchema';
+import {
   isPiSupportedHostToolName,
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
@@ -38,12 +49,14 @@ export type PiReadFileArguments = {
   intent?: string;
 };
 
-export type PiToolArguments =
+export type PiBuiltInToolArguments =
   | PiFileSearchArguments
   | PiWebSearchArguments
   | PiCalculatorArguments
   | PiBashArguments
   | PiReadFileArguments;
+
+export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments;
 
 const MAX_PI_READ_FILE_LINES = 500;
 
@@ -72,6 +85,13 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof PI_READ_FILE_TOOL_NAME;
       args: PiReadFileArguments;
+    }
+  | {
+      kind: 'mcp';
+      toolCallId: string;
+      name: PiMcpToolName;
+      args: PiMcpToolArguments;
+      schemaFingerprint: PiMcpSchemaFingerprint;
     };
 
 /** The caller owns authorization and execution; this module only supplies Pi's tool contract. */
@@ -138,6 +158,23 @@ export class PiToolCompatibilityError extends Error {
     super(ERROR_MESSAGES[code]);
     this.name = 'PiToolCompatibilityError';
     this.code = code;
+  }
+}
+
+export interface PiToolValidationContext {
+  mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  mcpToolSchema?: PiMcpToolSchema;
+  expectedSchemaFingerprint?: PiMcpSchemaFingerprint;
+}
+
+function validateMcpSchemaResult<T>(operation: () => T): T {
+  try {
+    return operation();
+  } catch (error) {
+    if (error instanceof PiMcpSchemaCompatibilityError) {
+      throw new PiToolCompatibilityError(error.code);
+    }
+    throw error;
   }
 }
 
@@ -410,6 +447,9 @@ function convertPiCodeToolSchema(name: string, schema: Record<string, unknown>):
 
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
+  if (isPiMcpToolName(name)) {
+    return validateMcpSchemaResult(() => createPiMcpToolSchema(name, schema).parameters);
+  }
   if (
     !isPiSupportedHostToolName(name) ||
     !isRecord(schema) ||
@@ -597,6 +637,7 @@ export function validatePiToolExecutionInput(
   name: string,
   toolCallId: string,
   args: unknown,
+  context: PiToolValidationContext = {},
 ): PiHostToolExecutionInput {
   if (toolCallId.length === 0) {
     throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
@@ -633,8 +674,28 @@ export function validatePiToolExecutionInput(
         name: PI_READ_FILE_TOOL_NAME,
         args: validatePiReadFileArguments(args),
       };
-    default:
-      throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+    default: {
+      if (!isPiMcpToolName(name)) {
+        throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+      }
+      const schema = context.mcpToolSchema ?? context.mcpToolSchemas?.get(name);
+      if (schema == null) {
+        throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+      }
+      if (
+        context.expectedSchemaFingerprint != null &&
+        schema.fingerprint !== context.expectedSchemaFingerprint
+      ) {
+        throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+      }
+      return {
+        kind: 'mcp',
+        toolCallId,
+        name,
+        args: validateMcpSchemaResult(() => schema.validateArguments(args)),
+        schemaFingerprint: schema.fingerprint,
+      };
+    }
   }
 }
 
@@ -647,23 +708,34 @@ export async function executePiToolCall(input: {
   name: string;
   toolCallId: string;
   arguments: unknown;
+  mcpToolSchema?: PiMcpToolSchema;
   signal?: AbortSignal;
 }): Promise<AgentToolResult> {
   if (typeof input.execute !== 'function') {
     throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
   }
-  if (!isPiSupportedHostToolName(input.name)) {
+  if (!isPiSupportedHostToolName(input.name) && !isPiMcpToolName(input.name)) {
     throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
   }
   return input.execute(
-    validatePiToolExecutionInput(input.name, input.toolCallId, input.arguments),
+    validatePiToolExecutionInput(input.name, input.toolCallId, input.arguments, {
+      ...(input.mcpToolSchema == null ? {} : { mcpToolSchema: input.mcpToolSchema }),
+    }),
     input.signal,
   );
+}
+
+/** Compile schemas once per isolated Pi generation and translate boundary errors. */
+export function compilePiMcpToolSchemaRegistry(
+  definitions: readonly PiHostToolDefinition[],
+): PiMcpToolSchemaRegistry {
+  return validateMcpSchemaResult(() => createPiMcpToolSchemaRegistry(definitions));
 }
 
 export function createPiTools(input: {
   definitions: readonly PiHostToolDefinition[];
   execute?: PiHostToolExecutor;
+  mcpToolSchemas?: PiMcpToolSchemaRegistry;
 }): PiToolDefinition[] {
   if (!Array.isArray(input.definitions)) {
     throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
@@ -675,10 +747,28 @@ export function createPiTools(input: {
     throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
   }
 
+  const definitionNames = new Set<string>();
+  for (const definition of input.definitions) {
+    const candidateName: unknown = definition.name;
+    if (
+      typeof candidateName !== 'string' ||
+      (!isPiSupportedHostToolName(candidateName) && !isPiMcpToolName(candidateName)) ||
+      definitionNames.has(candidateName)
+    ) {
+      throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+    }
+    definitionNames.add(candidateName);
+  }
+
+  const mcpToolSchemas = input.mcpToolSchemas ?? compilePiMcpToolSchemaRegistry(input.definitions);
+
   const seenNames = new Set<string>();
   return input.definitions.map((definition) => {
     const candidateName: unknown = definition.name;
-    if (!isPiSupportedHostToolName(candidateName) || seenNames.has(candidateName)) {
+    if (
+      (!isPiSupportedHostToolName(candidateName) && !isPiMcpToolName(candidateName)) ||
+      seenNames.has(candidateName)
+    ) {
       throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
     }
     seenNames.add(candidateName);
@@ -687,6 +777,29 @@ export function createPiTools(input: {
     }
 
     const name = candidateName;
+    if (isPiMcpToolName(name)) {
+      const schema = mcpToolSchemas.get(name);
+      if (schema == null) {
+        throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+      }
+      const description = validateDescription(definition.description);
+      return {
+        name,
+        label: name,
+        description: description ?? name,
+        parameters: schema.parameters,
+        executionMode: 'sequential',
+        execute: (toolCallId, args, signal) =>
+          executePiToolCall({
+            execute: input.execute,
+            name,
+            toolCallId,
+            arguments: args,
+            mcpToolSchema: schema,
+            signal,
+          }),
+      };
+    }
     const parameters = convertPiToolSchema(name, definition.parameters);
     return {
       name,

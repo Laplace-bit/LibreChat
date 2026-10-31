@@ -1,5 +1,6 @@
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
+import { isPiMcpToolName } from './mcpSchema';
 
 export type PiUnsupportedTurnMode =
   | 'event_actor'
@@ -67,8 +68,10 @@ export function isPiManagedCodeExecutionCompatible(
  */
 export function assertPiCompatible(input: PiCompatibilityInput): void {
   const supportedNames = new Set(
-    input.supportedToolNames.filter((name) =>
-      PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name),
+    input.supportedToolNames.filter(
+      (name) =>
+        PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name) ||
+        isPiMcpToolName(name),
     ),
   );
   if (

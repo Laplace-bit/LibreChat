@@ -1,5 +1,5 @@
-import { Tools } from 'librechat-data-provider';
 import { DATE_RANGE, Constants } from '@librechat/agents';
+import { Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
 import type { PiPauseToolCall } from './pause';
 import {
@@ -7,10 +7,13 @@ import {
   buildPiApprovalInterruptPayload,
   createPiApprovalContinuation,
   matchesPiApprovalHostState,
+  revalidatePiMcpApprovalArguments,
   resolvePiApprovalContinuation,
   resolvePiApprovalDecision,
 } from './resume';
+import { createPiMcpToolSchemaRegistry } from './mcpSchema';
 import { buildPendingAction } from '~/agents/hitl/policy';
+import { createPiPauseController } from './pause';
 
 function createApproval() {
   const toolCall: PiPauseToolCall = {
@@ -87,7 +90,111 @@ function hostState(args: Record<string, unknown> = { query: 'maintenance manual'
   };
 }
 
+function createMcpApproval() {
+  const name = `lookup${DataConstants.mcp_delimiter}inventory`;
+  const parameters = {
+    type: 'object',
+    properties: { query: { type: 'string', minLength: 2 } },
+    required: ['query'],
+  };
+  const mcpToolSchemas = createPiMcpToolSchemaRegistry([{ name, parameters }]);
+  const toolName = [...mcpToolSchemas.keys()][0];
+  const schema = toolName == null ? undefined : mcpToolSchemas.get(toolName);
+  if (toolName == null || schema == null) {
+    throw new Error('Test MCP schema failed to compile');
+  }
+  const toolCall = {
+    kind: 'mcp' as const,
+    toolCallId: 'pi-mcp-call-1',
+    name: toolName,
+    args: { query: 'pump' },
+    schemaFingerprint: schema.fingerprint,
+    hostExecution: {
+      toolCallId: 'host-mcp-call-1',
+      toolTurn: 1,
+      stepIdentity: {
+        id: 'mcp-step-1',
+        index: 3,
+        messageId: 'response-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 101,
+    },
+    review: { allowedDecisions: ['approve', 'reject', 'edit', 'respond'] as const },
+  };
+  const signal = createPiPauseController({ mcpToolSchemas }).request(toolCall);
+  if (signal.kind !== 'tool_approval') {
+    throw new Error('Test MCP approval did not pause');
+  }
+  const payload = buildPiApprovalInterruptPayload({
+    kind: 'mcp',
+    hostToolCallId: toolCall.hostExecution.toolCallId,
+    toolName,
+    args: toolCall.args,
+    schemaFingerprint: schema.fingerprint,
+    mcpToolSchemas,
+    allowedDecisions: toolCall.review.allowedDecisions,
+  });
+  const pendingAction = buildPendingAction(payload, {
+    streamId: 'conversation-1',
+    conversationId: 'conversation-1',
+    runId: 'response-1',
+    responseMessageId: 'response-1',
+  });
+  const continuation = createPiApprovalContinuation(pendingAction.actionId, signal.toolCall);
+  return { continuation, mcpToolSchemas, pendingAction, parameters, toolName };
+}
+
 describe('Pi approval continuation', () => {
+  it('persists the MCP schema fingerprint and revalidates against current authorized schemas', () => {
+    const { continuation, mcpToolSchemas, pendingAction, parameters, toolName } =
+      createMcpApproval();
+    expect(continuation).toMatchObject({ kind: 'mcp', toolName, args: { query: 'pump' } });
+    expect('schemaFingerprint' in continuation).toBe(true);
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+
+    expect(
+      revalidatePiMcpApprovalArguments({
+        continuation,
+        arguments: { query: 'pump station' },
+        mcpToolSchemas,
+      }),
+    ).toEqual({ query: 'pump station' });
+
+    const changedSchema = createPiMcpToolSchemaRegistry([
+      { name: toolName, parameters: { ...parameters, description: 'Changed after approval' } },
+    ]);
+    expect(() =>
+      revalidatePiMcpApprovalArguments({
+        continuation,
+        arguments: continuation.args,
+        mcpToolSchemas: changedSchema,
+      }),
+    ).toThrow('This tool schema is not supported by the Pi runtime.');
+    expect(() =>
+      revalidatePiMcpApprovalArguments({
+        continuation,
+        arguments: continuation.args,
+        mcpToolSchemas: createPiMcpToolSchemaRegistry([]),
+      }),
+    ).toThrow('This tool schema is not supported by the Pi runtime.');
+    expect(() =>
+      revalidatePiMcpApprovalArguments({
+        continuation,
+        arguments: { query: 'x' },
+        mcpToolSchemas,
+      }),
+    ).toThrow('The Pi tool arguments are invalid.');
+  });
+
   it('persists the managed Code API session snapshot and requires an approval target binding', () => {
     const toolCall: PiPauseToolCall = {
       toolCallId: 'pi-code-call',

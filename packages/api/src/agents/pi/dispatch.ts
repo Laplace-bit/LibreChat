@@ -8,14 +8,15 @@ import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
+import type { PiMcpToolSchemaRegistry } from './mcpSchema';
 import type { PiApprovalContinuation } from './resume';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostSessionOutcome } from './bridge';
 import type { PiModelBinding } from './session';
 import type { PiToolArguments } from './tools';
+import { compilePiMcpToolSchemaRegistry, createPiTools, PiToolCompatibilityError } from './tools';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { createPiTools, PiToolCompatibilityError } from './tools';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
 import { appendPiToolResultContinuation } from './resume';
@@ -43,6 +44,8 @@ export interface PiGenerationDispatchInput {
   createModelBinding(): Promise<PiModelBinding>;
   /** Tool definitions are the initialized root agent's host-authorized tools. */
   toolDefinitions?: readonly LCTool[];
+  /** Schemas compiled from the same authorized host definitions used to build tools. */
+  mcpToolSchemas?: PiMcpToolSchemaRegistry;
   /** Executes a tool through the existing host handler. */
   executeHostToolCall?: (call: PiHostToolCall, signal?: AbortSignal) => Promise<ToolExecuteResult>;
   /** Server-owned context persisted if a Code API tool waits for approval. */
@@ -94,7 +97,17 @@ export function createPiGenerationDispatcher(
     }
 
     const usage: UsageMetadata[] = [];
-    const pauseController = createPiPauseController();
+    const toolDefinitions = input.toolDefinitions ?? [];
+    let mcpToolSchemas: PiMcpToolSchemaRegistry;
+    try {
+      mcpToolSchemas = input.mcpToolSchemas ?? compilePiMcpToolSchemaRegistry(toolDefinitions);
+    } catch (error) {
+      if (error instanceof PiToolCompatibilityError) {
+        throw new AgentRuntimeUnavailableError();
+      }
+      throw error;
+    }
+    const pauseController = createPiPauseController({ mcpToolSchemas });
     const eventSequencer = createPiHostEventSequencer(async (event) => {
       if (event.event === UsageEvents.ON_TOKEN_USAGE) {
         usage.push(event.data);
@@ -114,6 +127,7 @@ export function createPiGenerationDispatcher(
           createStepIdentity: input.createToolStepIdentity,
           createToolCallId: input.createToolCallId,
           executeHostToolCall: input.executeHostToolCall,
+          mcpToolSchemas,
           ...(input.getCodeSessionContext == null
             ? {}
             : { getCodeSessionContext: input.getCodeSessionContext }),
@@ -132,8 +146,9 @@ export function createPiGenerationDispatcher(
         });
       }
       tools = createPiTools({
-        definitions: input.toolDefinitions ?? [],
+        definitions: toolDefinitions,
         execute: executeTool,
+        mcpToolSchemas,
       });
     } catch (error) {
       if (error instanceof PiToolCompatibilityError) {

@@ -1,4 +1,5 @@
-import { Tools } from 'librechat-data-provider';
+import { Constants, Tools } from 'librechat-data-provider';
+import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiPauseController } from './pause';
 
@@ -55,6 +56,42 @@ describe('Pi pause controller', () => {
     expect(controller.request(call)).toEqual({ kind: 'tool_approval', toolCall: call });
     expect(() => controller.request({ ...call, args: { input: '2 + 3' } })).toThrow(
       'A Pi tool call ID cannot refer to two different host actions',
+    );
+  });
+
+  it('requires the current MCP schema before staging an approval', () => {
+    const rawName = `lookup${Constants.mcp_delimiter}inventory`;
+    if (!isPiMcpToolName(rawName)) {
+      throw new Error('Expected a valid MCP tool name.');
+    }
+    const schema = createPiMcpToolSchema(rawName, {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    });
+    const call = {
+      kind: 'mcp' as const,
+      toolCallId: 'pi-mcp-call-1',
+      name: rawName,
+      args: { query: 'pump inventory' },
+      schemaFingerprint: schema.fingerprint,
+      hostExecution: {
+        toolCallId: 'host-mcp-call-1',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'mcp-step-1',
+          index: 0,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 1,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] as const },
+    };
+
+    expect(() => createPiPauseController().request(call)).toThrow(
+      'This tool schema is not supported by the Pi runtime.',
     );
   });
 

@@ -10312,6 +10312,16 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['path'],
     },
   };
+  const mcpToolName = `lookup${Constants.mcp_delimiter}inventory`;
+  const mcpToolDefinition = {
+    name: mcpToolName,
+    description: 'Look up inventory status.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', minLength: 2, maxLength: 80 } },
+      required: ['query'],
+    },
+  };
   const createPiFileSearchClient = ({
     toolApproval,
     agentOverrides = {},
@@ -10723,6 +10733,164 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
       calculatorDefinition,
     ]);
+  });
+
+  it('routes an authorized foreground MCP tool through the host handler with validated arguments', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: {
+        endpoints: { [EModelEndpoint.agents]: { toolApproval: { enabled: true, mode: 'bypass' } } },
+      },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Inventory is ready.',
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: mcpToolName }],
+        toolDefinitions: [mcpToolDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let gateDecision;
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      const args = { query: 'pump inventory' };
+      const schema = input.mcpToolSchemas.get(mcpToolName);
+      gateDecision = await input.toolExecutionGate({
+        kind: 'mcp',
+        toolCallId: 'pi-mcp-call',
+        name: mcpToolName,
+        args,
+        schemaFingerprint: schema.fingerprint,
+        turn: 0,
+      });
+      toolResult = await input.executeHostToolCall(
+        {
+          kind: 'mcp',
+          id: 'host-mcp-call',
+          name: mcpToolName,
+          args,
+          schemaFingerprint: schema.fingerprint,
+          stepId: 'host-mcp-step',
+          turn: 0,
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0]).toHaveProperty('toolExecutionGate');
+    expect(gateDecision).toEqual({ kind: 'execute' });
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch, metadata] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-mcp-call',
+        name: mcpToolName,
+        args: { query: 'pump inventory' },
+        stepId: 'host-mcp-step',
+        turn: 0,
+      },
+    ]);
+    expect(batch.userId).toBe('user-pi');
+    expect(batch.agentId).toBe('agent-pi');
+    expect(batch.configurable).toMatchObject({ req, user_id: 'user-pi' });
+    expect(metadata).toMatchObject({ thread_id: 'conversation-pi', run_id: 'response-pi' });
+    expect(toolResult).toMatchObject({
+      toolCallId: 'host-mcp-call',
+      status: 'success',
+      content: 'Inventory is ready.',
+    });
+    expect(batch.metadata).not.toHaveProperty('schemaFingerprint');
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([mcpToolDefinition]);
+  });
+
+  it('rejects an MCP approval before model or host execution when its current schema changed', async () => {
+    const api = require('@librechat/api');
+    const originalSchema = api.createPiMcpToolSchema(mcpToolName, mcpToolDefinition.parameters);
+    const changedDefinition = {
+      ...mcpToolDefinition,
+      parameters: { ...mcpToolDefinition.parameters, description: 'Changed after approval.' },
+    };
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: {
+        endpoints: { [EModelEndpoint.agents]: { toolApproval: { enabled: true, mode: 'bypass' } } },
+      },
+    };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: mcpToolName }],
+        toolDefinitions: [changedDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    client.loadHistory = jest.fn().mockResolvedValue([
+      {
+        messageId: 'parent-pi',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'Continue the inventory lookup.',
+      },
+    ]);
+    client.buildMessages = jest.fn().mockResolvedValue({ prompt: [] });
+    client.getBuildMessagesOptions = jest.fn(() => ({}));
+    client.isCompactionTurn = jest.fn(() => false);
+    const continuation = {
+      version: 1,
+      actionId: 'action-mcp-1',
+      piToolCallId: 'pi-mcp-call-1',
+      hostToolCallId: 'host-mcp-call-1',
+      toolTurn: 0,
+      kind: 'mcp',
+      toolName: mcpToolName,
+      args: { query: 'pump inventory' },
+      schemaFingerprint: originalSchema.fingerprint,
+      allowedDecisions: ['approve', 'reject'],
+      stepIdentity: {
+        id: 'step-mcp-1',
+        index: 0,
+        messageId: 'response-pi',
+        runId: 'response-pi',
+        agentId: 'agent-pi',
+      },
+      stepCreatedAt: 100,
+    };
+
+    await client.resumeCompletion({
+      resumeValue: {},
+      piApprovalContinuation: continuation,
+      piApprovalDecision: { kind: 'execute', args: continuation.args },
+      runSteps: [],
+    });
+
+    expect(client.loadHistory).toHaveBeenCalledTimes(1);
+    expect(client.buildMessages).toHaveBeenCalledTimes(1);
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+    expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
   });
 
   it('routes web_search through the host handler with its citation turn', async () => {

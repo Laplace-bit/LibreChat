@@ -1,4 +1,5 @@
 import { Tools } from 'librechat-data-provider';
+import { Constants as DataConstants } from 'librechat-data-provider';
 import {
   Constants,
   GraphEvents,
@@ -7,6 +8,7 @@ import {
   type ToolExecuteResult,
 } from '@librechat/agents';
 import type { PiHostToolCall } from './toolExecution';
+import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiCodeSessionBridge } from './codeSession';
@@ -71,6 +73,82 @@ function successfulResult(toolCallId = 'pi-call-1'): ToolExecuteResult {
 
 describe('createPiHostToolBatchExecutor', () => {
   const serverRequest = Object.freeze({ requestId: 'request-1' });
+
+  it('requires the exact server-authorized MCP name and keeps schema identity out of host metadata', async () => {
+    const rawName = `lookup${DataConstants.mcp_delimiter}inventory`;
+    if (!isPiMcpToolName(rawName)) {
+      throw new Error('Expected a valid MCP tool name.');
+    }
+    const schema = createPiMcpToolSchema(rawName, {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    });
+    const call: PiHostToolCall = {
+      kind: 'mcp',
+      id: 'pi-mcp-call-1',
+      name: rawName,
+      args: { query: 'stock status' },
+      schemaFingerprint: schema.fingerprint,
+      stepId: 'pi-mcp-step-1',
+      turn: 0,
+    };
+    const result = successfulResult(call.id);
+    const { handler, handle } = createHandler((batch) => batch.resolve([result]));
+    const execute = createPiHostToolBatchExecutor({
+      handler,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: serverRequest,
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+      authorizedToolNames: [rawName],
+    });
+
+    await expect(execute(call)).resolves.toBe(result);
+
+    const batch = getToolBatch(handle.mock.calls[0]?.[1]);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: call.id,
+        name: rawName,
+        args: call.args,
+        stepId: call.stepId,
+        turn: call.turn,
+      },
+    ]);
+    expect(batch.metadata).not.toHaveProperty('schemaFingerprint');
+  });
+
+  it('rejects a dynamic MCP name when no exact authorized tool set is supplied', async () => {
+    const rawName = `lookup${DataConstants.mcp_delimiter}inventory`;
+    if (!isPiMcpToolName(rawName)) {
+      throw new Error('Expected a valid MCP tool name.');
+    }
+    const schema = createPiMcpToolSchema(rawName, { type: 'object', properties: {} });
+    const call: PiHostToolCall = {
+      kind: 'mcp',
+      id: 'pi-mcp-call-1',
+      name: rawName,
+      args: {},
+      schemaFingerprint: schema.fingerprint,
+      stepId: 'pi-mcp-step-1',
+    };
+    const { handler, handle } = createHandler(() => undefined);
+    const execute = createPiHostToolBatchExecutor({
+      handler,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: serverRequest,
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+    });
+
+    await expect(execute(call)).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
+    expect(handle).not.toHaveBeenCalled();
+  });
 
   it('dispatches one exact call through ON_TOOL_EXECUTE with authoritative run metadata', async () => {
     const call = hostCall();

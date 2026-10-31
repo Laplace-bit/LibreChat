@@ -1,13 +1,25 @@
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
 import type { Agents } from 'librechat-data-provider';
-import type { PiHostToolExecutionInput, PiToolArguments } from './tools';
+import type {
+  PiMcpSchemaFingerprint,
+  PiMcpToolArguments,
+  PiMcpToolName,
+  PiMcpToolSchemaRegistry,
+} from './mcpSchema';
+import type { PiBuiltInToolArguments, PiHostToolExecutionInput, PiToolArguments } from './tools';
 import type { PiHistoryConversion, PiHistoryMessage } from './history';
 import type { PiCodeSessionSnapshot } from './codeSession';
+import type { PiSupportedHostTool } from './toolNames';
 import type { PiMessageStepIdentity } from './events';
 import type { PiPauseToolCall } from './pause';
+import {
+  isPiMcpSchemaFingerprint,
+  isPiMcpToolName,
+  normalizePiMcpToolArguments,
+} from './mcpSchema';
 import { isPiCodeExecutionToolName, isPiSupportedHostToolName } from './toolNames';
+import { PiToolCompatibilityError, validatePiToolExecutionInput } from './tools';
 import { parsePiCodeSessionSnapshot } from './codeSession';
-import { validatePiToolExecutionInput } from './tools';
 
 export const PI_RESUME_CONTINUATION_VERSION = 1 as const;
 export const PI_RESUMABLE_TOOL_DECISIONS: readonly Agents.ToolApprovalDecisionType[] = [
@@ -17,14 +29,12 @@ export const PI_RESUMABLE_TOOL_DECISIONS: readonly Agents.ToolApprovalDecisionTy
   'respond',
 ];
 
-export interface PiApprovalContinuation {
+export interface PiApprovalContinuationFields {
   readonly version: typeof PI_RESUME_CONTINUATION_VERSION;
   readonly actionId: string;
   readonly piToolCallId: string;
   readonly hostToolCallId: string;
   readonly toolTurn: number;
-  readonly toolName: PiHostToolExecutionInput['name'];
-  readonly args: PiToolArguments;
   readonly allowedDecisions: readonly Agents.ToolApprovalDecisionType[];
   readonly description?: string;
   readonly codeSessionContext?: PiCodeSessionSnapshot;
@@ -32,13 +42,41 @@ export interface PiApprovalContinuation {
   readonly stepCreatedAt: number;
 }
 
-export interface PiApprovalInterruptInput {
+export type PiApprovalContinuation = PiApprovalContinuationFields &
+  (
+    | {
+        readonly kind?: never;
+        readonly toolName: PiSupportedHostTool;
+        readonly args: PiBuiltInToolArguments;
+        readonly schemaFingerprint?: never;
+      }
+    | {
+        readonly kind: 'mcp';
+        readonly toolName: PiMcpToolName;
+        readonly args: PiMcpToolArguments;
+        readonly schemaFingerprint: PiMcpSchemaFingerprint;
+      }
+  );
+
+export type PiApprovalInterruptInput = {
   readonly hostToolCallId: string;
-  readonly toolName: PiApprovalContinuation['toolName'];
-  readonly args: PiToolArguments;
   readonly allowedDecisions: readonly Agents.ToolApprovalDecisionType[];
   readonly description?: string;
-}
+} & (
+  | {
+      readonly kind?: never;
+      readonly toolName: PiSupportedHostTool;
+      readonly args: PiBuiltInToolArguments;
+      readonly schemaFingerprint?: never;
+    }
+  | {
+      readonly kind: 'mcp';
+      readonly toolName: PiMcpToolName;
+      readonly args: PiMcpToolArguments;
+      readonly schemaFingerprint: PiMcpSchemaFingerprint;
+      readonly mcpToolSchemas: PiMcpToolSchemaRegistry;
+    }
+);
 
 const VALID_TOOL_DECISIONS = new Set<Agents.ToolApprovalDecisionType>(PI_RESUMABLE_TOOL_DECISIONS);
 
@@ -94,7 +132,14 @@ function parseStepIdentity(value: unknown): PiMessageStepIdentity | undefined {
 export function buildPiApprovalInterruptPayload(
   input: PiApprovalInterruptInput,
 ): Agents.ToolApprovalInterruptPayload {
-  const validated = validatePiToolExecutionInput(input.toolName, input.hostToolCallId, input.args);
+  const validated = validatePiToolExecutionInput(input.toolName, input.hostToolCallId, input.args, {
+    ...('kind' in input && input.kind === 'mcp'
+      ? {
+          mcpToolSchemas: input.mcpToolSchemas,
+          expectedSchemaFingerprint: input.schemaFingerprint,
+        }
+      : {}),
+  });
   if (
     input.allowedDecisions.length === 0 ||
     input.allowedDecisions.some((decision) => !VALID_TOOL_DECISIONS.has(decision)) ||
@@ -134,20 +179,28 @@ export function createPiApprovalContinuation(
     throw new Error('Pi continuation requires a pending action identity');
   }
   const codeSessionContext = parsePiCodeSessionSnapshot(toolCall.codeSessionContext);
-  return {
+  const fields: PiApprovalContinuationFields = {
     version: PI_RESUME_CONTINUATION_VERSION,
     actionId,
     piToolCallId: toolCall.toolCallId,
     hostToolCallId: toolCall.hostExecution.toolCallId,
     toolTurn: toolCall.hostExecution.toolTurn,
-    toolName: toolCall.name,
-    args: toolCall.args,
     allowedDecisions: [...toolCall.review.allowedDecisions],
     ...(toolCall.review.description == null ? {} : { description: toolCall.review.description }),
     ...(codeSessionContext == null ? {} : { codeSessionContext }),
     stepIdentity: { ...toolCall.hostExecution.stepIdentity },
     stepCreatedAt: toolCall.hostExecution.createdAt,
   };
+  if ('schemaFingerprint' in toolCall) {
+    return {
+      ...fields,
+      kind: 'mcp',
+      toolName: toolCall.name,
+      args: toolCall.args,
+      schemaFingerprint: toolCall.schemaFingerprint,
+    };
+  }
+  return { ...fields, toolName: toolCall.name, args: toolCall.args };
 }
 
 /**
@@ -161,6 +214,11 @@ export function resolvePiApprovalContinuation(input: {
   agentId: string;
 }): PiApprovalContinuation | undefined {
   const { value, pendingAction, responseMessageId, agentId } = input;
+  const hasKind = isRecord(value) && Object.prototype.hasOwnProperty.call(value, 'kind');
+  const hasSchemaFingerprint =
+    isRecord(value) && Object.prototype.hasOwnProperty.call(value, 'schemaFingerprint');
+  const mcpToolName = isRecord(value) && value.kind === 'mcp' ? value.toolName : undefined;
+  const isMcpTool = isPiMcpToolName(mcpToolName);
   if (
     pendingAction == null ||
     !isRecord(value) ||
@@ -175,6 +233,8 @@ export function resolvePiApprovalContinuation(input: {
       'allowedDecisions',
       'stepIdentity',
       'stepCreatedAt',
+      ...(hasKind ? ['kind'] : []),
+      ...(hasSchemaFingerprint ? ['schemaFingerprint'] : []),
       ...(Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')
         ? ['codeSessionContext']
         : []),
@@ -191,7 +251,9 @@ export function resolvePiApprovalContinuation(input: {
     !Number.isSafeInteger(value.toolTurn) ||
     value.toolTurn < 0 ||
     typeof value.toolName !== 'string' ||
-    !isPiSupportedHostToolName(value.toolName) ||
+    (!isPiSupportedHostToolName(value.toolName) && !isMcpTool) ||
+    (isMcpTool && !isPiMcpSchemaFingerprint(value.schemaFingerprint)) ||
+    (!isMcpTool && (hasKind || hasSchemaFingerprint)) ||
     ((isPiCodeExecutionToolName(value.toolName) ||
       Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')) &&
       pendingAction.codeExecutionBinding == null) ||
@@ -210,11 +272,25 @@ export function resolvePiApprovalContinuation(input: {
     return undefined;
   }
 
-  let validatedCall;
-  let stepIdentity;
+  let validatedCall: PiHostToolExecutionInput;
+  let stepIdentity: PiMessageStepIdentity | undefined;
   let codeSessionContext: PiCodeSessionSnapshot | undefined;
+  const schemaFingerprint =
+    isMcpTool && isPiMcpSchemaFingerprint(value.schemaFingerprint)
+      ? value.schemaFingerprint
+      : undefined;
   try {
-    validatedCall = validatePiToolExecutionInput(value.toolName, value.piToolCallId, value.args);
+    if (isMcpTool && schemaFingerprint != null && isPiMcpToolName(value.toolName)) {
+      validatedCall = {
+        kind: 'mcp',
+        toolCallId: value.piToolCallId,
+        name: value.toolName,
+        args: normalizePiMcpToolArguments(value.args),
+        schemaFingerprint,
+      };
+    } else {
+      validatedCall = validatePiToolExecutionInput(value.toolName, value.piToolCallId, value.args);
+    }
     stepIdentity = parseStepIdentity(value.stepIdentity);
     if (Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')) {
       codeSessionContext = parsePiCodeSessionSnapshot(value.codeSessionContext);
@@ -263,20 +339,28 @@ export function resolvePiApprovalContinuation(input: {
     return undefined;
   }
 
-  return {
+  const fields: PiApprovalContinuationFields = {
     version: PI_RESUME_CONTINUATION_VERSION,
     actionId: value.actionId,
     piToolCallId: value.piToolCallId,
     hostToolCallId: value.hostToolCallId,
     toolTurn: value.toolTurn,
-    toolName: validatedCall.name,
-    args: validatedCall.args,
     allowedDecisions,
     ...(value.description == null ? {} : { description: value.description }),
     ...(codeSessionContext == null ? {} : { codeSessionContext }),
     stepIdentity,
     stepCreatedAt: value.stepCreatedAt,
   };
+  if ('schemaFingerprint' in validatedCall) {
+    return {
+      ...fields,
+      kind: 'mcp',
+      toolName: validatedCall.name,
+      args: validatedCall.args,
+      schemaFingerprint: validatedCall.schemaFingerprint,
+    };
+  }
+  return { ...fields, toolName: validatedCall.name, args: validatedCall.args };
 }
 
 function decodeArguments(value: unknown): Record<string, unknown> | undefined {
@@ -352,6 +436,41 @@ export type PiApprovalDecision =
   | { readonly kind: 'reject' }
   | { readonly kind: 'respond'; readonly text: string };
 
+/** Revalidate an approved MCP call against the current authorized tool snapshot. */
+export function revalidatePiMcpApprovalArguments(input: {
+  continuation: PiApprovalContinuation;
+  arguments: unknown;
+  mcpToolSchemas: PiMcpToolSchemaRegistry;
+}): PiMcpToolArguments {
+  const { continuation, arguments: toolArguments, mcpToolSchemas } = input;
+  if (continuation.kind !== 'mcp') {
+    throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+  }
+
+  const currentSchema = mcpToolSchemas.get(continuation.toolName);
+  if (
+    currentSchema == null ||
+    currentSchema.fingerprint !== continuation.schemaFingerprint ||
+    !isPiMcpSchemaFingerprint(continuation.schemaFingerprint)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  const validatedCall = validatePiToolExecutionInput(
+    continuation.toolName,
+    continuation.piToolCallId,
+    toolArguments,
+    {
+      mcpToolSchema: currentSchema,
+      expectedSchemaFingerprint: continuation.schemaFingerprint,
+    },
+  );
+  if (!('schemaFingerprint' in validatedCall)) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+  return validatedCall.args;
+}
+
 /** Decode exactly one reviewed decision and validate edited arguments with the host tool schema. */
 export function resolvePiApprovalDecision(input: {
   continuation: PiApprovalContinuation;
@@ -379,6 +498,12 @@ export function resolvePiApprovalDecision(input: {
         : undefined;
     case 'edit': {
       try {
+        if (continuation.kind === 'mcp') {
+          return {
+            kind: 'execute',
+            args: normalizePiMcpToolArguments(candidate.editedArguments),
+          };
+        }
         const validated = validatePiToolExecutionInput(
           continuation.toolName,
           continuation.piToolCallId,

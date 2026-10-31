@@ -12,7 +12,12 @@ import {
   type PiHostToolExecutionInput,
   type PiHostToolExecutor,
 } from './tools';
-import { PI_BASH_TOOL_NAME, PI_CALCULATOR_TOOL_NAME, PI_READ_FILE_TOOL_NAME } from './toolNames';
+import {
+  PI_BASH_TOOL_NAME,
+  PI_CALCULATOR_TOOL_NAME,
+  PI_READ_FILE_TOOL_NAME,
+  PI_SKILL_TOOL_NAME,
+} from './toolNames';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 
 const fileSearchParameters: NonNullable<LCTool['parameters']> = {
@@ -68,6 +73,20 @@ const readFileDefinition: PiHostToolDefinition = {
       max_lines: { type: 'integer', minimum: 1, maximum: 500 },
     },
     required: ['path'],
+  },
+};
+
+const skillDefinition: LCTool = {
+  name: PI_SKILL_TOOL_NAME,
+  description: 'Load an accessible skill.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string' },
+      skillName: { type: 'string' },
+      args: { type: 'string' },
+    },
+    required: ['skillName'],
   },
 };
 
@@ -211,6 +230,43 @@ describe('createPiTools', () => {
       },
       undefined,
     );
+  });
+
+  it('routes the host skill tool with bounded arguments and no Pi-local skill lookup', async () => {
+    const execute = hostExecutor();
+    const [skill] = createPiTools({ definitions: [skillDefinition], execute });
+
+    expect(skill).toMatchObject({
+      name: PI_SKILL_TOOL_NAME,
+      executionMode: 'sequential',
+      parameters: {
+        type: 'object',
+        required: ['skillName'],
+        additionalProperties: false,
+      },
+    });
+    await skill.execute('pi-skill-call', {
+      intent: 'Loading the maintenance workflow',
+      skillName: 'maintenance-workflow',
+      args: 'focus on press line 4',
+    });
+    expect(execute).toHaveBeenCalledWith(
+      {
+        toolCallId: 'pi-skill-call',
+        name: PI_SKILL_TOOL_NAME,
+        args: {
+          intent: 'Loading the maintenance workflow',
+          skillName: 'maintenance-workflow',
+          args: 'focus on press line 4',
+        },
+      },
+      undefined,
+    );
+
+    await expect(
+      skill.execute('pi-skill-invalid', { skillName: 'x', path: '/etc/passwd' }),
+    ).rejects.toMatchObject({ code: 'PI_TOOL_ARGUMENTS_INVALID' });
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
   it('rejects read_file ranges above the host hard limit before dispatch', async () => {

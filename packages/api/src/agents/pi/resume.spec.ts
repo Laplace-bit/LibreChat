@@ -14,6 +14,7 @@ import {
 import { createPiMcpToolSchemaRegistry } from './mcpSchema';
 import { buildPendingAction } from '~/agents/hitl/policy';
 import { createPiPauseController } from './pause';
+import { PI_SKILL_TOOL_NAME } from './toolNames';
 
 function createApproval() {
   const toolCall: PiPauseToolCall = {
@@ -147,6 +148,90 @@ function createMcpApproval() {
 }
 
 describe('Pi approval continuation', () => {
+  it('preserves a host skill action through the existing approval continuation shape', () => {
+    const toolCall: PiPauseToolCall = {
+      toolCallId: 'pi-skill-call',
+      name: PI_SKILL_TOOL_NAME,
+      args: { skillName: 'maintenance', args: 'focus on press line 4' },
+      hostExecution: {
+        toolCallId: 'host-skill-call',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'skill-step',
+          index: 0,
+          messageId: 'response-1',
+          runId: 'response-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 100,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] },
+    };
+    const payload = buildPiApprovalInterruptPayload({
+      hostToolCallId: toolCall.hostExecution.toolCallId,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      allowedDecisions: toolCall.review.allowedDecisions,
+    });
+    const pendingAction = buildPendingAction(payload, {
+      streamId: 'conversation-1',
+      conversationId: 'conversation-1',
+      runId: 'response-1',
+      responseMessageId: 'response-1',
+    });
+    const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      matchesPiApprovalHostState({
+        continuation,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+        runSteps: [
+          {
+            id: 'skill-step',
+            runId: 'response-1',
+            agentId: 'agent-1',
+            type: 'tool_calls',
+            index: 0,
+            created_at: 100,
+            status: 'in_progress',
+            stepDetails: {
+              type: 'tool_calls',
+              tool_calls: [
+                {
+                  id: 'host-skill-call',
+                  function: {
+                    name: PI_SKILL_TOOL_NAME,
+                    arguments: toolCall.args,
+                  },
+                },
+              ],
+            },
+          },
+        ],
+        aggregatedContent: [
+          {
+            type: 'tool_call',
+            tool_call: {
+              id: 'host-skill-call',
+              stepId: 'skill-step',
+              name: PI_SKILL_TOOL_NAME,
+              args: JSON.stringify(toolCall.args),
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
   it('persists the MCP schema fingerprint and revalidates against current authorized schemas', () => {
     const { continuation, mcpToolSchemas, pendingAction, parameters, toolName } =
       createMcpApproval();

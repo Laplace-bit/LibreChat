@@ -11,9 +11,9 @@ import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionBridge } from './codeSession';
 import type { PiHostEvent } from './events';
 import { buildPiToolUsageCounts, createPiHostToolExecutor } from './toolExecution';
+import { PI_CALCULATOR_TOOL_NAME, PI_SKILL_TOOL_NAME } from './toolNames';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiCodeSessionBridge } from './codeSession';
-import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiHostEventSequencer } from './bridge';
 import { createPiPauseController } from './pause';
 import { createPiTools } from './tools';
@@ -63,6 +63,20 @@ const readFileDefinition: LCTool = {
     type: 'object',
     properties: { path: { type: 'string' } },
     required: ['path'],
+  },
+};
+
+const skillDefinition: LCTool = {
+  name: PI_SKILL_TOOL_NAME,
+  description: 'Load a skill.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string' },
+      skillName: { type: 'string' },
+      args: { type: 'string' },
+    },
+    required: ['skillName'],
   },
 };
 
@@ -148,6 +162,71 @@ function createHarness(
 }
 
 describe('createPiHostToolExecutor', () => {
+  it('keeps the filtered skill body in Pi context and persists only the host summary', async () => {
+    const harness = createHarness(
+      {
+        toolCallId: '',
+        status: 'success',
+        content: 'Skill "maintenance" loaded.',
+        injectedMessages: [
+          {
+            role: 'user',
+            isMeta: true,
+            source: 'skill',
+            skillName: 'maintenance',
+            content: 'Check the equipment isolation checklist before any work.',
+          },
+        ],
+      },
+      undefined,
+      skillDefinition,
+    );
+
+    const toolResult = await harness.tool.execute('pi-skill-call', {
+      skillName: 'maintenance',
+    });
+    await harness.eventSequencer.drain();
+
+    expect(toolResult.content).toContainEqual({
+      type: 'text',
+      text: 'Skill "maintenance" loaded.\n\nCheck the equipment isolation checklist before any work.',
+    });
+    const completed = harness.events.find(
+      (event) => event.event === GraphEvents.ON_RUN_STEP_COMPLETED,
+    );
+    expect(completed?.data.result.tool_call?.output).toBe('Skill "maintenance" loaded.');
+  });
+
+  it('fails closed when a host tool returns an unsupported injected message', async () => {
+    const harness = createHarness(
+      {
+        toolCallId: '',
+        status: 'success',
+        content: 'Unexpected injection.',
+        injectedMessages: [
+          {
+            role: 'system',
+            isMeta: true,
+            source: 'system',
+            content: 'Unreviewed prompt content.',
+          },
+        ],
+      },
+      undefined,
+      skillDefinition,
+    );
+
+    const toolResult = await harness.tool.execute('pi-skill-call', {
+      skillName: 'maintenance',
+    });
+
+    expect(toolResult.isError).toBe(true);
+    expect(toolResult.content).not.toContainEqual({
+      type: 'text',
+      text: expect.stringContaining('Unreviewed prompt content.'),
+    });
+  });
+
   it('uses independent per-tool turns for web citation anchors and restores offsets on resume', async () => {
     const batches: ToolExecuteBatchRequest[] = [];
     const eventSequencer = createPiHostEventSequencer(() => undefined);

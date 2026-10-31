@@ -1,7 +1,7 @@
 import { Constants } from '@librechat/agents';
 import type { CodeEnvFile, CodeSessionContext, ToolExecuteResult } from '@librechat/agents';
+import { isPiCodeSessionAwareToolName, PI_BASH_TOOL_NAME, PI_SKILL_TOOL_NAME } from './toolNames';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { PI_BASH_TOOL_NAME } from './toolNames';
 
 export interface PiCodeSessionSnapshot {
   session_id: CodeSessionContext['session_id'];
@@ -261,7 +261,9 @@ export class PiCodeSessionBridge {
       call: T & { codeSessionContext?: PiCodeSessionSnapshot },
     ) => Promise<ToolExecuteResult>,
   ): Promise<ToolExecuteResult> {
-    if (call.name !== PI_BASH_TOOL_NAME && call.name !== Constants.READ_FILE) {
+    const isCodeTool = call.name === PI_BASH_TOOL_NAME || call.name === Constants.READ_FILE;
+    const isSkillTool = isPiCodeSessionAwareToolName(call.name);
+    if (!isCodeTool && !isSkillTool) {
       return executeHostCall(call);
     }
 
@@ -272,7 +274,11 @@ export class PiCodeSessionBridge {
         ...(context == null ? {} : { codeSessionContext: context }),
       } as T & { codeSessionContext?: PiCodeSessionSnapshot };
       const result = await executeHostCall(hostCall);
-      if (call.name === PI_BASH_TOOL_NAME && result.status === 'success') {
+      if (
+        result.status === 'success' &&
+        (call.name === PI_BASH_TOOL_NAME ||
+          (call.name === PI_SKILL_TOOL_NAME && result.artifact != null))
+      ) {
         this.context = foldCodeExecutionArtifact(this.context, result.artifact);
       }
       return result;

@@ -151,6 +151,49 @@ describe('PiCodeSessionBridge', () => {
     });
   });
 
+  it('serializes skill file artifacts into the next managed Code API context', async () => {
+    const bridge = createPiCodeSessionBridge(initialContext);
+    let observedContext: unknown;
+    await bridge.execute(
+      { id: 'skill-1', name: Constants.SKILL_TOOL, args: { skillName: 'maintenance' } },
+      async (call) => {
+        observedContext = call.codeSessionContext;
+        return result('skill-1', {
+          session_id: 'exec-after-skill',
+          files: [
+            {
+              id: 'guide-file',
+              resource_id: 'skill-resource',
+              name: 'guide.md',
+              storage_session_id: 'storage-skill',
+              kind: 'skill',
+              version: 4,
+            },
+          ],
+        });
+      },
+    );
+
+    expect(observedContext).toEqual({
+      session_id: initialContext.session_id,
+      files: initialContext.files,
+    });
+    expect(bridge.snapshot()).toEqual({
+      session_id: 'exec-after-skill',
+      files: [
+        ...initialContext.files!,
+        {
+          id: 'guide-file',
+          resource_id: 'skill-resource',
+          name: 'guide.md',
+          storage_session_id: 'storage-skill',
+          kind: 'skill',
+          version: 4,
+        },
+      ],
+    });
+  });
+
   it('rejects malformed initial refs instead of silently losing caller files', () => {
     expect(() =>
       createPiCodeSessionBridge({ session_id: 'exec-initial', files: [{ id: 'missing-name' }] }),

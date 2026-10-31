@@ -5179,13 +5179,6 @@ class AgentClient extends BaseClient {
           ) {
             unsupportedModes.push('steer');
           }
-          if (
-            (manualSkillPrimes?.length ?? 0) > 0 ||
-            (alwaysApplySkillPrimes?.length ?? 0) > 0 ||
-            (skillPrimeResult?.skills?.size ?? 0) > 0
-          ) {
-            unsupportedModes.push('skills');
-          }
           if (attachedCodeEnvironmentAgentIds.size > 0) {
             unsupportedModes.push('code_api_environment');
           }
@@ -6021,9 +6014,7 @@ class AgentClient extends BaseClient {
         req?.body?.isContinued === true ||
         req?._recoveredSteerId != null ||
         req?.body?.steerId != null ||
-        req?.body?.steer != null ||
-        (this.options.agent?.manualSkillPrimes?.length ?? 0) > 0 ||
-        (this.options.agent?.alwaysApplySkillPrimes?.length ?? 0) > 0
+        req?.body?.steer != null
       ) {
         unsupportedModes.push('unsupported_resume_context');
       }

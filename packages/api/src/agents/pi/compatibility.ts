@@ -9,7 +9,6 @@ export type PiUnsupportedTurnMode =
   | 'compaction'
   | 'regenerate'
   | 'steer'
-  | 'skills'
   | 'code_api_environment';
 
 export interface PiCompatibilityInput {

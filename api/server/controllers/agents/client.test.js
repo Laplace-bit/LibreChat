@@ -10312,6 +10312,19 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['path'],
     },
   };
+  const skillDefinition = {
+    name: Tools.skill,
+    description: 'Load an accessible skill.',
+    parameters: {
+      type: 'object',
+      properties: {
+        intent: { type: 'string' },
+        skillName: { type: 'string' },
+        args: { type: 'string' },
+      },
+      required: ['skillName'],
+    },
+  };
   const mcpToolName = `lookup${Constants.mcp_delimiter}inventory`;
   const mcpToolDefinition = {
     name: mcpToolName,
@@ -10433,6 +10446,28 @@ describe('AgentClient - Pi generation dispatch', () => {
       status: 'completed',
     });
     expect(client.run).toBeUndefined();
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('projects ACL-resolved manual skill primes into the Pi transcript', async () => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const skillBody = 'Inspect the pump isolation log before proposing maintenance.';
+    const client = createPiClient({
+      agent: {
+        manualSkillPrimes: [{ name: 'pump-maintenance', body: skillBody }],
+      },
+    });
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage('What should I inspect?')],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    const [dispatchInput] = mockExecutePiGeneration.mock.calls[0];
+    expect(dispatchInput.messages.map((message) => message.content)).toContain(skillBody);
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
@@ -10733,6 +10768,85 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
       calculatorDefinition,
     ]);
+  });
+
+  it('loads an authorized LibreChat skill into Pi through the host handler', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+    };
+    const skillBody = 'Read the maintenance checklist and verify lockout status.';
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Skill "pump-maintenance" loaded.',
+            injectedMessages: [
+              {
+                role: 'user',
+                isMeta: true,
+                source: 'skill',
+                skillName: 'pump-maintenance',
+                content: skillBody,
+              },
+            ],
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: Tools.skill }],
+        toolDefinitions: [skillDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      toolResult = await input.executeHostToolCall(
+        {
+          id: 'host-skill-call',
+          name: Tools.skill,
+          args: { skillName: 'pump-maintenance' },
+          stepId: 'host-skill-step',
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalled();
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-skill-call',
+        name: Tools.skill,
+        args: { skillName: 'pump-maintenance' },
+        stepId: 'host-skill-step',
+      },
+    ]);
+    expect(toolResult).toMatchObject({
+      status: 'success',
+      content: 'Skill "pump-maintenance" loaded.',
+      injectedMessages: [
+        {
+          role: 'user',
+          isMeta: true,
+          source: 'skill',
+          skillName: 'pump-maintenance',
+          content: skillBody,
+        },
+      ],
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([skillDefinition]);
   });
 
   it('routes an authorized foreground MCP tool through the host handler with validated arguments', async () => {

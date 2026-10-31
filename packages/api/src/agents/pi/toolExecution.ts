@@ -8,6 +8,7 @@ import type {
   PiFileSearchArguments,
   PiHostToolExecutionInput,
   PiReadFileArguments,
+  PiSkillArguments,
   PiWebSearchArguments,
   PiToolArguments,
 } from './tools';
@@ -25,6 +26,7 @@ import {
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
   isPiSupportedHostToolName,
 } from './toolNames';
@@ -87,6 +89,14 @@ export type PiHostToolCall =
       id: string;
       name: typeof PI_READ_FILE_TOOL_NAME;
       args: PiReadFileArguments;
+      stepId: string;
+      turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      id: string;
+      name: typeof PI_SKILL_TOOL_NAME;
+      args: PiSkillArguments;
       stepId: string;
       turn?: number;
       codeSessionContext?: PiCodeSessionSnapshot;
@@ -178,6 +188,34 @@ function hostContentToText(content: ToolExecuteResult['content']): string | unde
     }
   }
   return fragments.join('\n');
+}
+
+const MAX_PI_SKILL_BODY_CHARS = 512 * 1_024;
+
+function hostInjectedSkillText(
+  messages: ToolExecuteResult['injectedMessages'],
+  skillName: string,
+): { text?: string; invalid: boolean } {
+  if (messages === undefined) {
+    return { invalid: false };
+  }
+  if (!Array.isArray(messages) || messages.length !== 1) {
+    return { invalid: true };
+  }
+  const [message] = messages;
+  if (
+    message == null ||
+    message.role !== 'user' ||
+    message.isMeta !== true ||
+    message.source !== 'skill' ||
+    message.skillName !== skillName ||
+    typeof message.content !== 'string' ||
+    message.content.length === 0 ||
+    message.content.length > MAX_PI_SKILL_BODY_CHARS
+  ) {
+    return { invalid: true };
+  }
+  return { text: message.content, invalid: false };
 }
 
 type PiToolResultContent =
@@ -325,6 +363,15 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    case PI_SKILL_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_SKILL_TOOL_NAME,
+        args: input.args,
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
+        hostExecution,
+        review,
+      };
     default:
       throw new Error('The Pi approval call has no host tool adapter.');
   }
@@ -379,6 +426,14 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
       return {
         id,
         name: PI_READ_FILE_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_SKILL_TOOL_NAME:
+      return {
+        id,
+        name: PI_SKILL_TOOL_NAME,
         args: input.args,
         stepId,
         turn: input.turn,
@@ -531,9 +586,21 @@ export async function settlePiHostToolResult(options: {
   const now = options.now ?? Date.now;
   const hostText = hostContentToText(options.hostResult.content);
   const imageProjection = hostArtifactToPiImages(options.hostResult.artifact);
+  const skillName =
+    options.input.name === PI_SKILL_TOOL_NAME ? options.input.args.skillName : undefined;
+  const injectedSkill = hostInjectedSkillText(options.hostResult.injectedMessages, skillName ?? '');
+  const unexpectedInjectedMessages =
+    options.input.name !== PI_SKILL_TOOL_NAME && options.hostResult.injectedMessages !== undefined;
+  const missingSkillBody =
+    options.input.name === PI_SKILL_TOOL_NAME &&
+    options.hostResult.status === 'success' &&
+    injectedSkill.text === undefined;
   const status: Exclude<HostToolStatus, 'cancelled'> =
     options.hostResult.status === 'success' &&
     !imageProjection.invalid &&
+    !injectedSkill.invalid &&
+    !unexpectedInjectedMessages &&
+    !missingSkillBody &&
     (hostText != null || imageProjection.images.length > 0)
       ? 'success'
       : 'error';
@@ -548,10 +615,13 @@ export async function settlePiHostToolResult(options: {
     status,
     now,
   });
-  const modelText =
-    output.length > 0 || status === 'success'
-      ? output
-      : 'The tool could not complete this request.';
+  let modelText = output;
+  if (status === 'success' && injectedSkill.text != null) {
+    modelText = `${output}\n\n${injectedSkill.text}`;
+  }
+  if (modelText.length === 0) {
+    modelText = 'The tool could not complete this request.';
+  }
   return {
     content: [
       { type: 'text', text: modelText },

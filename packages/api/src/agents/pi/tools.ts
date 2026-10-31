@@ -19,6 +19,7 @@ import {
   PI_BASH_TOOL_NAME,
   PI_CALCULATOR_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
+  PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
 
@@ -49,12 +50,19 @@ export type PiReadFileArguments = {
   intent?: string;
 };
 
+export type PiSkillArguments = {
+  intent?: string;
+  skillName: string;
+  args?: string;
+};
+
 export type PiBuiltInToolArguments =
   | PiFileSearchArguments
   | PiWebSearchArguments
   | PiCalculatorArguments
   | PiBashArguments
-  | PiReadFileArguments;
+  | PiReadFileArguments
+  | PiSkillArguments;
 
 export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments;
 
@@ -85,6 +93,11 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof PI_READ_FILE_TOOL_NAME;
       args: PiReadFileArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_SKILL_TOOL_NAME;
+      args: PiSkillArguments;
     }
   | {
       kind: 'mcp';
@@ -148,6 +161,10 @@ const TOOL_FIELDS = {
   [PI_READ_FILE_TOOL_NAME]: {
     label: 'Read file',
     description: 'Read a file from the authorized code-execution environment.',
+  },
+  [PI_SKILL_TOOL_NAME]: {
+    label: 'Load skill',
+    description: 'Load an accessible LibreChat skill into this conversation.',
   },
 } as const;
 
@@ -445,6 +462,50 @@ function convertPiCodeToolSchema(name: string, schema: Record<string, unknown>):
   } satisfies TSchema;
 }
 
+function convertPiSkillSchema(schema: Record<string, unknown>): TSchema {
+  const properties = schema.properties;
+  const required = schema.required;
+  if (
+    !isRecord(properties) ||
+    !hasOnlyKeys(properties, ['intent', 'skillName', 'args']) ||
+    !Array.isArray(required) ||
+    required.length !== 1 ||
+    required[0] !== 'skillName' ||
+    (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  for (const property of Object.values(properties)) {
+    if (!isStringProperty(property)) {
+      throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
+    optionalDescription(property);
+  }
+
+  const stringProperty = (property: unknown) => {
+    if (!isStringProperty(property)) {
+      throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
+    const description = optionalDescription(property);
+    return {
+      type: 'string' as const,
+      ...(description == null ? {} : { description }),
+    };
+  };
+  return {
+    type: 'object',
+    required: ['skillName'],
+    properties: {
+      ...(properties.intent == null ? {} : { intent: stringProperty(properties.intent) }),
+      skillName: stringProperty(properties.skillName),
+      ...(properties.args == null ? {} : { args: stringProperty(properties.args) }),
+    },
+    additionalProperties: false,
+    ...(optionalDescription(schema) == null ? {} : { description: optionalDescription(schema) }),
+  } satisfies TSchema;
+}
+
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   if (isPiMcpToolName(name)) {
@@ -468,6 +529,9 @@ export function convertPiToolSchema(name: string, schema: unknown): TSchema {
 
   if (name === PI_BASH_TOOL_NAME || name === PI_READ_FILE_TOOL_NAME) {
     return convertPiCodeToolSchema(name, schema);
+  }
+  if (name === PI_SKILL_TOOL_NAME) {
+    return convertPiSkillSchema(schema);
   }
   if (name === PI_WEB_SEARCH_TOOL_NAME) {
     return convertPiWebSearchSchema(schema);
@@ -633,6 +697,26 @@ export function validatePiReadFileArguments(value: unknown): PiReadFileArguments
   };
 }
 
+export function validatePiSkillArguments(value: unknown): PiSkillArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['intent', 'skillName', 'args']) ||
+    typeof value.skillName !== 'string' ||
+    value.skillName.length === 0 ||
+    value.skillName.length > 200 ||
+    (value.intent !== undefined &&
+      (typeof value.intent !== 'string' || value.intent.length > 1_000)) ||
+    (value.args !== undefined && (typeof value.args !== 'string' || value.args.length > 131_072))
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return {
+    ...(value.intent == null ? {} : { intent: value.intent }),
+    skillName: value.skillName,
+    ...(value.args == null ? {} : { args: value.args }),
+  };
+}
+
 export function validatePiToolExecutionInput(
   name: string,
   toolCallId: string,
@@ -673,6 +757,12 @@ export function validatePiToolExecutionInput(
         toolCallId,
         name: PI_READ_FILE_TOOL_NAME,
         args: validatePiReadFileArguments(args),
+      };
+    case PI_SKILL_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_SKILL_TOOL_NAME,
+        args: validatePiSkillArguments(args),
       };
     default: {
       if (!isPiMcpToolName(name)) {

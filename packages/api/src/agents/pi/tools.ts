@@ -3,6 +3,13 @@ import { Tools } from 'librechat-data-provider';
 import type { AgentToolResult, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
 import type { TSchema } from 'typebox';
+import type {
+  PiActionSchemaFingerprint,
+  PiActionToolArguments,
+  PiActionToolName,
+  PiActionToolSchema,
+  PiActionToolSchemaRegistry,
+} from './actionSchema';
 import {
   createPiMcpToolSchema,
   createPiMcpToolSchemaRegistry,
@@ -24,6 +31,11 @@ import {
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
+import {
+  createPiActionToolSchema,
+  createPiActionToolSchemaRegistry,
+  isPiActionToolName,
+} from './actionSchema';
 
 export type PiFileSearchArguments = { query: string };
 
@@ -71,7 +83,7 @@ export type PiBuiltInToolArguments =
   | PiSetMemoryArguments
   | PiDeleteMemoryArguments;
 
-export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments;
+export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments | PiActionToolArguments;
 
 const MAX_PI_READ_FILE_LINES = 500;
 
@@ -122,6 +134,13 @@ export type PiHostToolExecutionInput =
       name: PiMcpToolName;
       args: PiMcpToolArguments;
       schemaFingerprint: PiMcpSchemaFingerprint;
+    }
+  | {
+      kind: 'action';
+      toolCallId: string;
+      name: PiActionToolName;
+      args: PiActionToolArguments;
+      schemaFingerprint: PiActionSchemaFingerprint;
     };
 
 /** The caller owns authorization and execution; this module only supplies Pi's tool contract. */
@@ -131,7 +150,10 @@ export type PiHostToolExecutor = (
 ) => Promise<AgentToolResult>;
 
 type PiSdkToolDefinition = ToolDefinition<TSchema>;
-export type PiHostToolDefinition = Omit<LCTool, 'parameters'> & { parameters?: unknown };
+export type PiHostToolDefinition = Omit<LCTool, 'parameters'> & {
+  parameters?: unknown;
+  oauth?: unknown;
+};
 type PiHostToolExecute = (
   toolCallId: string,
   args: unknown,
@@ -206,6 +228,8 @@ export class PiToolCompatibilityError extends Error {
 export interface PiToolValidationContext {
   mcpToolSchemas?: PiMcpToolSchemaRegistry;
   mcpToolSchema?: PiMcpToolSchema;
+  actionToolSchemas?: PiActionToolSchemaRegistry;
+  actionToolSchema?: PiActionToolSchema;
   expectedSchemaFingerprint?: PiMcpSchemaFingerprint;
 }
 
@@ -568,6 +592,11 @@ function convertPiMemorySchema(name: string, schema: Record<string, unknown>): T
 
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
+  if (isPiActionToolName(name)) {
+    return validateMcpSchemaResult(
+      () => createPiActionToolSchema({ name, parameters: schema }).parameters,
+    );
+  }
   if (isPiMcpToolName(name)) {
     return validateMcpSchemaResult(() => createPiMcpToolSchema(name, schema).parameters);
   }
@@ -869,6 +898,25 @@ export function validatePiToolExecutionInput(
         args: validatePiDeleteMemoryArguments(args),
       };
     default: {
+      if (isPiActionToolName(name)) {
+        const schema = context.actionToolSchema ?? context.actionToolSchemas?.get(name);
+        if (schema == null) {
+          throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+        }
+        if (
+          context.expectedSchemaFingerprint != null &&
+          schema.fingerprint !== context.expectedSchemaFingerprint
+        ) {
+          throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+        }
+        return {
+          kind: 'action',
+          toolCallId,
+          name,
+          args: validateMcpSchemaResult(() => schema.validateArguments(args)),
+          schemaFingerprint: schema.fingerprint,
+        };
+      }
       if (!isPiMcpToolName(name)) {
         throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
       }
@@ -903,17 +951,23 @@ export async function executePiToolCall(input: {
   toolCallId: string;
   arguments: unknown;
   mcpToolSchema?: PiMcpToolSchema;
+  actionToolSchema?: PiActionToolSchema;
   signal?: AbortSignal;
 }): Promise<AgentToolResult> {
   if (typeof input.execute !== 'function') {
     throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
   }
-  if (!isPiSupportedHostToolName(input.name) && !isPiMcpToolName(input.name)) {
+  if (
+    !isPiSupportedHostToolName(input.name) &&
+    !isPiMcpToolName(input.name) &&
+    !isPiActionToolName(input.name)
+  ) {
     throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
   }
   return input.execute(
     validatePiToolExecutionInput(input.name, input.toolCallId, input.arguments, {
       ...(input.mcpToolSchema == null ? {} : { mcpToolSchema: input.mcpToolSchema }),
+      ...(input.actionToolSchema == null ? {} : { actionToolSchema: input.actionToolSchema }),
     }),
     input.signal,
   );
@@ -926,10 +980,18 @@ export function compilePiMcpToolSchemaRegistry(
   return validateMcpSchemaResult(() => createPiMcpToolSchemaRegistry(definitions));
 }
 
+/** Compile schemas from the exact current host-authorized Action definitions. */
+export function compilePiActionToolSchemaRegistry(
+  definitions: readonly PiHostToolDefinition[],
+): PiActionToolSchemaRegistry {
+  return validateMcpSchemaResult(() => createPiActionToolSchemaRegistry(definitions));
+}
+
 export function createPiTools(input: {
   definitions: readonly PiHostToolDefinition[];
   execute?: PiHostToolExecutor;
   mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  actionToolSchemas?: PiActionToolSchemaRegistry;
 }): PiToolDefinition[] {
   if (!Array.isArray(input.definitions)) {
     throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
@@ -946,7 +1008,9 @@ export function createPiTools(input: {
     const candidateName: unknown = definition.name;
     if (
       typeof candidateName !== 'string' ||
-      (!isPiSupportedHostToolName(candidateName) && !isPiMcpToolName(candidateName)) ||
+      (!isPiSupportedHostToolName(candidateName) &&
+        !isPiMcpToolName(candidateName) &&
+        !isPiActionToolName(candidateName)) ||
       definitionNames.has(candidateName)
     ) {
       throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
@@ -955,12 +1019,16 @@ export function createPiTools(input: {
   }
 
   const mcpToolSchemas = input.mcpToolSchemas ?? compilePiMcpToolSchemaRegistry(input.definitions);
+  const actionToolSchemas =
+    input.actionToolSchemas ?? compilePiActionToolSchemaRegistry(input.definitions);
 
   const seenNames = new Set<string>();
   return input.definitions.map((definition) => {
     const candidateName: unknown = definition.name;
     if (
-      (!isPiSupportedHostToolName(candidateName) && !isPiMcpToolName(candidateName)) ||
+      (!isPiSupportedHostToolName(candidateName) &&
+        !isPiMcpToolName(candidateName) &&
+        !isPiActionToolName(candidateName)) ||
       seenNames.has(candidateName)
     ) {
       throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
@@ -971,7 +1039,7 @@ export function createPiTools(input: {
     }
 
     const name = candidateName;
-    if (isPiMcpToolName(name)) {
+    if (isPiMcpToolName(name) && !isPiActionToolName(name)) {
       const schema = mcpToolSchemas.get(name);
       if (schema == null) {
         throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
@@ -990,6 +1058,31 @@ export function createPiTools(input: {
             toolCallId,
             arguments: args,
             mcpToolSchema: schema,
+            signal,
+          }),
+      };
+    }
+    if (isPiActionToolName(name)) {
+      const schema = actionToolSchemas.get(name);
+      if (schema == null) {
+        throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+      }
+      const rawDescription = definition.description;
+      const description =
+        rawDescription === '' ? name : (validateDescription(rawDescription) ?? name);
+      return {
+        name,
+        label: name,
+        description,
+        parameters: schema.parameters,
+        executionMode: 'sequential',
+        execute: (toolCallId, args, signal) =>
+          executePiToolCall({
+            execute: input.execute,
+            name,
+            toolCallId,
+            arguments: args,
+            actionToolSchema: schema,
             signal,
           }),
       };

@@ -4,6 +4,7 @@ import type { ExecuteHooksOptions } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
 import type { ResolvedToolApprovalHook, ToolApprovalHookContext } from '~/agents/hitl/hooks';
 import type { PiToolExecutionContext, PiToolExecutionGate } from './toolExecution';
+import type { PiActionToolSchemaRegistry } from './actionSchema';
 import type { PluginHookSource } from '~/agents/hooks/source';
 import type { PiMcpToolSchemaRegistry } from './mcpSchema';
 import { buildEffectiveToolApprovalPolicy } from '~/agents/hitl/allow';
@@ -23,6 +24,7 @@ export interface PiToolApprovalGateOptions {
   agentId: string;
   model?: string;
   mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  actionToolSchemas?: PiActionToolSchemaRegistry;
 }
 
 const DEFAULT_ALLOWED_DECISIONS: readonly Agents.ToolApprovalDecisionType[] = [
@@ -69,9 +71,10 @@ export function createPiToolApprovalGate(options: PiToolApprovalGateOptions): Pi
   return async (input: PiToolExecutionContext, signal?: AbortSignal) => {
     const validationContext = {
       ...(options.mcpToolSchemas == null ? {} : { mcpToolSchemas: options.mcpToolSchemas }),
-      ...('kind' in input && input.kind === 'mcp'
-        ? { expectedSchemaFingerprint: input.schemaFingerprint }
-        : {}),
+      ...(options.actionToolSchemas == null
+        ? {}
+        : { actionToolSchemas: options.actionToolSchemas }),
+      ...('kind' in input ? { expectedSchemaFingerprint: input.schemaFingerprint } : {}),
     };
     let result;
     try {

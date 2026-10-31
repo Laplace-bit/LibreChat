@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { Constants, Tools } from 'librechat-data-provider';
+import { Constants, isActionTool, Tools } from 'librechat-data-provider';
 import type { TSchema } from 'typebox';
 import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 
@@ -14,18 +14,20 @@ const MAX_ENUM_VALUES = 128;
 const MAX_STRING_BOUND = 65_536;
 const MAX_JSON_DEPTH = 8;
 
-type PiMcpScalar = string | number | boolean;
+export type PiScalarToolValue = string | number | boolean;
 type PiMcpScalarType = 'string' | 'number' | 'integer' | 'boolean';
 type JsonValue = null | string | number | boolean | JsonValue[] | { [key: string]: JsonValue };
-export type PiMcpToolArguments = Record<string, string | number | boolean>;
+export type PiScalarToolArguments = Record<string, PiScalarToolValue>;
+export type PiMcpToolArguments = PiScalarToolArguments;
 declare const piMcpToolNameBrand: unique symbol;
 export type PiMcpToolName = `${string}${typeof Constants.mcp_delimiter}${string}` & {
   readonly [piMcpToolNameBrand]: true;
 };
-declare const piMcpSchemaFingerprintBrand: unique symbol;
-export type PiMcpSchemaFingerprint = string & {
-  readonly [piMcpSchemaFingerprintBrand]: true;
+declare const piScalarToolSchemaFingerprintBrand: unique symbol;
+export type PiScalarToolSchemaFingerprint = string & {
+  readonly [piScalarToolSchemaFingerprintBrand]: true;
 };
+export type PiMcpSchemaFingerprint = PiScalarToolSchemaFingerprint;
 export type PiMcpSchemaCompatibilityCode =
   | 'PI_TOOL_SCHEMA_UNSUPPORTED'
   | 'PI_TOOL_ARGUMENTS_INVALID';
@@ -49,18 +51,20 @@ export class PiMcpSchemaCompatibilityError extends Error {
 interface ScalarProperty {
   type: PiMcpScalarType;
   description?: string;
-  enum?: readonly PiMcpScalar[];
+  enum?: readonly PiScalarToolValue[];
   minLength?: number;
   maxLength?: number;
   minimum?: number;
   maximum?: number;
 }
 
-export interface PiMcpToolSchema {
+export interface PiScalarToolSchema {
   parameters: TSchema;
-  fingerprint: PiMcpSchemaFingerprint;
-  validateArguments(value: unknown): PiMcpToolArguments;
+  fingerprint: PiScalarToolSchemaFingerprint;
+  validateArguments(value: unknown): PiScalarToolArguments;
 }
+
+export type PiMcpToolSchema = PiScalarToolSchema;
 
 export type PiMcpToolSchemaRegistry = ReadonlyMap<PiMcpToolName, PiMcpToolSchema>;
 
@@ -97,6 +101,7 @@ export function isPiMcpToolName(value: unknown): value is PiMcpToolName {
     value.length === 0 ||
     value.length > MAX_TOOL_NAME_LENGTH ||
     hasControlCharacters(value) ||
+    isActionTool(value) ||
     STATIC_TOOL_NAMES.has(value)
   ) {
     return false;
@@ -121,8 +126,14 @@ export function isPiMcpToolName(value: unknown): value is PiMcpToolName {
   );
 }
 
-export function isPiMcpSchemaFingerprint(value: unknown): value is PiMcpSchemaFingerprint {
+export function isPiScalarToolSchemaFingerprint(
+  value: unknown,
+): value is PiScalarToolSchemaFingerprint {
   return typeof value === 'string' && /^[a-f0-9]{64}$/u.test(value);
+}
+
+export function isPiMcpSchemaFingerprint(value: unknown): value is PiMcpSchemaFingerprint {
+  return isPiScalarToolSchemaFingerprint(value);
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -256,7 +267,7 @@ function parseBoundaryJson(value: unknown, errorCode: PiMcpSchemaCompatibilityCo
 }
 
 /** Validates the bounded JSON shape before the current MCP schema is reloaded. */
-export function normalizePiMcpToolArguments(value: unknown): PiMcpToolArguments {
+export function normalizePiScalarToolArguments(value: unknown): PiScalarToolArguments {
   const canonical = parseBoundaryJson(value, 'PI_TOOL_ARGUMENTS_INVALID');
   if (!isRecord(canonical)) {
     return fail('PI_TOOL_ARGUMENTS_INVALID');
@@ -280,6 +291,10 @@ export function normalizePiMcpToolArguments(value: unknown): PiMcpToolArguments 
   return Object.fromEntries(entries);
 }
 
+export function normalizePiMcpToolArguments(value: unknown): PiMcpToolArguments {
+  return normalizePiScalarToolArguments(value);
+}
+
 function hasOnlyKeys(value: Record<string, JsonValue>, allowed: readonly string[]): boolean {
   return Object.keys(value).every((key) => allowed.includes(key));
 }
@@ -294,7 +309,7 @@ function validateDescription(value: JsonValue | undefined): string | undefined {
   return value;
 }
 
-function isScalarForType(value: JsonValue, type: PiMcpScalarType): value is PiMcpScalar {
+function isScalarForType(value: JsonValue, type: PiMcpScalarType): value is PiScalarToolValue {
   switch (type) {
     case 'string':
       return typeof value === 'string';
@@ -382,12 +397,20 @@ function validateScalarProperty(value: JsonValue): ScalarProperty {
       !Array.isArray(value.enum) ||
       value.enum.length === 0 ||
       value.enum.length > MAX_ENUM_VALUES ||
-      !value.enum.every((entry) => isScalarForType(entry, type)) ||
       new Set(value.enum).size !== value.enum.length
     ) {
       return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
     }
-    property.enum = value.enum as PiMcpScalar[];
+    const scalarValues = value.enum.filter((entry): entry is PiScalarToolValue =>
+      isScalarForType(entry, type),
+    );
+    if (scalarValues.length !== value.enum.length) {
+      return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
+    property.enum = scalarValues;
+    if (!property.enum.every((entry) => scalarValueIsValid(entry, property))) {
+      return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
   }
 
   return property;
@@ -405,8 +428,8 @@ function toTypeBoxProperty(property: ScalarProperty): TSchema {
   } satisfies TSchema;
 }
 
-function scalarValueIsValid(value: unknown, property: ScalarProperty): value is PiMcpScalar {
-  let scalar: PiMcpScalar;
+function scalarValueIsValid(value: unknown, property: ScalarProperty): value is PiScalarToolValue {
+  let scalar: PiScalarToolValue;
   switch (property.type) {
     case 'string':
       if (typeof value !== 'string') return false;
@@ -446,9 +469,18 @@ function scalarValueIsValid(value: unknown, property: ScalarProperty): value is 
   return property.enum === undefined || property.enum.includes(scalar);
 }
 
-/** Builds a bounded flat schema adapter and an exact argument validator for one MCP tool. */
-export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolSchema {
-  if (!isPiMcpToolName(name)) {
+/** Builds a bounded flat scalar schema for one named host tool. */
+export function createPiScalarToolSchema(
+  name: string,
+  schema: unknown,
+  fingerprintValue?: unknown,
+): PiScalarToolSchema {
+  if (
+    typeof name !== 'string' ||
+    name.length === 0 ||
+    name.length > MAX_TOOL_NAME_LENGTH ||
+    hasControlCharacters(name)
+  ) {
     return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
   }
 
@@ -493,14 +525,21 @@ export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolS
   if (canonicalSchema.required !== undefined) {
     if (
       !Array.isArray(canonicalSchema.required) ||
-      canonicalSchema.required.length > MAX_OBJECT_PROPERTIES ||
-      !canonicalSchema.required.every((entry) => typeof entry === 'string') ||
-      new Set(canonicalSchema.required).size !== canonicalSchema.required.length ||
-      !canonicalSchema.required.every((entry) => hasOwn(properties, entry))
+      canonicalSchema.required.length > MAX_OBJECT_PROPERTIES
     ) {
       return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
     }
-    required = [...canonicalSchema.required] as string[];
+    const requiredNames = canonicalSchema.required.filter(
+      (entry): entry is string => typeof entry === 'string',
+    );
+    if (
+      requiredNames.length !== canonicalSchema.required.length ||
+      new Set(requiredNames).size !== requiredNames.length ||
+      !requiredNames.every((entry) => hasOwn(properties, entry))
+    ) {
+      return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
+    required = requiredNames;
   }
 
   const description = validateDescription(canonicalSchema.description);
@@ -518,15 +557,17 @@ export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolS
   } satisfies TSchema;
 
   const fingerprintInput = JSON.stringify(
-    canonicalizeJson({ name, schema: canonicalSchema }, 'PI_TOOL_SCHEMA_UNSUPPORTED'),
+    canonicalizeJson(
+      fingerprintValue === undefined ? { name, schema: canonicalSchema } : fingerprintValue,
+      'PI_TOOL_SCHEMA_UNSUPPORTED',
+    ),
   );
-  const fingerprintValue = createHash('sha256').update(fingerprintInput, 'utf8').digest('hex');
-  if (!isPiMcpSchemaFingerprint(fingerprintValue)) {
+  const fingerprint = createHash('sha256').update(fingerprintInput, 'utf8').digest('hex');
+  if (!isPiScalarToolSchemaFingerprint(fingerprint)) {
     return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
   }
-  const fingerprint = fingerprintValue;
 
-  function validateArguments(value: unknown): PiMcpToolArguments {
+  function validateArguments(value: unknown): PiScalarToolArguments {
     const canonicalArguments = parseBoundaryJson(value, 'PI_TOOL_ARGUMENTS_INVALID');
     if (
       !isRecord(canonicalArguments) ||
@@ -543,7 +584,7 @@ export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolS
       return fail('PI_TOOL_ARGUMENTS_INVALID');
     }
 
-    const validatedEntries: Array<[string, PiMcpScalar]> = [];
+    const validatedEntries: Array<[string, PiScalarToolValue]> = [];
     for (const argumentName of argumentNames) {
       const argumentValue = canonicalArguments[argumentName];
       const property = properties[argumentName];
@@ -560,6 +601,14 @@ export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolS
   }
 
   return { parameters, fingerprint, validateArguments };
+}
+
+/** Builds the same bounded schema adapter for a current host-authorized MCP definition. */
+export function createPiMcpToolSchema(name: string, schema: unknown): PiMcpToolSchema {
+  if (!isPiMcpToolName(name)) {
+    return fail('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+  return createPiScalarToolSchema(name, schema);
 }
 
 /** Compiles the exact MCP definitions supplied by the current authorized host context. */

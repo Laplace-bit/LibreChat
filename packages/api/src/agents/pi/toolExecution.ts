@@ -15,6 +15,12 @@ import type {
   PiToolArguments,
 } from './tools';
 import type {
+  PiActionSchemaFingerprint,
+  PiActionToolArguments,
+  PiActionToolName,
+  PiActionToolSchemaRegistry,
+} from './actionSchema';
+import type {
   PiMcpToolArguments,
   PiMcpSchemaFingerprint,
   PiMcpToolName,
@@ -35,6 +41,7 @@ import {
   isPiSupportedHostToolName,
 } from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
+import { isPiActionToolName } from './actionSchema';
 import { isPiMcpToolName } from './mcpSchema';
 
 export type PiToolExecutionInput = PiHostToolExecutionInput;
@@ -127,6 +134,15 @@ export type PiHostToolCall =
       schemaFingerprint: PiMcpSchemaFingerprint;
       stepId: string;
       turn?: number;
+    }
+  | {
+      kind: 'action';
+      id: string;
+      name: PiActionToolName;
+      args: PiActionToolArguments;
+      schemaFingerprint: PiActionSchemaFingerprint;
+      stepId: string;
+      turn?: number;
     };
 
 export interface PiToolExecutionOptions {
@@ -134,6 +150,7 @@ export interface PiToolExecutionOptions {
   createToolCallId(): string;
   executeHostToolCall(call: PiHostToolCall, signal?: AbortSignal): Promise<ToolExecuteResult>;
   mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  actionToolSchemas?: PiActionToolSchemaRegistry;
   getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
   /** Per-tool call counts reconstructed from the current generation on resume. */
   initialToolUsageCounts?: Readonly<Record<string, number>>;
@@ -170,7 +187,10 @@ export function buildPiToolUsageCounts(input: {
         continue;
       }
       const name = toolCall.function.name;
-      if (typeof name === 'string' && (isPiSupportedHostToolName(name) || isPiMcpToolName(name))) {
+      if (
+        typeof name === 'string' &&
+        (isPiSupportedHostToolName(name) || isPiMcpToolName(name) || isPiActionToolName(name))
+      ) {
         counts[name] = (counts[name] ?? 0) + 1;
       }
     }
@@ -178,7 +198,9 @@ export function buildPiToolUsageCounts(input: {
   const pendingTool = input.pendingTool;
   if (
     pendingTool != null &&
-    (isPiSupportedHostToolName(pendingTool.name) || isPiMcpToolName(pendingTool.name)) &&
+    (isPiSupportedHostToolName(pendingTool.name) ||
+      isPiMcpToolName(pendingTool.name) ||
+      isPiActionToolName(pendingTool.name)) &&
     Number.isSafeInteger(pendingTool.turn) &&
     pendingTool.turn >= 0
   ) {
@@ -335,6 +357,18 @@ function toPauseToolCall(
       review,
     };
   }
+  if ('kind' in input && input.kind === 'action') {
+    return {
+      kind: 'action',
+      toolCallId: input.toolCallId,
+      name: input.name,
+      args: input.args,
+      schemaFingerprint: input.schemaFingerprint,
+      ...(codeSessionContext == null ? {} : { codeSessionContext }),
+      hostExecution,
+      review,
+    };
+  }
   switch (input.name) {
     case Tools.file_search:
       return {
@@ -415,6 +449,17 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
   if ('kind' in input && input.kind === 'mcp') {
     return {
       kind: 'mcp',
+      id,
+      name: input.name,
+      args: input.args,
+      schemaFingerprint: input.schemaFingerprint,
+      stepId,
+      turn: input.turn,
+    };
+  }
+  if ('kind' in input && input.kind === 'action') {
+    return {
+      kind: 'action',
       id,
       name: input.name,
       args: input.args,
@@ -636,8 +681,14 @@ export async function settlePiHostToolResult(options: {
   const now = options.now ?? Date.now;
   const hostText = hostContentToText(options.hostResult.content);
   const imageProjection = hostArtifactToPiImages(options.hostResult.artifact);
-  const skillName =
-    options.input.name === PI_SKILL_TOOL_NAME ? options.input.args.skillName : undefined;
+  const toolArguments: unknown = options.input.args;
+  let skillName: string | undefined;
+  if (options.input.name === PI_SKILL_TOOL_NAME && isRecord(toolArguments)) {
+    const candidateSkillName = toolArguments.skillName;
+    if (typeof candidateSkillName === 'string') {
+      skillName = candidateSkillName;
+    }
+  }
   const injectedSkill = hostInjectedSkillText(options.hostResult.injectedMessages, skillName ?? '');
   const unexpectedInjectedMessages =
     options.input.name !== PI_SKILL_TOOL_NAME && options.hostResult.injectedMessages !== undefined;
@@ -747,7 +798,7 @@ export function createPiHostToolExecutor(
   const nextTurnByTool = new Map<string, number>();
   for (const [name, count] of Object.entries(options.initialToolUsageCounts ?? {})) {
     if (
-      (isPiSupportedHostToolName(name) || isPiMcpToolName(name)) &&
+      (isPiSupportedHostToolName(name) || isPiMcpToolName(name) || isPiActionToolName(name)) &&
       Number.isSafeInteger(count) &&
       count >= 0
     ) {
@@ -788,9 +839,10 @@ export function createPiHostToolExecutor(
     const validateGateArguments = (args: PiToolArguments): PiToolExecutionContext => ({
       ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, args, {
         ...(options.mcpToolSchemas == null ? {} : { mcpToolSchemas: options.mcpToolSchemas }),
-        ...('kind' in toolInput && toolInput.kind === 'mcp'
-          ? { expectedSchemaFingerprint: toolInput.schemaFingerprint }
-          : {}),
+        ...(options.actionToolSchemas == null
+          ? {}
+          : { actionToolSchemas: options.actionToolSchemas }),
+        ...('kind' in toolInput ? { expectedSchemaFingerprint: toolInput.schemaFingerprint } : {}),
       }),
       turn: toolInput.turn,
     });

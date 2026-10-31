@@ -1,5 +1,6 @@
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
+import { isPiActionToolName } from './actionSchema';
 import { isPiMcpToolName } from './mcpSchema';
 
 export type PiUnsupportedTurnMode =
@@ -70,7 +71,8 @@ export function assertPiCompatible(input: PiCompatibilityInput): void {
     input.supportedToolNames.filter(
       (name) =>
         PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name) ||
-        isPiMcpToolName(name),
+        isPiMcpToolName(name) ||
+        isPiActionToolName(name),
     ),
   );
   if (

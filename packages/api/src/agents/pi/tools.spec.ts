@@ -1,6 +1,6 @@
 import { WebSearchToolDefinition } from '@librechat/agents';
 import { CalculatorToolDefinition, Constants } from '@librechat/agents';
-import { Constants as DataConstants, Tools } from 'librechat-data-provider';
+import { actionDelimiter, Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
 import {
@@ -20,6 +20,7 @@ import {
   PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
 } from './toolNames';
+import { createPiActionToolSchema, isPiActionToolName } from './actionSchema';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
 
 const fileSearchParameters: NonNullable<LCTool['parameters']> = {
@@ -192,6 +193,86 @@ describe('createPiTools', () => {
       { code: 'PI_TOOL_ARGUMENTS_INVALID' },
     );
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('creates a schema-bound host adapter for a current OpenAPI Action definition', async () => {
+    const nameValue = `get_inventory${actionDelimiter}api---example---com`;
+    if (!isPiActionToolName(nameValue)) {
+      throw new Error('Expected a valid Action tool name.');
+    }
+    const parameters = {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 2, maxLength: 40 },
+        includeInactive: { type: 'boolean' },
+      },
+      required: ['query'],
+    };
+    const description = 'List inventory records.';
+    const expectedSchema = createPiActionToolSchema({
+      name: nameValue,
+      description,
+      oauth: true,
+      parameters,
+    });
+    const execute = hostExecutor();
+    const [tool] = createPiTools({
+      definitions: [{ name: nameValue, description, oauth: true, parameters }],
+      execute,
+    });
+
+    expect(tool).toMatchObject({
+      name: nameValue,
+      label: nameValue,
+      description,
+      executionMode: 'sequential',
+      parameters: { type: 'object', required: ['query'], additionalProperties: false },
+    });
+    await tool.execute('pi-action-call-1', { query: 'pump', includeInactive: false });
+    expect(execute).toHaveBeenCalledWith(
+      {
+        kind: 'action',
+        toolCallId: 'pi-action-call-1',
+        name: nameValue,
+        args: { query: 'pump', includeInactive: false },
+        schemaFingerprint: expectedSchema.fingerprint,
+      },
+      undefined,
+    );
+    await expect(
+      tool.execute('pi-action-invalid', { query: 'x', unrecognized: true }),
+    ).rejects.toMatchObject({ code: 'PI_TOOL_ARGUMENTS_INVALID' });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an Action operation ID containing the MCP delimiter on the Action adapter', async () => {
+    const nameValue = `get_mcp_inventory${actionDelimiter}api---example---com`;
+    if (!isPiActionToolName(nameValue) || isPiMcpToolName(nameValue)) {
+      throw new Error('Expected a valid Action name excluded from the MCP name family.');
+    }
+    const parameters = {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    };
+    const schema = createPiActionToolSchema({ name: nameValue, parameters });
+    const execute = hostExecutor();
+    const [tool] = createPiTools({
+      definitions: [{ name: nameValue, parameters }],
+      execute,
+    });
+
+    await tool.execute('pi-action-mcp-overlap', { query: 'pump' });
+    expect(execute).toHaveBeenCalledWith(
+      {
+        kind: 'action',
+        toolCallId: 'pi-action-mcp-overlap',
+        name: nameValue,
+        args: { query: 'pump' },
+        schemaFingerprint: schema.fingerprint,
+      },
+      undefined,
+    );
   });
 
   it('creates strict managed Code API tool schemas and forwards only validated args', async () => {

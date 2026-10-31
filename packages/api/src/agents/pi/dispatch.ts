@@ -5,6 +5,7 @@ import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import type { PiContentEventTranslatorOptions, PiHostEvent } from './events';
 import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
+import type { PiActionToolSchemaRegistry } from './actionSchema';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
@@ -15,7 +16,12 @@ import type { PiMessageStepIdentity } from './events';
 import type { PiHostSessionOutcome } from './bridge';
 import type { PiModelBinding } from './session';
 import type { PiToolArguments } from './tools';
-import { compilePiMcpToolSchemaRegistry, createPiTools, PiToolCompatibilityError } from './tools';
+import {
+  compilePiActionToolSchemaRegistry,
+  compilePiMcpToolSchemaRegistry,
+  createPiTools,
+  PiToolCompatibilityError,
+} from './tools';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
@@ -46,6 +52,8 @@ export interface PiGenerationDispatchInput {
   toolDefinitions?: readonly LCTool[];
   /** Schemas compiled from the same authorized host definitions used to build tools. */
   mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  /** Schemas compiled from the same current host-authorized Action definitions. */
+  actionToolSchemas?: PiActionToolSchemaRegistry;
   /** Executes a tool through the existing host handler. */
   executeHostToolCall?: (call: PiHostToolCall, signal?: AbortSignal) => Promise<ToolExecuteResult>;
   /** Server-owned context persisted if a Code API tool waits for approval. */
@@ -99,15 +107,18 @@ export function createPiGenerationDispatcher(
     const usage: UsageMetadata[] = [];
     const toolDefinitions = input.toolDefinitions ?? [];
     let mcpToolSchemas: PiMcpToolSchemaRegistry;
+    let actionToolSchemas: PiActionToolSchemaRegistry;
     try {
       mcpToolSchemas = input.mcpToolSchemas ?? compilePiMcpToolSchemaRegistry(toolDefinitions);
+      actionToolSchemas =
+        input.actionToolSchemas ?? compilePiActionToolSchemaRegistry(toolDefinitions);
     } catch (error) {
       if (error instanceof PiToolCompatibilityError) {
         throw new AgentRuntimeUnavailableError();
       }
       throw error;
     }
-    const pauseController = createPiPauseController({ mcpToolSchemas });
+    const pauseController = createPiPauseController({ mcpToolSchemas, actionToolSchemas });
     const eventSequencer = createPiHostEventSequencer(async (event) => {
       if (event.event === UsageEvents.ON_TOKEN_USAGE) {
         usage.push(event.data);
@@ -128,6 +139,7 @@ export function createPiGenerationDispatcher(
           createToolCallId: input.createToolCallId,
           executeHostToolCall: input.executeHostToolCall,
           mcpToolSchemas,
+          actionToolSchemas,
           ...(input.getCodeSessionContext == null
             ? {}
             : { getCodeSessionContext: input.getCodeSessionContext }),
@@ -149,6 +161,7 @@ export function createPiGenerationDispatcher(
         definitions: toolDefinitions,
         execute: executeTool,
         mcpToolSchemas,
+        actionToolSchemas,
       });
     } catch (error) {
       if (error instanceof PiToolCompatibilityError) {

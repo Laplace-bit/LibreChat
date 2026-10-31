@@ -31,6 +31,7 @@ const {
   ContentTypes,
   EModelEndpoint,
   Tools,
+  actionDelimiter,
   ErrorTypes,
   UsageEvents,
 } = require('librechat-data-provider');
@@ -10348,6 +10349,20 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['query'],
     },
   };
+  const actionToolName = `get_inventory${actionDelimiter}api---example---com`;
+  const actionToolDefinition = {
+    name: actionToolName,
+    description: 'List inventory records.',
+    oauth: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 2, maxLength: 80 },
+        limit: { type: 'integer', minimum: 1, maximum: 10 },
+      },
+      required: ['query'],
+    },
+  };
   const createPiFileSearchClient = ({
     toolApproval,
     agentOverrides = {},
@@ -11021,6 +11036,92 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([mcpToolDefinition]);
   });
 
+  it('routes an authorized OpenAPI Action through the current ON_TOOL_EXECUTE handler', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: {
+        endpoints: { [EModelEndpoint.agents]: { toolApproval: { enabled: true, mode: 'bypass' } } },
+      },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Inventory is ready.',
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: actionToolName }],
+        toolDefinitions: [actionToolDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let gateDecision;
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      const args = { query: 'pump inventory', limit: 3 };
+      const schema = input.actionToolSchemas.get(actionToolName);
+      gateDecision = await input.toolExecutionGate({
+        kind: 'action',
+        toolCallId: 'pi-action-call',
+        name: actionToolName,
+        args,
+        schemaFingerprint: schema.fingerprint,
+        turn: 0,
+      });
+      toolResult = await input.executeHostToolCall(
+        {
+          kind: 'action',
+          id: 'host-action-call',
+          name: actionToolName,
+          args,
+          schemaFingerprint: schema.fingerprint,
+          stepId: 'host-action-step',
+          turn: 0,
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(gateDecision).toEqual({ kind: 'execute' });
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch, metadata] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-action-call',
+        name: actionToolName,
+        args: { query: 'pump inventory', limit: 3 },
+        stepId: 'host-action-step',
+        turn: 0,
+      },
+    ]);
+    expect(batch.userId).toBe('user-pi');
+    expect(batch.agentId).toBe('agent-pi');
+    expect(batch.configurable).toMatchObject({ req, user_id: 'user-pi' });
+    expect(metadata).toMatchObject({ thread_id: 'conversation-pi', run_id: 'response-pi' });
+    expect(toolResult).toMatchObject({
+      toolCallId: 'host-action-call',
+      status: 'success',
+      content: 'Inventory is ready.',
+    });
+    expect(batch.metadata).not.toHaveProperty('schemaFingerprint');
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
+      actionToolDefinition,
+    ]);
+  });
+
   it('rejects an MCP approval before model or host execution when its current schema changed', async () => {
     const api = require('@librechat/api');
     const originalSchema = api.createPiMcpToolSchema(mcpToolName, mcpToolDefinition.parameters);
@@ -11069,6 +11170,76 @@ describe('AgentClient - Pi generation dispatch', () => {
       allowedDecisions: ['approve', 'reject'],
       stepIdentity: {
         id: 'step-mcp-1',
+        index: 0,
+        messageId: 'response-pi',
+        runId: 'response-pi',
+        agentId: 'agent-pi',
+      },
+      stepCreatedAt: 100,
+    };
+
+    await client.resumeCompletion({
+      resumeValue: {},
+      piApprovalContinuation: continuation,
+      piApprovalDecision: { kind: 'execute', args: continuation.args },
+      runSteps: [],
+    });
+
+    expect(client.loadHistory).toHaveBeenCalledTimes(1);
+    expect(client.buildMessages).toHaveBeenCalledTimes(1);
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+    expect(mockGetAgentPiModelBindingFactory).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+  });
+
+  it('rejects an Action approval when the current authorized definition changed', async () => {
+    const api = require('@librechat/api');
+    const originalSchema = api.createPiActionToolSchema(actionToolDefinition);
+    const changedDefinition = { ...actionToolDefinition, oauth: false };
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: {
+        endpoints: { [EModelEndpoint.agents]: { toolApproval: { enabled: true, mode: 'bypass' } } },
+      },
+    };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: actionToolName }],
+        toolDefinitions: [changedDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    client.loadHistory = jest.fn().mockResolvedValue([
+      {
+        messageId: 'parent-pi',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'Continue the inventory lookup.',
+      },
+    ]);
+    client.buildMessages = jest.fn().mockResolvedValue({ prompt: [] });
+    client.getBuildMessagesOptions = jest.fn(() => ({}));
+    client.isCompactionTurn = jest.fn(() => false);
+    const continuation = {
+      version: 1,
+      actionId: 'action-openapi-1',
+      piToolCallId: 'pi-action-call-1',
+      hostToolCallId: 'host-action-call-1',
+      toolTurn: 0,
+      kind: 'action',
+      toolName: actionToolName,
+      args: { query: 'pump inventory', limit: 3 },
+      schemaFingerprint: originalSchema.fingerprint,
+      allowedDecisions: ['approve', 'reject'],
+      stepIdentity: {
+        id: 'step-action-1',
         index: 0,
         messageId: 'response-pi',
         runId: 'response-pi',

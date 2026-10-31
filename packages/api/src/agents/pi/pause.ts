@@ -1,4 +1,5 @@
 import type { Agents } from 'librechat-data-provider';
+import type { PiActionToolSchemaRegistry } from './actionSchema';
 import type { PiProviderEventFailure } from './providerEvents';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMcpToolSchemaRegistry } from './mcpSchema';
@@ -56,6 +57,7 @@ const SUPPORTED_DECISIONS = new Set<Agents.ToolApprovalDecisionType>([
 export function createPiPauseController(
   options: {
     mcpToolSchemas?: PiMcpToolSchemaRegistry;
+    actionToolSchemas?: PiActionToolSchemaRegistry;
   } = {},
 ): PiPauseController {
   let signal: PiPauseSignal | undefined;
@@ -75,9 +77,10 @@ export function createPiPauseController(
         toolCall.args,
         {
           ...(options.mcpToolSchemas == null ? {} : { mcpToolSchemas: options.mcpToolSchemas }),
-          ...('kind' in toolCall && toolCall.kind === 'mcp'
-            ? { expectedSchemaFingerprint: toolCall.schemaFingerprint }
-            : {}),
+          ...(options.actionToolSchemas == null
+            ? {}
+            : { actionToolSchemas: options.actionToolSchemas }),
+          ...('kind' in toolCall ? { expectedSchemaFingerprint: toolCall.schemaFingerprint } : {}),
         },
       );
       let codeSessionContext: PiCodeSessionSnapshot | undefined;

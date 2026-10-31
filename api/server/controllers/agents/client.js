@@ -232,11 +232,13 @@ const {
   assertPiCompatible,
   isPiManagedCodeExecutionCompatible,
   isPiMcpToolName,
+  isPiActionToolName,
   isPiCodeExecutionToolName,
   PI_SUPPORTED_HOST_TOOLS,
   createPiCodeSessionBridge,
   createPiToolApprovalGate,
   compilePiMcpToolSchemaRegistry,
+  compilePiActionToolSchemaRegistry,
   PiToolCompatibilityError,
   createPiHostToolBatchExecutor,
   buildPiToolUsageCounts,
@@ -247,6 +249,7 @@ const {
   buildPiApprovalInterruptPayload,
   createPiApprovalContinuation,
   revalidatePiMcpApprovalArguments,
+  revalidatePiActionApprovalArguments,
   executePiGeneration,
 } = require('@librechat/api');
 const {
@@ -302,6 +305,24 @@ const loadAgent = (params) =>
     getMCPServerTools,
     getAccessibleMCPServers,
   });
+
+function getPiToolSchemaBinding(input) {
+  if (input.kind === 'action' || isPiActionToolName(input.name)) {
+    return {
+      kind: 'action',
+      schemaFingerprint: input.schemaFingerprint,
+      ...(input.actionToolSchemas == null ? {} : { actionToolSchemas: input.actionToolSchemas }),
+    };
+  }
+  if (input.kind === 'mcp' || isPiMcpToolName(input.name)) {
+    return {
+      kind: 'mcp',
+      schemaFingerprint: input.schemaFingerprint,
+      ...(input.mcpToolSchemas == null ? {} : { mcpToolSchemas: input.mcpToolSchemas }),
+    };
+  }
+  return {};
+}
 
 const MEMORY_INPUT_CHARS_PER_TOKEN = 8;
 
@@ -4632,7 +4653,7 @@ class AgentClient extends BaseClient {
   }
 
   /** Stage one approved Pi host call through the shared durable HITL lifecycle. */
-  async handlePiToolApprovalInterrupt(signal, streamId, mcpToolSchemas) {
+  async handlePiToolApprovalInterrupt(signal, streamId, mcpToolSchemas, actionToolSchemas) {
     if (
       !streamId ||
       signal?.kind !== 'tool_approval' ||
@@ -4649,9 +4670,13 @@ class AgentClient extends BaseClient {
       hostToolCallId: toolCall.hostExecution.toolCallId,
       toolName: toolCall.name,
       args: toolCall.args,
-      ...(isPiMcpToolName(toolCall.name)
-        ? { kind: 'mcp', schemaFingerprint: toolCall.schemaFingerprint, mcpToolSchemas }
-        : {}),
+      ...getPiToolSchemaBinding({
+        name: toolCall.name,
+        kind: toolCall.kind,
+        schemaFingerprint: toolCall.schemaFingerprint,
+        mcpToolSchemas,
+        actionToolSchemas,
+      }),
       allowedDecisions: toolCall.review.allowedDecisions,
       ...(toolCall.review.description == null ? {} : { description: toolCall.review.description }),
     });
@@ -5143,6 +5168,7 @@ class AgentClient extends BaseClient {
         let piModelBindingFactory;
         let piToolDefinitions = [];
         let piMcpToolSchemas;
+        let piActionToolSchemas;
         let piCodeSessionBridge;
         if (isPiRuntime) {
           const unsupportedModes = [];
@@ -5191,11 +5217,13 @@ class AgentClient extends BaseClient {
           piToolDefinitions = configuredToolDefinitions.filter(
             (definition) =>
               (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
-                isPiMcpToolName(definition?.name)) &&
+                isPiMcpToolName(definition?.name) ||
+                isPiActionToolName(definition?.name)) &&
               callableToolNames.includes(definition.name),
           );
           try {
             piMcpToolSchemas = compilePiMcpToolSchemaRegistry(piToolDefinitions);
+            piActionToolSchemas = compilePiActionToolSchemaRegistry(piToolDefinitions);
           } catch (error) {
             if (error instanceof PiToolCompatibilityError) {
               throw new AgentRuntimeUnavailableError();
@@ -5425,6 +5453,7 @@ class AgentClient extends BaseClient {
             threadId: this.conversationId,
             agentId: this.options.agent.id,
             mcpToolSchemas: piMcpToolSchemas,
+            actionToolSchemas: piActionToolSchemas,
             model:
               this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
           });
@@ -5436,6 +5465,7 @@ class AgentClient extends BaseClient {
               createModelBinding: piModelBindingFactory,
               toolDefinitions: piToolDefinitions,
               mcpToolSchemas: piMcpToolSchemas,
+              actionToolSchemas: piActionToolSchemas,
               executeHostToolCall: executePiHostToolCall,
               ...(piCodeSessionBridge == null
                 ? {}
@@ -5472,7 +5502,12 @@ class AgentClient extends BaseClient {
 
           this.options.startupTelemetry?.mark('pi_session_settled');
           if (outcome.status === 'paused') {
-            await this.handlePiToolApprovalInterrupt(outcome.signal, streamId, piMcpToolSchemas);
+            await this.handlePiToolApprovalInterrupt(
+              outcome.signal,
+              streamId,
+              piMcpToolSchemas,
+              piActionToolSchemas,
+            );
             if (!this.pendingApproval) {
               throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
                 code: 'RUN_REPLACED',
@@ -5977,12 +6012,15 @@ class AgentClient extends BaseClient {
       const piToolDefinitions = configuredToolDefinitions.filter(
         (definition) =>
           (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
-            isPiMcpToolName(definition?.name)) &&
+            isPiMcpToolName(definition?.name) ||
+            isPiActionToolName(definition?.name)) &&
           callableToolNames.includes(definition.name),
       );
       let piMcpToolSchemas;
+      let piActionToolSchemas;
       try {
         piMcpToolSchemas = compilePiMcpToolSchemaRegistry(piToolDefinitions);
+        piActionToolSchemas = compilePiActionToolSchemaRegistry(piToolDefinitions);
       } catch (error) {
         if (error instanceof PiToolCompatibilityError) {
           throw new AgentRuntimeUnavailableError();
@@ -6046,6 +6084,16 @@ class AgentClient extends BaseClient {
             continuation: piApprovalContinuation,
             arguments: continuationToolArguments,
             mcpToolSchemas: piMcpToolSchemas,
+          });
+        } catch {
+          throw new AgentRuntimeUnavailableError();
+        }
+      } else if (piApprovalContinuation.kind === 'action') {
+        try {
+          continuationToolArguments = revalidatePiActionApprovalArguments({
+            continuation: piApprovalContinuation,
+            arguments: continuationToolArguments,
+            actionToolSchemas: piActionToolSchemas,
           });
         } catch {
           throw new AgentRuntimeUnavailableError();
@@ -6206,6 +6254,7 @@ class AgentClient extends BaseClient {
         threadId: this.conversationId,
         agentId: this.options.agent.id,
         mcpToolSchemas: piMcpToolSchemas,
+        actionToolSchemas: piActionToolSchemas,
         model: this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
       });
 
@@ -6215,9 +6264,11 @@ class AgentClient extends BaseClient {
           toolCallId: continuation.piToolCallId,
           name: continuation.toolName,
           args: continuationToolArguments,
-          ...(isPiMcpToolName(continuation.toolName)
-            ? { kind: 'mcp', schemaFingerprint: continuation.schemaFingerprint }
-            : {}),
+          ...getPiToolSchemaBinding({
+            name: continuation.toolName,
+            kind: continuation.kind,
+            schemaFingerprint: continuation.schemaFingerprint,
+          }),
           turn: continuation.toolTurn,
         };
         let hostResult;
@@ -6231,9 +6282,11 @@ class AgentClient extends BaseClient {
                 id: continuation.hostToolCallId,
                 name: continuation.toolName,
                 args: continuationToolArguments,
-                ...(isPiMcpToolName(continuation.toolName)
-                  ? { kind: 'mcp', schemaFingerprint: continuation.schemaFingerprint }
-                  : {}),
+                ...getPiToolSchemaBinding({
+                  name: continuation.toolName,
+                  kind: continuation.kind,
+                  schemaFingerprint: continuation.schemaFingerprint,
+                }),
                 stepId: continuation.stepIdentity.id,
                 turn: continuation.toolTurn,
               },
@@ -6281,6 +6334,7 @@ class AgentClient extends BaseClient {
           toolDefinitions: piToolDefinitions,
           executeHostToolCall: executePiHostToolCall,
           mcpToolSchemas: piMcpToolSchemas,
+          actionToolSchemas: piActionToolSchemas,
           initialToolUsageCounts: buildPiToolUsageCounts({
             runSteps,
             pendingTool: {
@@ -6319,7 +6373,12 @@ class AgentClient extends BaseClient {
       outcome = execution.outcome;
       this.collectedUsage.push(...outcome.usage);
       if (outcome.status === 'paused') {
-        await this.handlePiToolApprovalInterrupt(outcome.signal, streamId, piMcpToolSchemas);
+        await this.handlePiToolApprovalInterrupt(
+          outcome.signal,
+          streamId,
+          piMcpToolSchemas,
+          piActionToolSchemas,
+        );
         if (!this.pendingApproval) {
           throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
             code: 'RUN_REPLACED',

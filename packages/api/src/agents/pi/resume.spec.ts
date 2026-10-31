@@ -1,5 +1,5 @@
 import { DATE_RANGE, Constants } from '@librechat/agents';
-import { Constants as DataConstants, Tools } from 'librechat-data-provider';
+import { actionDelimiter, Constants as DataConstants, Tools } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
 import type { PiDeleteMemoryArguments, PiSetMemoryArguments } from './tools';
 import type { PiPauseToolCall } from './pause';
@@ -8,6 +8,7 @@ import {
   buildPiApprovalInterruptPayload,
   createPiApprovalContinuation,
   matchesPiApprovalHostState,
+  revalidatePiActionApprovalArguments,
   revalidatePiMcpApprovalArguments,
   resolvePiApprovalContinuation,
   resolvePiApprovalDecision,
@@ -17,6 +18,7 @@ import {
   PI_SET_MEMORY_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
 } from './toolNames';
+import { createPiActionToolSchemaRegistry, isPiActionToolName } from './actionSchema';
 import { createPiMcpToolSchemaRegistry } from './mcpSchema';
 import { buildPendingAction } from '~/agents/hitl/policy';
 import { createPiPauseController } from './pause';
@@ -150,6 +152,74 @@ function createMcpApproval() {
   });
   const continuation = createPiApprovalContinuation(pendingAction.actionId, signal.toolCall);
   return { continuation, mcpToolSchemas, pendingAction, parameters, toolName };
+}
+
+function createActionApproval() {
+  const rawToolName = `get_inventory${actionDelimiter}api---example---com`;
+  if (!isPiActionToolName(rawToolName)) {
+    throw new Error('Test Action name failed validation');
+  }
+  const toolName = rawToolName;
+  const parameters = {
+    type: 'object',
+    properties: {
+      query: { type: 'string', minLength: 2, maxLength: 40 },
+      limit: { type: 'integer', minimum: 1, maximum: 10 },
+    },
+    required: ['query'],
+  };
+  const definition = {
+    name: toolName,
+    description: 'List inventory.',
+    oauth: false,
+    parameters,
+  };
+  const actionToolSchemas = createPiActionToolSchemaRegistry([definition]);
+  const schema = actionToolSchemas.get(toolName);
+  if (schema == null) {
+    throw new Error('Test Action schema failed to compile');
+  }
+  const toolCall = {
+    kind: 'action' as const,
+    toolCallId: 'pi-action-call-1',
+    name: toolName,
+    args: { query: 'pump', limit: 3 },
+    schemaFingerprint: schema.fingerprint,
+    hostExecution: {
+      toolCallId: 'host-action-call-1',
+      toolTurn: 1,
+      stepIdentity: {
+        id: 'action-step-1',
+        index: 4,
+        messageId: 'response-1',
+        runId: 'response-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 102,
+    },
+    review: { allowedDecisions: ['approve', 'reject', 'edit', 'respond'] as const },
+  };
+  const signal = createPiPauseController({ actionToolSchemas }).request(toolCall);
+  if (signal.kind !== 'tool_approval') {
+    throw new Error('Test Action approval did not pause');
+  }
+  const payload = buildPiApprovalInterruptPayload({
+    kind: 'action',
+    hostToolCallId: toolCall.hostExecution.toolCallId,
+    toolName: toolCall.name,
+    args: toolCall.args,
+    schemaFingerprint: schema.fingerprint,
+    actionToolSchemas,
+    allowedDecisions: toolCall.review.allowedDecisions,
+  });
+  const pendingAction = buildPendingAction(payload, {
+    streamId: 'conversation-1',
+    conversationId: 'conversation-1',
+    runId: 'response-1',
+    responseMessageId: 'response-1',
+  });
+  const continuation = createPiApprovalContinuation(pendingAction.actionId, signal.toolCall);
+  return { actionToolSchemas, continuation, definition, parameters, pendingAction, toolName };
 }
 
 describe('Pi approval continuation', () => {
@@ -374,6 +444,75 @@ describe('Pi approval continuation', () => {
         continuation,
         arguments: { query: 'x' },
         mcpToolSchemas,
+      }),
+    ).toThrow('The Pi tool arguments are invalid.');
+  });
+
+  it('binds approval resume to the current authorized Action definition and validates edits', () => {
+    const { continuation, actionToolSchemas, definition, parameters, pendingAction, toolName } =
+      createActionApproval();
+    expect(continuation).toMatchObject({
+      kind: 'action',
+      toolName,
+      args: { query: 'pump', limit: 3 },
+    });
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      revalidatePiActionApprovalArguments({
+        continuation,
+        arguments: { query: 'pump', limit: 4 },
+        actionToolSchemas,
+      }),
+    ).toEqual({ query: 'pump', limit: 4 });
+
+    const changedParameters = {
+      ...parameters,
+      properties: { ...parameters.properties, limit: { type: 'integer', maximum: 5 } },
+    };
+    const changedDefinition = createPiActionToolSchemaRegistry([
+      { ...definition, parameters: changedParameters },
+    ]);
+    expect(() =>
+      revalidatePiActionApprovalArguments({
+        continuation,
+        arguments: continuation.args,
+        actionToolSchemas: changedDefinition,
+      }),
+    ).toThrow('This tool schema is not supported by the Pi runtime.');
+    expect(() =>
+      revalidatePiActionApprovalArguments({
+        continuation,
+        arguments: continuation.args,
+        actionToolSchemas: createPiActionToolSchemaRegistry([]),
+      }),
+    ).toThrow('This tool schema is not supported by the Pi runtime.');
+
+    const edited = resolvePiApprovalDecision({
+      continuation,
+      resolutions: [
+        {
+          tool_call_id: continuation.hostToolCallId,
+          decision: 'edit',
+          editedArguments: { query: 'x', limit: 3 },
+        },
+      ],
+    });
+    expect(edited).toMatchObject({ kind: 'execute', args: { query: 'x', limit: 3 } });
+    if (edited?.kind !== 'execute') {
+      throw new Error('Expected an edited Action approval decision.');
+    }
+    expect(() =>
+      revalidatePiActionApprovalArguments({
+        continuation,
+        arguments: edited.args,
+        actionToolSchemas,
       }),
     ).toThrow('The Pi tool arguments are invalid.');
   });

@@ -151,6 +151,7 @@ export * from './agents/pi/prompt';
 export * from './agents/pi/compatibility';
 export * from './agents/pi/toolNames';
 export * from './agents/pi/mcpSchema';
+export * from './agents/pi/actionSchema';
 export * from './agents/pi/tools';
 export * from './agents/pi/codeSession';
 export * from './agents/pi/history';

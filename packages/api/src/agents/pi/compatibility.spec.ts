@@ -1,4 +1,4 @@
-import { Constants } from 'librechat-data-provider';
+import { actionDelimiter, Constants } from 'librechat-data-provider';
 import { assertPiCompatible, isPiManagedCodeExecutionCompatible } from './compatibility';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
@@ -35,6 +35,24 @@ describe('assertPiCompatible', () => {
         supportedToolNames: [toolName],
       }),
     ).not.toThrow();
+  });
+
+  it('allows only Action names present in the current authorized definition set', () => {
+    const toolName = `get_inventory${actionDelimiter}api---example---com`;
+    expect(() =>
+      assertPiCompatible({
+        ...supported,
+        callableToolNames: [toolName],
+        supportedToolNames: [toolName],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertPiCompatible({
+        ...supported,
+        callableToolNames: [toolName],
+        supportedToolNames: [],
+      }),
+    ).toThrow(AgentRuntimeUnavailableError);
   });
 
   it('permits only an explicitly configured managed Code API context for Pi code tools', () => {

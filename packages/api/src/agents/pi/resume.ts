@@ -192,7 +192,9 @@ export function resolvePiApprovalContinuation(input: {
     value.toolTurn < 0 ||
     typeof value.toolName !== 'string' ||
     !isPiSupportedHostToolName(value.toolName) ||
-    (isPiCodeExecutionToolName(value.toolName) && pendingAction.codeExecutionBinding == null) ||
+    ((isPiCodeExecutionToolName(value.toolName) ||
+      Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')) &&
+      pendingAction.codeExecutionBinding == null) ||
     !Array.isArray(value.allowedDecisions) ||
     value.allowedDecisions.length === 0 ||
     !value.allowedDecisions.every(isDecision) ||
@@ -216,7 +218,7 @@ export function resolvePiApprovalContinuation(input: {
     stepIdentity = parseStepIdentity(value.stepIdentity);
     if (Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')) {
       codeSessionContext = parsePiCodeSessionSnapshot(value.codeSessionContext);
-      if (codeSessionContext == null || !isPiCodeExecutionToolName(value.toolName)) {
+      if (codeSessionContext == null) {
         return undefined;
       }
     }

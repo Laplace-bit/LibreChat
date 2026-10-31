@@ -58,6 +58,47 @@ describe('Pi pause controller', () => {
     );
   });
 
+  it('keeps the managed Code API session with a paused non-code tool', () => {
+    const controller = createPiPauseController();
+    const codeSessionContext = {
+      session_id: 'exec-session',
+      files: [
+        {
+          id: 'upload-1',
+          resource_id: 'user-1',
+          name: 'input.csv',
+          storage_session_id: 'storage-1',
+          kind: 'user' as const,
+        },
+      ],
+    };
+
+    const signal = controller.request({
+      toolCallId: 'call-search-1',
+      name: Tools.file_search,
+      args: { query: 'input.csv' },
+      codeSessionContext,
+      hostExecution: {
+        toolCallId: 'host-search-1',
+        toolTurn: 1,
+        stepIdentity: {
+          id: 'step-search-1',
+          index: 1,
+          messageId: 'message-1',
+          runId: 'run-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 2,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] },
+    });
+
+    expect(signal).toMatchObject({
+      kind: 'tool_approval',
+      toolCall: { name: Tools.file_search, codeSessionContext },
+    });
+  });
+
   it('records an unsupported batch as IDs without retaining unvalidated arguments', () => {
     const controller = createPiPauseController();
 

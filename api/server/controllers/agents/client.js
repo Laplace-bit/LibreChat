@@ -4641,12 +4641,16 @@ class AgentClient extends BaseClient {
     });
     const request = this.options.req;
     const appConfig = request?.config;
-    const codeExecutionBinding = isPiCodeExecutionToolName(toolCall.name)
-      ? captureCodeExecutionApprovalBinding([this.options.agent], {
-          includeManagedStateless: true,
-        })
-      : undefined;
-    if (isPiCodeExecutionToolName(toolCall.name) && codeExecutionBinding == null) {
+    const codeExecutionBinding =
+      isPiCodeExecutionToolName(toolCall.name) || toolCall.codeSessionContext != null
+        ? captureCodeExecutionApprovalBinding([this.options.agent], {
+            includeManagedStateless: true,
+          })
+        : undefined;
+    if (
+      (isPiCodeExecutionToolName(toolCall.name) || toolCall.codeSessionContext != null) &&
+      codeExecutionBinding == null
+    ) {
       throw new AgentRuntimeUnavailableError();
     }
     const checkpointerCfg = appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
@@ -5971,7 +5975,7 @@ class AgentClient extends BaseClient {
       ) {
         throw new AgentRuntimeUnavailableError();
       }
-      const piCodeSessionBridge = isPiCodeExecutionToolName(piApprovalContinuation.toolName)
+      const piCodeSessionBridge = piHasCodeExecutionTools
         ? createPiCodeSessionBridge(piApprovalContinuation.codeSessionContext)
         : undefined;
 

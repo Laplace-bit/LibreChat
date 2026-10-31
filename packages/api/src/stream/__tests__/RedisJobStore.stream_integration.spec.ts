@@ -3740,6 +3740,106 @@ describe('RedisJobStore Integration Tests', () => {
       await Promise.all([owner.destroy(), reader.destroy()]);
     });
 
+    describe('Pi approval lifecycle concurrency', () => {
+      test('allows only one Redis-backed replica to resume a Pi approval action', async () => {
+        if (!ioredisClient) {
+          return;
+        }
+
+        const [{ RedisJobStore }, { ApprovalLifecycle }] = await Promise.all([
+          import('../implementations/RedisJobStore'),
+          import('../ApprovalLifecycle'),
+        ]);
+        const replicaAClient = ioredisClient.duplicate();
+        const replicaBClient = ioredisClient.duplicate();
+        const replicaAStore = new RedisJobStore(replicaAClient);
+        const replicaBStore = new RedisJobStore(replicaBClient);
+
+        try {
+          await Promise.all([replicaAStore.initialize(), replicaBStore.initialize()]);
+
+          const streamId = `pi-approval-race-${Date.now()}`;
+          const job = await replicaAStore.createJob(streamId, 'resume-user', streamId, 'tenant-1');
+          const pendingAction: Agents.PendingAction = {
+            ...buildPendingAction(streamId),
+            payload: {
+              type: 'tool_approval',
+              action_requests: [
+                {
+                  name: 'bash_tool',
+                  arguments: { command: 'echo approved' },
+                  tool_call_id: 'pi-tool-call',
+                },
+              ],
+              review_configs: [
+                {
+                  action_name: 'bash_tool',
+                  tool_call_id: 'pi-tool-call',
+                  allowed_decisions: ['approve'],
+                },
+              ],
+            },
+          };
+          const piResumeContinuation = {
+            version: 1,
+            actionId: pendingAction.actionId,
+          };
+          expect(
+            await replicaAStore.transitionStatus(streamId, {
+              from: 'running',
+              to: 'requires_action',
+              expectCreatedAt: job.createdAt,
+              patch: {
+                pendingAction,
+                pendingActionId: pendingAction.actionId,
+                piResumeContinuation,
+              },
+            }),
+          ).toBe(true);
+
+          const onResumedA = jest.fn();
+          const onResumedB = jest.fn();
+          const replicaA = new ApprovalLifecycle(replicaAStore, { onResumed: onResumedA });
+          const replicaB = new ApprovalLifecycle(replicaBStore, { onResumed: onResumedB });
+          let hostToolSideEffects = 0;
+          const resolveOnReplica = async (
+            replica: InstanceType<typeof ApprovalLifecycle>,
+            providerExecutionId: string,
+          ) => {
+            const won = await replica.resolve(
+              streamId,
+              pendingAction.actionId,
+              { providerExecutionId },
+              job.createdAt,
+            );
+            if (won) {
+              hostToolSideEffects += 1;
+            }
+            return won;
+          };
+
+          const results = await Promise.all([
+            resolveOnReplica(replicaA, 'provider-replica-a'),
+            resolveOnReplica(replicaB, 'provider-replica-b'),
+          ]);
+          const resumedJob = await replicaAStore.getJob(streamId);
+
+          expect(results.filter(Boolean)).toHaveLength(1);
+          expect(hostToolSideEffects).toBe(1);
+          expect(onResumedA.mock.calls.length + onResumedB.mock.calls.length).toBe(1);
+          expect(resumedJob).toMatchObject({ status: 'running' });
+          expect(resumedJob?.providerExecutionId).toBe(
+            results[0] ? 'provider-replica-a' : 'provider-replica-b',
+          );
+          expect(resumedJob?.pendingAction).toBeUndefined();
+          expect(resumedJob?.piResumeContinuation).toBeUndefined();
+        } finally {
+          await Promise.all([replicaAStore.destroy(), replicaBStore.destroy()]);
+          await Promise.all([replicaAClient.quit(), replicaBClient.quit()]);
+        }
+      });
+    });
+
     test('terminal transitions and deleteJob remove the steers key', async () => {
       if (!ioredisClient) {
         return;

@@ -4,7 +4,6 @@ import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiHostToolExecutionInput } from './tools';
 import type { PiMessageStepIdentity } from './events';
 import { parsePiCodeSessionSnapshot } from './codeSession';
-import { isPiCodeExecutionToolName } from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
 
 /** Host identity required to settle the in-progress step after an approval resume. */
@@ -77,7 +76,6 @@ export function createPiPauseController(): PiPauseController {
         throw new Error('Pi approval continuation code session is invalid');
       }
       if (
-        (!isPiCodeExecutionToolName(toolCall.name) && codeSessionContext != null) ||
         toolCall.hostExecution.toolCallId.length === 0 ||
         !Number.isSafeInteger(toolCall.hostExecution.toolTurn) ||
         toolCall.hostExecution.toolTurn < 0 ||

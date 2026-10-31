@@ -3384,6 +3384,43 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(resumedClient.resumeCompletion).toHaveBeenCalledTimes(1);
     });
 
+    it('revalidates the managed Code API target across a non-code Pi approval', async () => {
+      const { job, continuation } = makePiToolApprovalJob();
+      const agent = {
+        id: AGENT_ID,
+        codeExecutionContext: {
+          baseUrl: 'https://managed-code.example/v1',
+          codeSessionKey: 'execute_code',
+          executionProfile: 'default',
+          statefulSessions: false,
+        },
+      };
+      continuation.codeSessionContext = { session_id: 'managed-session' };
+      job.metadata.pendingAction.codeExecutionBinding = captureCodeExecutionApprovalBinding(
+        [agent],
+        { includeManagedStateless: true },
+      );
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({
+          args: continuation.args,
+          stepIdentity: continuation.stepIdentity,
+        }),
+      );
+      const resumedClient = makeClient({ options: { agent }, agentConfigs: new Map() });
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+
+      const res = await post(approveBody());
+      await settled;
+      await flush();
+      expect(res.status).toBe(200);
+
+      expect(mockGenerationJobManager.beginProviderExecution).toHaveBeenCalledTimes(1);
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({ piApprovalContinuation: continuation }),
+      );
+    });
+
     it('fails before provider execution when the approved stateful code target changed', async () => {
       const pausedAgent = statefulCodeAgent('worker-a');
       const codeExecutionBinding = captureCodeExecutionApprovalBinding([pausedAgent]);

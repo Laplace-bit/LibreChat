@@ -164,6 +164,48 @@ describe('Pi approval continuation', () => {
     ).toBeUndefined();
   });
 
+  it('retains the Code API session binding across a non-code tool approval', () => {
+    const toolCall: PiPauseToolCall = {
+      ...createApproval().toolCall,
+      codeSessionContext: { session_id: 'exec-session' },
+    };
+    const payload = buildPiApprovalInterruptPayload({
+      hostToolCallId: toolCall.hostExecution.toolCallId,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      allowedDecisions: toolCall.review.allowedDecisions,
+    });
+    const binding = {
+      version: 1 as const,
+      targets: [{ agentId: 'agent-1', targetHash: 'b'.repeat(64) }],
+    };
+    const pendingAction = buildPendingAction(payload, {
+      streamId: 'conversation-1',
+      conversationId: 'conversation-1',
+      runId: 'response-1',
+      responseMessageId: 'response-1',
+      codeExecutionBinding: binding,
+    });
+    const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction: { ...pendingAction, codeExecutionBinding: undefined },
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+  });
+
   it('validates the server envelope against the exact pending action and generation', () => {
     const { continuation, pendingAction } = createApproval();
 

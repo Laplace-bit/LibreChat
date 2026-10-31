@@ -2036,7 +2036,9 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       assertCodeExecutionApprovalBinding(
         pendingAction.codeExecutionBinding,
         reachableAgents,
-        piContinuation && isPiCodeExecutionToolName(piContinuation.toolName)
+        piContinuation &&
+          (isPiCodeExecutionToolName(piContinuation.toolName) ||
+            piContinuation.codeSessionContext != null)
           ? { includeManagedStateless: true }
           : undefined,
       );

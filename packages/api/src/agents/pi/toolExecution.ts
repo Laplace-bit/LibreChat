@@ -14,12 +14,7 @@ import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause'
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostEvent } from './events';
-import {
-  isPiCodeExecutionToolName,
-  PI_BASH_TOOL_NAME,
-  PI_CALCULATOR_TOOL_NAME,
-  PI_READ_FILE_TOOL_NAME,
-} from './toolNames';
+import { PI_BASH_TOOL_NAME, PI_CALCULATOR_TOOL_NAME, PI_READ_FILE_TOOL_NAME } from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
 
 export type PiToolExecutionInput = PiHostToolExecutionInput;
@@ -208,6 +203,7 @@ function toPauseToolCall(
         toolCallId: input.toolCallId,
         name: input.name,
         args: { query: input.args.query },
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
         hostExecution,
         review,
       };
@@ -216,6 +212,7 @@ function toPauseToolCall(
         toolCallId: input.toolCallId,
         name: input.name,
         args: { input: input.args.input },
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
         hostExecution,
         review,
       };
@@ -617,9 +614,7 @@ export function createPiHostToolExecutor(
                   allowedDecisions: decision.allowedDecisions,
                   ...(decision.description == null ? {} : { description: decision.description }),
                 },
-                isPiCodeExecutionToolName(executionInput.name)
-                  ? options.getCodeSessionContext?.()
-                  : undefined,
+                options.getCodeSessionContext?.(),
               ),
             ),
           );

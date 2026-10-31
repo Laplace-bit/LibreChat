@@ -115,6 +115,9 @@ function createHarness(
     }),
     createToolCallId: () => 'host-call-1',
     executeHostToolCall,
+    ...(codeSessionBridge == null
+      ? {}
+      : { getCodeSessionContext: () => codeSessionBridge.snapshot() }),
     handleHostEvent: eventSequencer.enqueue,
     ...(evaluateTool == null
       ? {}
@@ -403,6 +406,41 @@ describe('createPiHostToolExecutor', () => {
           allowedDecisions: ['approve', 'reject'],
           description: 'Review the file search request.',
         },
+      },
+    });
+  });
+
+  it('snapshots the managed Code API session when a non-code tool pauses', async () => {
+    const bridge = createPiCodeSessionBridge({
+      session_id: 'exec-session',
+      files: [
+        {
+          id: 'upload-1',
+          resource_id: 'user-1',
+          name: 'input.csv',
+          storage_session_id: 'storage-1',
+          kind: 'user',
+        },
+      ],
+    });
+    const { pauseController, tool } = createHarness(
+      {
+        toolCallId: 'host-call-1',
+        status: 'success',
+        content: 'This result must not be reached.',
+      },
+      async () => ({ kind: 'pause', allowedDecisions: ['approve', 'reject'] }),
+      fileSearchDefinition,
+      bridge,
+    );
+
+    await tool.execute('pi-search-1', { query: 'input.csv' });
+
+    expect(pauseController.signal).toMatchObject({
+      kind: 'tool_approval',
+      toolCall: {
+        name: Tools.file_search,
+        codeSessionContext: bridge.snapshot(),
       },
     });
   });

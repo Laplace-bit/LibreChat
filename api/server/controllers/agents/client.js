@@ -226,6 +226,8 @@ const {
   getAgentRuntimeUserFacingError,
   resolveStoredAgentRuntime,
   assertPiCompatible,
+  PI_SUPPORTED_HOST_TOOLS,
+  createPiToolApprovalGate,
   createPiHostToolBatchExecutor,
   generateAgentConversationTitle,
   getAgentPiModelBindingFactory,
@@ -252,7 +254,6 @@ const {
   FileSources,
   ApprovalEvents,
   EModelEndpoint,
-  Tools,
   PermissionTypes,
   AgentCapabilities,
   hasActivePiiPatterns,
@@ -4671,6 +4672,11 @@ class AgentClient extends BaseClient {
         ),
       ];
       const askUserQuestionAdminDisabled = isAskUserQuestionAdminDisabled(appConfig);
+      const runToolApprovalAllows = resolveRunToolApprovalAllows(
+        agentsEConfig?.toolApproval,
+        this.options.req?.resolvedConversation,
+        this.conversationId,
+      );
       const runCanPause = canAgentGraphPause({
         policy: effectiveToolApprovalPolicy,
         agents: topLevelAgents,
@@ -4679,11 +4685,7 @@ class AgentClient extends BaseClient {
         resolvedProgrammaticHooks: admissionToolApprovalHooks,
         pluginHookSource: getPluginHookSource(),
         askUserQuestionAdminDisabled,
-        toolApprovalAllows: resolveRunToolApprovalAllows(
-          agentsEConfig?.toolApproval,
-          this.options.req?.resolvedConversation,
-          this.conversationId,
-        ),
+        toolApprovalAllows: runToolApprovalAllows,
       });
       const runUsesCheckpointer = agentRunUsesCheckpointer({
         policy: effectiveToolApprovalPolicy,
@@ -5063,14 +5065,19 @@ class AgentClient extends BaseClient {
             : [];
           piToolDefinitions = configuredToolDefinitions.filter(
             (definition) =>
-              definition?.name === Tools.file_search && callableToolNames.includes(definition.name),
+              PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) &&
+              callableToolNames.includes(definition.name),
           );
           assertPiCompatible({
             rootAgentId: this.options.agent?.id,
             loadedAgentIds: agents.map((agent) => agent?.id),
             callableToolNames,
             supportedToolNames: piToolDefinitions.map((definition) => definition.name),
-            toolApprovalRequired: effectiveToolApprovalPolicy?.enabled === true,
+            toolApprovalCanPause:
+              runCanPause ||
+              effectiveToolApprovalPolicy?.agentModes === true ||
+              (attachedCodeEnvironmentAgentIds.size > 0 &&
+                agentsEConfig?.toolApproval?.enabled !== false),
             unsupportedModes,
           });
           piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
@@ -5259,11 +5266,30 @@ class AgentClient extends BaseClient {
                     ),
                 })
               : undefined;
+          const piToolExecutionGate = createPiToolApprovalGate({
+            policy: effectiveToolApprovalPolicy,
+            allowedTools: runToolApprovalAllows,
+            logger,
+            pluginHookSource: getPluginHookSource(),
+            resolvedHooks: resolvedToolApprovalHooks,
+            hookContext: {
+              userId: request?.user?.id,
+              conversationId: this.conversationId,
+              tenantId: resolveRequestTenantId(request ?? {}),
+              appConfig,
+            },
+            runId: this.responseMessageId,
+            threadId: this.conversationId,
+            agentId: this.options.agent.id,
+            model:
+              this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
+          });
           const outcome = await executePiGeneration({
             messages: piMessages,
             createModelBinding: piModelBindingFactory,
             toolDefinitions: piToolDefinitions,
             executeHostToolCall: executePiHostToolCall,
+            toolExecutionGate: piToolExecutionGate,
             createToolStepIdentity: createPiStepIdentity,
             createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
             signal: abortController.signal,
@@ -5330,11 +5356,7 @@ class AgentClient extends BaseClient {
           hitlCapable: true,
           toolApprovalStorage: db,
           resolvedToolApprovalHooks,
-          toolApprovalAllows: resolveRunToolApprovalAllows(
-            agentsEConfig?.toolApproval,
-            this.options.req?.resolvedConversation,
-            this.conversationId,
-          ),
+          toolApprovalAllows: runToolApprovalAllows,
           toolInputValidationErrors: this.toolInputValidationErrors,
           // Mid-run steering: drain queued user messages at each tool-batch
           // boundary and inject them into graph state. The offset wrapper

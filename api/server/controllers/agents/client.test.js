@@ -10258,6 +10258,15 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['query'],
     },
   };
+  const calculatorDefinition = {
+    name: 'calculator',
+    description: 'Evaluate a mathematical expression.',
+    parameters: {
+      type: 'object',
+      properties: { input: { type: 'string' } },
+      required: ['input'],
+    },
+  };
   const createPiFileSearchClient = ({
     toolApproval,
     agentOverrides = {},
@@ -10386,7 +10395,6 @@ describe('AgentClient - Pi generation dispatch', () => {
 
   it.each([
     ['default ask policy', { enabled: true }],
-    ['deny-only policy', { enabled: true, mode: 'dontAsk', deny: ['file_search'] }],
     ['explicit ask policy', { enabled: true, mode: 'bypass', ask: ['file_search'] }],
   ])(
     'rejects Pi tool execution before provider or host effects under %s',
@@ -10408,6 +10416,27 @@ describe('AgentClient - Pi generation dispatch', () => {
       expect(mockCreateRun).not.toHaveBeenCalled();
     },
   );
+
+  it('runs static host policy decisions before Pi can dispatch a file_search call', async () => {
+    for (const [toolApproval, expectedDecision] of [
+      [{ enabled: true, mode: 'dontAsk', deny: ['file_search'] }, { kind: 'deny' }],
+      [{ enabled: true, mode: 'bypass' }, { kind: 'execute' }],
+    ]) {
+      const client = createPiFileSearchClient({ toolApproval });
+
+      await client.chatCompletion({ payload: [] });
+
+      const [dispatchInput] = mockExecutePiGeneration.mock.calls.at(-1);
+      await expect(
+        dispatchInput.toolExecutionGate({
+          toolCallId: 'pi-call-1',
+          name: Tools.file_search,
+          args: { query: 'machine maintenance' },
+          turn: 0,
+        }),
+      ).resolves.toEqual(expectedDecision);
+    }
+  });
 
   it('rejects Pi before executing a registered PreToolUse hook when approval is enabled', async () => {
     mockIsHITLEnabled.mockReturnValue(true);
@@ -10537,6 +10566,77 @@ describe('AgentClient - Pi generation dispatch', () => {
       expect.any(Function),
     );
     expect(mockExecutePiGeneration.mock.calls[0][0].createToolCallId).toEqual(expect.any(Function));
+  });
+
+  it('routes the host calculator through the current authorized ON_TOOL_EXECUTE handler', async () => {
+    const req = {
+      user: { id: 'user-pi' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: '4',
+          },
+        ]);
+      }),
+    };
+    const client = createPiClient({
+      req,
+      agent: {
+        tools: [{ name: 'calculator' }],
+        toolDefinitions: [calculatorDefinition],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    let toolResult;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      toolResult = await input.executeHostToolCall(
+        {
+          id: 'host-calculator-call',
+          name: 'calculator',
+          args: { input: '2 + 2' },
+          stepId: 'host-calculator-step',
+        },
+        new AbortController().signal,
+      );
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    const [event, batch, metadata] = toolExecuteHandler.handle.mock.calls[0];
+    expect(event).toBe(GraphEvents.ON_TOOL_EXECUTE);
+    expect(batch.toolCalls).toEqual([
+      {
+        id: 'host-calculator-call',
+        name: 'calculator',
+        args: { input: '2 + 2' },
+        stepId: 'host-calculator-step',
+      },
+    ]);
+    expect(batch.userId).toBe('user-pi');
+    expect(batch.agentId).toBe('agent-pi');
+    expect(batch.configurable).toMatchObject({
+      req,
+      user_id: 'user-pi',
+      thread_id: 'conversation-pi',
+      run_id: 'response-pi',
+    });
+    expect(metadata).toMatchObject({ thread_id: 'conversation-pi', run_id: 'response-pi' });
+    expect(toolResult).toEqual({
+      toolCallId: 'host-calculator-call',
+      status: 'success',
+      content: '4',
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
+      calculatorDefinition,
+    ]);
   });
 
   it('keeps Pi context overflow actionable when model-bound content protection is enabled', async () => {

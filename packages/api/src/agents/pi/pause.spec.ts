@@ -1,4 +1,5 @@
 import { Tools } from 'librechat-data-provider';
+import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiPauseController } from './pause';
 
 describe('Pi pause controller', () => {
@@ -15,6 +16,20 @@ describe('Pi pause controller', () => {
 
     expect(repeatedSignal).toBe(firstSignal);
     expect(firstSignal).toEqual({ kind: 'tool_approval', toolCall: call });
+  });
+
+  it('supports schema-validated calculator calls and rejects conflicting reused IDs', () => {
+    const controller = createPiPauseController();
+    const call = {
+      toolCallId: 'call-calc-1',
+      name: PI_CALCULATOR_TOOL_NAME,
+      args: { input: '2 + 2' },
+    } as const;
+
+    expect(controller.request(call)).toEqual({ kind: 'tool_approval', toolCall: call });
+    expect(() => controller.request({ ...call, args: { input: '2 + 3' } })).toThrow(
+      'A Pi tool call ID cannot refer to two different host actions',
+    );
   });
 
   it('records an unsupported batch as IDs without retaining unvalidated arguments', () => {

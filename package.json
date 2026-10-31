@@ -10,6 +10,7 @@
     "api",
     "client",
     "desktop",
+    "desktop/electron",
     "packages/*"
   ],
   "scripts": {

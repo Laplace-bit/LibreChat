@@ -1,30 +1,47 @@
 import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import { GraphEvents, type ToolExecuteResult } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
+import type {
+  PiCalculatorArguments,
+  PiFileSearchArguments,
+  PiHostToolExecutionInput,
+  PiToolArguments,
+} from './tools';
 import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause';
 import type { PiMessageStepIdentity } from './events';
-import type { PiFileSearchArguments } from './tools';
 import type { PiHostEvent } from './events';
+import { validatePiToolExecutionInput } from './tools';
+import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 
-export interface PiToolExecutionInput {
-  toolCallId: string;
-  name: typeof Tools.file_search;
-  args: PiFileSearchArguments;
-}
+export type PiToolExecutionInput = PiHostToolExecutionInput;
 
-export type PiToolGateDecision = { kind: 'execute' } | { kind: 'pause' };
+export type PiToolExecutionContext = PiToolExecutionInput & { turn: number };
+
+export type PiToolGateDecision =
+  | { kind: 'execute'; args?: PiToolArguments }
+  | { kind: 'deny' }
+  | { kind: 'pause' };
 
 export type PiToolExecutionGate = (
-  input: PiToolExecutionInput,
+  input: PiToolExecutionContext,
   signal?: AbortSignal,
 ) => PiToolGateDecision | Promise<PiToolGateDecision>;
 
-export interface PiHostToolCall {
-  id: string;
-  name: typeof Tools.file_search;
-  args: PiFileSearchArguments;
-  stepId: string;
-}
+export type PiHostToolCall =
+  | {
+      id: string;
+      name: typeof Tools.file_search;
+      args: PiFileSearchArguments;
+      stepId: string;
+      turn?: number;
+    }
+  | {
+      id: string;
+      name: typeof PI_CALCULATOR_TOOL_NAME;
+      args: PiCalculatorArguments;
+      stepId: string;
+      turn?: number;
+    };
 
 export interface PiToolExecutionOptions {
   createStepIdentity(): PiMessageStepIdentity;
@@ -72,11 +89,41 @@ function abortError(): Error {
 }
 
 function toPauseToolCall(input: PiToolExecutionInput): PiPauseToolCall {
-  return {
-    toolCallId: input.toolCallId,
-    name: input.name,
-    args: { query: input.args.query },
-  };
+  switch (input.name) {
+    case Tools.file_search:
+      return {
+        toolCallId: input.toolCallId,
+        name: input.name,
+        args: { query: input.args.query },
+      };
+    case PI_CALCULATOR_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: input.name,
+        args: { input: input.args.input },
+      };
+  }
+}
+
+function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: string): PiHostToolCall {
+  switch (input.name) {
+    case Tools.file_search:
+      return {
+        id,
+        name: Tools.file_search,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_CALCULATOR_TOOL_NAME:
+      return {
+        id,
+        name: PI_CALCULATOR_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+  }
 }
 
 function buildRunStep(
@@ -183,6 +230,56 @@ async function settleRunStep(options: {
   }
 }
 
+interface StartedPiToolStep {
+  identity: PiMessageStepIdentity;
+  toolCallId: string;
+  input: PiToolExecutionInput;
+  createdAt: number;
+}
+
+async function startPiToolStep(
+  options: PiToolExecutionOptions,
+  input: PiToolExecutionInput,
+  createdAt: number,
+  now: () => number,
+): Promise<StartedPiToolStep> {
+  const identity = options.createStepIdentity();
+  const toolCallId = options.createToolCallId();
+  const step = buildRunStep(identity, toolCallId, input, createdAt);
+  try {
+    await options.handleHostEvent({ event: GraphEvents.ON_RUN_STEP, data: step });
+    await options.handleHostEvent({
+      event: StepEvents.ON_TOOL_CALLS_DISPATCHED,
+      data: {
+        dispatched_at: createdAt,
+        runId: identity.runId,
+        toolCalls: [{ id: toolCallId, name: input.name, stepId: identity.id }],
+      },
+    });
+  } catch (error) {
+    try {
+      await settleRunStep({
+        identity,
+        toolCallId,
+        input,
+        output: 'Tool execution could not be started.',
+        status: 'error',
+        createdAt,
+        now,
+        handleHostEvent: options.handleHostEvent,
+      });
+    } catch (settleError) {
+      throw new AggregateError(
+        [error, settleError],
+        'Pi tool dispatch and step settlement both failed',
+      );
+    }
+    throw error;
+  }
+
+  return { identity, toolCallId, input, createdAt };
+}
+
 /**
  * Executes one Pi tool through the host's existing tool handler and emits the
  * LibreChat run-step lifecycle around it. Tool authorization, execution,
@@ -198,6 +295,7 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
   terminate?: boolean;
 }> {
   const now = options.now ?? Date.now;
+  let nextTurn = 0;
   const createPauseResult = (signal: PiPauseSignal) =>
     signal.kind === 'tool_approval'
       ? {
@@ -217,24 +315,51 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       throw abortError();
     }
 
+    const toolInput: PiToolExecutionContext = { ...input, turn: nextTurn++ };
+    let executionInput = toolInput;
+
     if (options.pauseGate != null) {
       const pendingPause = options.pauseGate.controller.signal;
       if (pendingPause != null) {
-        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(toolInput)));
       }
-      const decision = await options.pauseGate.evaluate(input, signal);
+      const decision = await options.pauseGate.evaluate(toolInput, signal);
       if (signal?.aborted) {
         throw abortError();
       }
       const pendingPauseAfterGate = options.pauseGate.controller.signal;
       if (pendingPauseAfterGate != null) {
-        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(toolInput)));
       }
       switch (decision.kind) {
         case 'execute':
+          if (decision.args != null) {
+            executionInput = {
+              ...validatePiToolExecutionInput(toolInput.name, toolInput.toolCallId, decision.args),
+              turn: toolInput.turn,
+            };
+          }
           break;
+        case 'deny': {
+          const deniedStep = await startPiToolStep(options, toolInput, now(), now);
+          const deniedOutput = 'This tool call was denied by the server policy.';
+          await settleRunStep({
+            ...deniedStep,
+            output: deniedOutput,
+            status: 'error',
+            now,
+            handleHostEvent: options.handleHostEvent,
+          });
+          return {
+            content: [{ type: 'text', text: deniedOutput }],
+            details: { status: 'error' },
+            isError: true,
+          };
+        }
         case 'pause': {
-          return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+          return createPauseResult(
+            options.pauseGate.controller.request(toPauseToolCall(toolInput)),
+          );
         }
         default: {
           const exhaustive: never = decision;
@@ -247,53 +372,17 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       throw abortError();
     }
 
-    const identity = options.createStepIdentity();
-    const toolCallId = options.createToolCallId();
     const createdAt = now();
-    const step = buildRunStep(identity, toolCallId, input, createdAt);
-    try {
-      await options.handleHostEvent({ event: GraphEvents.ON_RUN_STEP, data: step });
-      await options.handleHostEvent({
-        event: StepEvents.ON_TOOL_CALLS_DISPATCHED,
-        data: {
-          dispatched_at: createdAt,
-          runId: identity.runId,
-          toolCalls: [{ id: toolCallId, name: input.name, stepId: identity.id }],
-        },
-      });
-    } catch (error) {
-      try {
-        await settleRunStep({
-          identity,
-          toolCallId,
-          input,
-          output: 'Tool execution could not be started.',
-          status: 'error',
-          createdAt,
-          now,
-          handleHostEvent: options.handleHostEvent,
-        });
-      } catch (settleError) {
-        throw new AggregateError(
-          [error, settleError],
-          'Pi tool dispatch and step settlement both failed',
-        );
-      }
-      throw error;
-    }
+    const started = await startPiToolStep(options, executionInput, createdAt, now);
+    const { identity, toolCallId } = started;
 
-    const hostCall: PiHostToolCall = {
-      id: toolCallId,
-      name: input.name,
-      args: input.args,
-      stepId: identity.id,
-    };
+    const hostCall = toHostToolCall(executionInput, toolCallId, identity.id);
 
     if (signal?.aborted) {
       await settleRunStep({
         identity,
         toolCallId,
-        input,
+        input: executionInput,
         output: 'Tool execution was cancelled.',
         status: 'cancelled',
         createdAt,
@@ -311,7 +400,7 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       await settleRunStep({
         identity,
         toolCallId,
-        input,
+        input: executionInput,
         output: cancelled ? 'Tool execution was cancelled.' : 'Tool execution failed.',
         status: cancelled ? 'cancelled' : 'error',
         createdAt,
@@ -328,7 +417,7 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
       await settleRunStep({
         identity,
         toolCallId,
-        input,
+        input: executionInput,
         output: 'Tool execution was cancelled.',
         status: 'cancelled',
         createdAt,
@@ -345,7 +434,7 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
     await settleRunStep({
       identity,
       toolCallId,
-      input,
+      input: executionInput,
       output,
       status,
       createdAt,

@@ -136,7 +136,14 @@ export function createPiHostToolBatchExecutor(
         };
         const batchMetadata = { ...metadata };
         const batch: ToolExecuteBatchRequest = {
-          toolCalls: [call],
+          toolCalls: [
+            {
+              id: call.id,
+              name: call.name,
+              args: call.args,
+              stepId: call.stepId,
+            },
+          ],
           userId: options.userId,
           agentId: options.agentId,
           configurable,

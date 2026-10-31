@@ -1,12 +1,9 @@
-import { Tools } from 'librechat-data-provider';
 import type { PiProviderEventFailure } from './providerEvents';
+import type { PiHostToolExecutionInput } from './tools';
+import { validatePiToolExecutionInput } from './tools';
 
 /** Exact, schema-validated host call stopped before dispatch. */
-export type PiPauseToolCall = {
-  readonly toolCallId: string;
-  readonly name: typeof Tools.file_search;
-  readonly args: { readonly query: string };
-};
+export type PiPauseToolCall = PiHostToolExecutionInput;
 
 export type PiPauseSignal =
   | { readonly kind: 'tool_approval'; readonly toolCall: PiPauseToolCall }
@@ -39,14 +36,16 @@ export function createPiPauseController(): PiPauseController {
       if (signal?.kind === 'unsupported_provider_event') {
         return signal;
       }
-      if (toolCall.toolCallId.length === 0 || toolCall.args.query.length === 0) {
-        throw new Error('A Pi pause signal requires a validated host tool call');
-      }
+      const validatedCall = validatePiToolExecutionInput(
+        toolCall.name,
+        toolCall.toolCallId,
+        toolCall.args,
+      );
       const previousCall = requestedCalls.get(toolCall.toolCallId);
       if (previousCall != null) {
         if (
           previousCall.name !== toolCall.name ||
-          previousCall.args.query !== toolCall.args.query
+          JSON.stringify(previousCall.args) !== JSON.stringify(validatedCall.args)
         ) {
           throw new Error('A Pi tool call ID cannot refer to two different host actions');
         }
@@ -54,7 +53,7 @@ export function createPiPauseController(): PiPauseController {
         return signal;
       }
 
-      const nextCall = { ...toolCall, args: { ...toolCall.args } };
+      const nextCall = validatedCall;
       if (
         signal?.kind === 'unsupported_tool_batch' &&
         signal.toolCallIds.includes(nextCall.toolCallId)

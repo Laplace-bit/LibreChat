@@ -10,6 +10,7 @@ import type { PiToolExecutionGate } from './toolExecution';
 import type { PiHostEvent } from './events';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiHostToolExecutor } from './toolExecution';
+import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiHostEventSequencer } from './bridge';
 import { createPiPauseController } from './pause';
 import { createPiTools } from './tools';
@@ -21,6 +22,16 @@ const fileSearchDefinition: LCTool = {
     type: 'object',
     properties: { query: { type: 'string' } },
     required: ['query'],
+  },
+};
+
+const calculatorDefinition: LCTool = {
+  name: PI_CALCULATOR_TOOL_NAME,
+  description: 'Evaluate an expression.',
+  parameters: {
+    type: 'object',
+    properties: { input: { type: 'string' } },
+    required: ['input'],
   },
 };
 
@@ -59,7 +70,11 @@ function createAuthorizedHandler(
   };
 }
 
-function createHarness(result: ToolExecuteResult, evaluateTool?: PiToolExecutionGate) {
+function createHarness(
+  result: ToolExecuteResult,
+  evaluateTool?: PiToolExecutionGate,
+  definition: LCTool = fileSearchDefinition,
+) {
   const events: PiHostEvent[] = [];
   const batches: ToolExecuteBatchRequest[] = [];
   const pauseController = createPiPauseController();
@@ -91,12 +106,44 @@ function createHarness(result: ToolExecuteResult, evaluateTool?: PiToolExecution
       : { pauseGate: { controller: pauseController, evaluate: evaluateTool } }),
     now: () => 42,
   });
-  const [tool] = createPiTools({ definitions: [fileSearchDefinition], execute: executePiTool });
+  const [tool] = createPiTools({ definitions: [definition], execute: executePiTool });
 
   return { batches, events, eventSequencer, pauseController, tool };
 }
 
 describe('createPiHostToolExecutor', () => {
+  it('routes calculator calls through the host authorization and step lifecycle', async () => {
+    const { batches, events, eventSequencer, tool } = createHarness(
+      {
+        toolCallId: 'host-call-1',
+        status: 'success',
+        content: '4',
+      },
+      undefined,
+      calculatorDefinition,
+    );
+
+    const result = await tool.execute('pi-calc-1', { input: '2 + 2' });
+    await eventSequencer.drain();
+
+    expect(result).toEqual({
+      content: [{ type: 'text', text: '4' }],
+      details: { status: 'success' },
+    });
+    expect(batches[0]?.toolCalls[0]).toMatchObject({
+      id: 'host-call-1',
+      name: PI_CALCULATOR_TOOL_NAME,
+      args: { input: '2 + 2' },
+      stepId: 'pi-step-1',
+    });
+    expect(events.map(({ event }) => event)).toEqual([
+      GraphEvents.ON_RUN_STEP,
+      StepEvents.ON_TOOL_CALLS_DISPATCHED,
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      GraphEvents.ON_RUN_STEP_CLOSED,
+    ]);
+  });
+
   it('routes Pi file_search through the host handler and emits ordered LibreChat tool events', async () => {
     const hostResult: ToolExecuteResult = {
       toolCallId: 'host-call-1',
@@ -177,6 +224,78 @@ describe('createPiHostToolExecutor', () => {
       isError: true,
     });
     expect(JSON.stringify(result)).not.toContain('private-secret');
+  });
+
+  it('denies a policy-blocked tool call before host execution and records a failed step', async () => {
+    const { batches, events, eventSequencer, tool } = createHarness(
+      {
+        toolCallId: 'host-call-1',
+        status: 'success',
+        content: 'must not execute',
+      },
+      async () => ({ kind: 'deny' }),
+    );
+
+    await expect(tool.execute('pi-call-1', { query: 'maintenance manual' })).resolves.toEqual({
+      content: [{ type: 'text', text: 'This tool call was denied by the server policy.' }],
+      details: { status: 'error' },
+      isError: true,
+    });
+    await eventSequencer.drain();
+
+    expect(batches).toHaveLength(0);
+    expect(events.map(({ event }) => event)).toEqual([
+      GraphEvents.ON_RUN_STEP,
+      StepEvents.ON_TOOL_CALLS_DISPATCHED,
+      GraphEvents.ON_RUN_STEP_COMPLETED,
+      GraphEvents.ON_RUN_STEP_CLOSED,
+    ]);
+    expect(events[2]).toMatchObject({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          tool_call: {
+            output: 'This tool call was denied by the server policy.',
+          },
+        },
+      },
+    });
+    expect(events[3]).toMatchObject({
+      event: GraphEvents.ON_RUN_STEP_CLOSED,
+      data: { id: 'pi-step-1', status: 'failed' },
+    });
+  });
+
+  it('executes only validated PreToolUse rewritten arguments', async () => {
+    const evaluateTool = jest.fn(async () => ({
+      kind: 'execute' as const,
+      args: { query: 'sanitized maintenance manual' },
+    }));
+    const { batches, eventSequencer, tool } = createHarness(
+      {
+        toolCallId: 'host-call-1',
+        status: 'success',
+        content: 'Found the sanitized manual.',
+      },
+      evaluateTool,
+    );
+
+    await tool.execute('pi-call-1', { query: 'maintenance manual' });
+    await eventSequencer.drain();
+
+    expect(evaluateTool).toHaveBeenCalledWith(
+      {
+        toolCallId: 'pi-call-1',
+        name: Tools.file_search,
+        args: { query: 'maintenance manual' },
+        turn: 0,
+      },
+      undefined,
+    );
+    expect(batches[0]?.toolCalls[0]).toMatchObject({
+      name: Tools.file_search,
+      args: { query: 'sanitized maintenance manual' },
+    });
   });
 
   it('pauses before host dispatch and emits no terminal tool-step event', async () => {

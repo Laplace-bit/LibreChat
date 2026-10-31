@@ -2,16 +2,29 @@ import { Tools } from 'librechat-data-provider';
 import type { AgentToolResult, ToolDefinition } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
 import type { TSchema } from 'typebox';
+import { isPiSupportedHostToolName, PI_CALCULATOR_TOOL_NAME } from './toolNames';
 
 export type PiFileSearchArguments = Record<string, unknown> & {
   query: string;
 };
 
-export interface PiHostToolExecutionInput {
-  toolCallId: string;
-  name: typeof Tools.file_search;
-  args: PiFileSearchArguments;
-}
+export type PiCalculatorArguments = Record<string, unknown> & {
+  input: string;
+};
+
+export type PiToolArguments = PiFileSearchArguments | PiCalculatorArguments;
+
+export type PiHostToolExecutionInput =
+  | {
+      toolCallId: string;
+      name: typeof Tools.file_search;
+      args: PiFileSearchArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_CALCULATOR_TOOL_NAME;
+      args: PiCalculatorArguments;
+    };
 
 /** The caller owns authorization and execution; this module only supplies Pi's tool contract. */
 export type PiHostToolExecutor = (
@@ -44,6 +57,19 @@ const ERROR_MESSAGES: Record<PiToolCompatibilityCode, string> = {
   PI_TOOL_ARGUMENTS_INVALID: 'The Pi tool arguments are invalid.',
 };
 
+const TOOL_FIELDS = {
+  [Tools.file_search]: {
+    argument: 'query',
+    label: 'File Search',
+    description: 'Search files the current agent is authorized to access.',
+  },
+  [PI_CALCULATOR_TOOL_NAME]: {
+    argument: 'input',
+    label: 'Calculator',
+    description: 'Evaluate a mathematical expression using the authorized host calculator.',
+  },
+} as const;
+
 export class PiToolCompatibilityError extends Error {
   readonly code: PiToolCompatibilityCode;
 
@@ -73,12 +99,12 @@ function validateDescription(value: unknown): string | undefined {
 }
 
 /**
- * The first Pi tool slice intentionally accepts only the existing file_search schema:
- * one required string query and no additional properties. This converts the trusted
- * LCTool JSON Schema into a Pi TypeBox schema and rejects widening/complexity at the edge.
+ * Converts only the reviewed one-string object schemas used by host file_search
+ * and calculator tools. Other JSON Schema features fail closed at admission.
  */
-export function convertPiToolSchema(schema: unknown): TSchema {
+export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   if (
+    !isPiSupportedHostToolName(name) ||
     !isRecord(schema) ||
     !hasOnlyKeys(schema, [
       'type',
@@ -88,37 +114,56 @@ export function convertPiToolSchema(schema: unknown): TSchema {
       'description',
     ]) ||
     schema.type !== 'object' ||
-    !isRecord(schema.properties) ||
-    !hasOnlyKeys(schema.properties, ['query']) ||
-    !isRecord(schema.properties.query)
+    !isRecord(schema.properties)
   ) {
     throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
   }
 
-  const objectDescription = validateDescription(schema.description);
-  const querySchema = schema.properties.query;
-  if (!hasOnlyKeys(querySchema, ['type', 'description']) || querySchema.type !== 'string') {
+  const { argument } = TOOL_FIELDS[name];
+  const propertySchema = schema.properties[argument];
+  if (
+    !hasOnlyKeys(schema.properties, [argument]) ||
+    !isRecord(propertySchema) ||
+    !hasOnlyKeys(propertySchema, ['type', 'description']) ||
+    propertySchema.type !== 'string'
+  ) {
     throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
   }
 
-  const queryDescription = validateDescription(querySchema.description);
   const required = schema.required;
   if (
     !Array.isArray(required) ||
     required.length !== 1 ||
-    required[0] !== 'query' ||
+    required[0] !== argument ||
     (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
   ) {
     throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
   }
 
+  const objectDescription = validateDescription(schema.description);
+  const propertyDescription = validateDescription(propertySchema.description);
+  if (name === Tools.file_search) {
+    return {
+      type: 'object',
+      required: ['query'],
+      properties: {
+        query: {
+          type: 'string',
+          ...(propertyDescription === undefined ? {} : { description: propertyDescription }),
+        },
+      },
+      additionalProperties: false,
+      ...(objectDescription === undefined ? {} : { description: objectDescription }),
+    } satisfies TSchema;
+  }
+
   return {
     type: 'object',
-    required: ['query'],
+    required: ['input'],
     properties: {
-      query: {
+      input: {
         type: 'string',
-        ...(queryDescription === undefined ? {} : { description: queryDescription }),
+        ...(propertyDescription === undefined ? {} : { description: propertyDescription }),
       },
     },
     additionalProperties: false,
@@ -126,7 +171,7 @@ export function convertPiToolSchema(schema: unknown): TSchema {
   } satisfies TSchema;
 }
 
-function parsePiFileSearchArguments(value: unknown): PiFileSearchArguments {
+export function validatePiFileSearchArguments(value: unknown): PiFileSearchArguments {
   if (
     !isRecord(value) ||
     !hasOnlyKeys(value, ['query']) ||
@@ -138,12 +183,52 @@ function parsePiFileSearchArguments(value: unknown): PiFileSearchArguments {
   return { query: value.query };
 }
 
+export function validatePiCalculatorArguments(value: unknown): PiCalculatorArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['input']) ||
+    typeof value.input !== 'string' ||
+    value.input.length === 0
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return { input: value.input };
+}
+
+export function validatePiToolExecutionInput(
+  name: string,
+  toolCallId: string,
+  args: unknown,
+): PiHostToolExecutionInput {
+  if (toolCallId.length === 0) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+
+  switch (name) {
+    case Tools.file_search:
+      return {
+        toolCallId,
+        name: Tools.file_search,
+        args: validatePiFileSearchArguments(args),
+      };
+    case PI_CALCULATOR_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_CALCULATOR_TOOL_NAME,
+        args: validatePiCalculatorArguments(args),
+      };
+    default:
+      throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+  }
+}
+
 /**
- * Invoke the host-owned callback with validated file_search arguments. Kept separate
- * from Pi's ExtensionToolContext so the host callback receives no ambient Pi capabilities.
+ * Invoke the host-owned callback with validated arguments. No Pi extension
+ * context is exposed, and no local shell or filesystem fallback exists.
  */
 export async function executePiToolCall(input: {
   execute?: PiHostToolExecutor;
+  name: string;
   toolCallId: string;
   arguments: unknown;
   signal?: AbortSignal;
@@ -151,16 +236,11 @@ export async function executePiToolCall(input: {
   if (typeof input.execute !== 'function') {
     throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
   }
-  if (input.toolCallId.length === 0) {
+  if (!isPiSupportedHostToolName(input.name)) {
     throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
   }
-
   return input.execute(
-    {
-      toolCallId: input.toolCallId,
-      name: Tools.file_search,
-      args: parsePiFileSearchArguments(input.arguments),
-    },
+    validatePiToolExecutionInput(input.name, input.toolCallId, input.arguments),
     input.signal,
   );
 }
@@ -175,35 +255,37 @@ export function createPiTools(input: {
   if (input.definitions.length === 0) {
     return [];
   }
-  if (input.definitions.length !== 1 || input.definitions[0]?.name !== Tools.file_search) {
-    throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
-  }
   if (typeof input.execute !== 'function') {
     throw new PiToolCompatibilityError('PI_TOOL_EXECUTION_UNAVAILABLE');
   }
 
-  const [definition] = input.definitions;
-  if (definition.parameters === undefined) {
-    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
-  }
+  const seenNames = new Set<string>();
+  return input.definitions.map((definition) => {
+    const candidateName: unknown = definition.name;
+    if (!isPiSupportedHostToolName(candidateName) || seenNames.has(candidateName)) {
+      throw new PiToolCompatibilityError('PI_TOOL_UNSUPPORTED');
+    }
+    seenNames.add(candidateName);
+    if (definition.parameters === undefined) {
+      throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
 
-  const parameters = convertPiToolSchema(definition.parameters);
-  return [
-    {
-      name: Tools.file_search,
-      label: 'File Search',
-      description:
-        validateDescription(definition.description) ??
-        'Search files the current agent is authorized to access.',
+    const name = candidateName;
+    const parameters = convertPiToolSchema(name, definition.parameters);
+    return {
+      name,
+      label: TOOL_FIELDS[name].label,
+      description: validateDescription(definition.description) ?? TOOL_FIELDS[name].description,
       parameters,
       executionMode: 'sequential',
       execute: (toolCallId, args, signal) =>
         executePiToolCall({
           execute: input.execute,
+          name,
           toolCallId,
           arguments: args,
           signal,
         }),
-    },
-  ];
+    };
+  });
 }

@@ -1,4 +1,3 @@
-import { Constants } from 'librechat-data-provider';
 import type { TContextUsageEvent } from 'librechat-data-provider';
 import { deriveTokenUsageView, pendingToBranchUsage } from '../view';
 import { buildIndex, clearIndex } from '../registry';

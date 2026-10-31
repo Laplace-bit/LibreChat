@@ -5,6 +5,7 @@ import type { PiContentEventTranslatorOptions, PiHostEvent } from './events';
 import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiGenerationExecutorInput } from './execution';
+import type { PiToolExecutionGate } from './toolExecution';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostSessionOutcome } from './bridge';
@@ -17,6 +18,7 @@ import { createPiGenerationExecutor } from './execution';
 import { convertLibreChatHistoryToPi } from './history';
 import { projectPiContextUsage } from './contextUsage';
 import { createPiHostEventSequencer } from './bridge';
+import { createPiPauseController } from './pause';
 
 export class PiContextUsageUnavailableError extends Error {
   readonly code = 'PI_CONTEXT_USAGE_UNAVAILABLE';
@@ -38,6 +40,8 @@ export interface PiGenerationDispatchInput {
   toolDefinitions?: readonly LCTool[];
   /** Executes a tool through the existing host handler. */
   executeHostToolCall?: (call: PiHostToolCall, signal?: AbortSignal) => Promise<ToolExecuteResult>;
+  /** Optional internal gate. Production request wiring does not supply this yet. */
+  toolExecutionGate?: PiToolExecutionGate;
   /** Host-generated identities for LibreChat tool call steps. */
   createToolStepIdentity?(): PiMessageStepIdentity;
   createToolCallId?(): string;
@@ -54,10 +58,7 @@ export interface PiGenerationDispatchDependencies {
   execute?: ReturnType<typeof createPiGenerationExecutor>;
 }
 
-export interface PiGenerationDispatchResult {
-  status: PiHostSessionOutcome['status'];
-  usage: UsageMetadata[];
-}
+export type PiGenerationDispatchResult = PiHostSessionOutcome & { usage: UsageMetadata[] };
 
 /**
  * Runs one isolated Pi turn from the host's already-formatted transcript.
@@ -75,6 +76,7 @@ export function createPiGenerationDispatcher(
     }
 
     const usage: UsageMetadata[] = [];
+    const pauseController = createPiPauseController();
     const eventSequencer = createPiHostEventSequencer(async (event) => {
       if (event.event === UsageEvents.ON_TOKEN_USAGE) {
         usage.push(event.data);
@@ -95,6 +97,14 @@ export function createPiGenerationDispatcher(
           createToolCallId: input.createToolCallId,
           executeHostToolCall: input.executeHostToolCall,
           handleHostEvent: eventSequencer.enqueue,
+          ...(input.toolExecutionGate == null
+            ? {}
+            : {
+                pauseGate: {
+                  controller: pauseController,
+                  evaluate: input.toolExecutionGate,
+                },
+              }),
         });
       }
       tools = createPiTools({
@@ -106,6 +116,11 @@ export function createPiGenerationDispatcher(
         throw new AgentRuntimeUnavailableError();
       }
       throw error;
+    }
+    if (input.toolExecutionGate != null) {
+      // Once a gate can pause a tool batch, a sibling must not begin a side effect
+      // while another call is awaiting its gate decision.
+      tools = tools.map((tool) => ({ ...tool, executionMode: 'sequential' }));
     }
 
     const modelBinding = await input.createModelBinding();
@@ -154,6 +169,10 @@ export function createPiGenerationDispatcher(
           ...(conversion.prompt.images.length === 0 ? {} : { images: conversion.prompt.images }),
         },
         signal: input.signal,
+        pauseController,
+        ...(input.toolExecutionGate == null
+          ? {}
+          : { toolBatchPolicy: { controller: pauseController } }),
         translateEvent,
         handleHostEvent: eventSequencer.enqueue,
         eventSequencer,

@@ -6,6 +6,9 @@ import type {
   ToolDefinition,
 } from '@earendil-works/pi-coding-agent';
 import type { PiHistoryMessage } from './history';
+import type { PiPauseController } from './pause';
+import { createPiProviderEventObserver, isPiToolBatchEventApi } from './providerEvents';
+import { AgentRuntimeUnavailableError } from '../runtime/selection';
 
 export interface PiModelBinding {
   /** A request-scoped model selected from the caller's authorized configuration. */
@@ -22,6 +25,8 @@ export interface HostPiSessionOptions {
   tools: ToolDefinition[];
   /** Structured, server-converted history; each message remains a separate Pi entry. */
   history?: PiHistoryMessage[];
+  /** Rejects multi-call tool batches before any tool gate or host handler runs. */
+  toolBatchPolicy?: { controller: PiPauseController };
   signal?: AbortSignal;
 }
 
@@ -118,6 +123,9 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
   };
 
   try {
+    if (options.toolBatchPolicy != null && !isPiToolBatchEventApi(modelBinding.model.api)) {
+      throw new AgentRuntimeUnavailableError();
+    }
     if (options.signal?.aborted) {
       throw abortError();
     }
@@ -157,6 +165,49 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       customTools: options.tools,
     });
     session = result.session;
+
+    if (options.toolBatchPolicy != null) {
+      const previousProviderStreamEvent = session.agent.onProviderStreamEvent;
+      const providerEventObserver = createPiProviderEventObserver();
+      session.agent.onProviderStreamEvent = async (event, model) => {
+        if (!isPiToolBatchEventApi(model.api)) {
+          options.toolBatchPolicy?.controller.rejectProviderEvent({
+            kind: 'unsupported_api',
+            api: model.api,
+          });
+          abort();
+        } else {
+          const providerFailure = providerEventObserver.observe(model.api, event);
+          if (providerFailure != null) {
+            options.toolBatchPolicy?.controller.rejectProviderEvent(providerFailure);
+            abort();
+          }
+        }
+        await previousProviderStreamEvent?.(event, model);
+      };
+
+      const previousBeforeToolCall = session.agent.beforeToolCall;
+      session.agent.beforeToolCall = async (context, signal) => {
+        const previousResult = await previousBeforeToolCall?.(context, signal);
+        if (signal?.aborted) {
+          return previousResult;
+        }
+
+        const toolCalls = context.assistantMessage.content.filter(
+          (part) => part.type === 'toolCall',
+        );
+        if (toolCalls.length > 1) {
+          options.toolBatchPolicy?.controller.rejectBatch(toolCalls.map(({ id }) => id));
+          return {
+            block: true,
+            reason: 'This tool batch cannot be paused safely.',
+            terminate: true,
+          };
+        }
+
+        return previousResult;
+      };
+    }
 
     options.signal?.addEventListener('abort', abort, { once: true });
     if (options.signal?.aborted) {

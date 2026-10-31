@@ -1,7 +1,9 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { PiHostEventSequencer, PiHostSessionOutcome } from './bridge';
 import type { HostPiSession, HostPiSessionOptions } from './session';
+import type { PiPauseController } from './pause';
 import type { PiHostEvent } from './events';
+import { createPiPauseController } from './pause';
 import { executePiHostSession } from './bridge';
 import { createHostPiSession } from './session';
 
@@ -11,6 +13,7 @@ export interface PiGenerationExecutorInput extends HostPiSessionOptions {
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   eventSequencer?: PiHostEventSequencer;
+  pauseController?: PiPauseController;
 }
 
 export interface PiGenerationExecutorDependencies {
@@ -43,6 +46,7 @@ export function createPiGenerationExecutor(
       }
       throw error;
     }
+    const pauseController = input.pauseController ?? createPiPauseController();
 
     let executionResult:
       | { ok: true; outcome: PiHostSessionOutcome }
@@ -53,6 +57,7 @@ export function createPiGenerationExecutor(
         prompt,
         promptOptions,
         signal: input.signal,
+        pauseController,
         translateEvent,
         handleHostEvent,
         eventSequencer,

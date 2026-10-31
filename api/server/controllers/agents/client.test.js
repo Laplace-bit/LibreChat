@@ -10202,6 +10202,23 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['paused', { status: 'paused', signal: { kind: 'tool_approval' }, usage: [] }],
+    ['unsupported', { status: 'unsupported', reason: 'multiple_tool_calls', usage: [] }],
+  ])('fails closed when Pi returns an unstaged %s outcome', async (_status, outcome) => {
+    const client = createPiClient();
+    mockExecutePiGeneration.mockResolvedValue(outcome);
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(client.executionOutcome).toBeUndefined();
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+    expect(client.contentParts.some((part) => part.type !== ContentTypes.ERROR)).toBe(false);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+  });
+
   it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {
     const definition = {
       name: Tools.file_search,

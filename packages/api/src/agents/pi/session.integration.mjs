@@ -3,9 +3,9 @@ import { Type } from 'typebox';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
-import { UsageEvents } from 'librechat-data-provider';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { StepTypes, Tools, UsageEvents } from 'librechat-data-provider';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
 import {
   AIMessage,
@@ -44,6 +44,14 @@ async function withTimeout(promise, timeoutMs, message) {
   }
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 async function createTestModelBinding(onDispose) {
   const modelRuntime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
@@ -60,7 +68,7 @@ async function createTestModelBinding(onDispose) {
   };
 }
 
-async function createFakeOpenAIModelBinding(baseUrl, onDispose) {
+async function createFakeOpenAIModelBinding(baseUrl, onDispose, api = 'openai-completions') {
   const modelRuntime = await ModelRuntime.create({
     credentials: new InMemoryCredentialStore(),
     modelsPath: null,
@@ -70,7 +78,7 @@ async function createFakeOpenAIModelBinding(baseUrl, onDispose) {
   modelRuntime.registerProvider('pi-integration-test', {
     name: 'Pi integration test provider',
     baseUrl,
-    api: 'openai-completions',
+    api,
     apiKey: 'integration-test-key',
     models: [
       {
@@ -91,6 +99,10 @@ async function createFakeOpenAIModelBinding(baseUrl, onDispose) {
 
 async function createFakeChatServer({
   toolCallOnFirst = false,
+  siblingToolCallOnFirst = false,
+  siblingToolCallId = 'call_sibling',
+  toolCallName = 'safe_query',
+  toolCallArguments = '{"query":"authorized"}',
   responseDelayMs = 0,
   onRequest,
 } = {}) {
@@ -125,7 +137,7 @@ async function createFakeChatServer({
         });
         response.write(
           `data: ${JSON.stringify({
-            id: 'chatcmpl-pi-test',
+            id: `chatcmpl-pi-test-${requestCount}`,
             object: 'chat.completion.chunk',
             created: 1,
             model: 'echo-test',
@@ -135,7 +147,7 @@ async function createFakeChatServer({
         if (toolCallOnFirst && requestCount === 1) {
           response.write(
             `data: ${JSON.stringify({
-              id: 'chatcmpl-pi-test',
+              id: `chatcmpl-pi-test-${requestCount}`,
               object: 'chat.completion.chunk',
               created: 1,
               model: 'echo-test',
@@ -149,10 +161,23 @@ async function createFakeChatServer({
                         id: 'call_safe_query',
                         type: 'function',
                         function: {
-                          name: 'safe_query',
-                          arguments: '{"query":"authorized"}',
+                          name: toolCallName,
+                          arguments: toolCallArguments,
                         },
                       },
+                      ...(siblingToolCallOnFirst
+                        ? [
+                            {
+                              index: 1,
+                              id: siblingToolCallId,
+                              type: 'function',
+                              function: {
+                                name: toolCallName,
+                                arguments: '{"query":"sibling query"}',
+                              },
+                            },
+                          ]
+                        : []),
                     ],
                   },
                   finish_reason: null,
@@ -163,7 +188,7 @@ async function createFakeChatServer({
         } else {
           response.write(
             `data: ${JSON.stringify({
-              id: 'chatcmpl-pi-test',
+              id: `chatcmpl-pi-test-${requestCount}`,
               object: 'chat.completion.chunk',
               created: 1,
               model: 'echo-test',
@@ -188,7 +213,7 @@ async function createFakeChatServer({
         }
         response.write(
           `data: ${JSON.stringify({
-            id: 'chatcmpl-pi-test',
+            id: `chatcmpl-pi-test-${requestCount}`,
             object: 'chat.completion.chunk',
             created: 1,
             model: 'echo-test',
@@ -739,6 +764,274 @@ test('Pi generation dispatcher streams a host-formatted turn and reports provide
           event.data.delta.content.some((part) => part.text === 'Pi adapter stream'),
       ),
     );
+  } finally {
+    await fakeProvider.close();
+  }
+});
+
+test('Pi dispatcher pauses at the tool gate without host effects or terminal tool steps', async () => {
+  const fakeProvider = await createFakeChatServer({
+    toolCallOnFirst: true,
+    toolCallName: Tools.file_search,
+    toolCallArguments: '{"query":"maintenance manual"}',
+  });
+  const hostEvents = [];
+  let bindingDisposals = 0;
+  let hostToolCalls = 0;
+  const usageHandlerStarted = deferred();
+  const releaseUsageHandler = deferred();
+  let generationSettled = false;
+
+  try {
+    const generation = executePiGeneration({
+      messages: [
+        new SystemMessage('Use the configured test provider.'),
+        new HumanMessage('Search for the maintenance manual.'),
+      ],
+      createModelBinding: () =>
+        createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {
+          bindingDisposals += 1;
+        }),
+      toolDefinitions: [
+        {
+          name: Tools.file_search,
+          description: 'Search agent files.',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+          },
+        },
+      ],
+      executeHostToolCall: async () => {
+        hostToolCalls += 1;
+        return { toolCallId: 'host-call-1', status: 'success', content: 'unexpected result' };
+      },
+      createToolStepIdentity: () => ({
+        id: 'paused-tool-step',
+        index: 0,
+        messageId: 'pause-response',
+        runId: 'pause-run',
+        agentId: 'pause-agent',
+      }),
+      createToolCallId: () => 'host-call-1',
+      toolExecutionGate: async (call) => {
+        assert.equal(call.name, Tools.file_search);
+        assert.deepEqual(call.args, { query: 'maintenance manual' });
+        return { kind: 'pause' };
+      },
+      createStepIdentity: () => ({
+        id: 'pause-content-step',
+        index: 0,
+        messageId: 'pause-response',
+        runId: 'pause-run',
+        agentId: 'pause-agent',
+      }),
+      handleHostEvent: async (event) => {
+        if (event.event === UsageEvents.ON_TOKEN_USAGE) {
+          usageHandlerStarted.resolve();
+          await releaseUsageHandler.promise;
+        }
+        hostEvents.push(event);
+      },
+    });
+    const boundedGeneration = withTimeout(
+      generation,
+      5_000,
+      'Pi did not settle after the host tool gate requested a pause',
+    );
+    await withTimeout(
+      usageHandlerStarted.promise,
+      5_000,
+      'Pi did not settle the fake provider response after the pause request',
+    );
+    await Promise.resolve();
+    assert.equal(generationSettled, false, 'pause waits for sequenced host events to drain');
+    releaseUsageHandler.resolve();
+    const outcome = await boundedGeneration;
+    generationSettled = true;
+
+    assert.equal(outcome.status, 'paused');
+    assert.deepEqual(outcome.signal, {
+      kind: 'tool_approval',
+      toolCall: {
+        toolCallId: 'call_safe_query',
+        name: Tools.file_search,
+        args: { query: 'maintenance manual' },
+      },
+    });
+    assert.equal(fakeProvider.getRequestCount(), 1, 'pause stops the next model request');
+    assert.equal(hostToolCalls, 0, 'the host handler is not invoked before approval');
+    assert.equal(bindingDisposals, 1, 'the per-run provider binding is disposed');
+    assert.equal(
+      hostEvents.some(({ event }) => event === UsageEvents.ON_TOKEN_USAGE),
+      true,
+      'Pi settles and the sequenced usage event is drained before pause returns',
+    );
+    assert.equal(
+      hostEvents.some(
+        (event) =>
+          (event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS) ||
+          (event.event === GraphEvents.ON_RUN_STEP_CLOSED &&
+            event.data.type === StepTypes.TOOL_CALLS),
+      ),
+      false,
+      'an unexecuted proposal must not emit a terminal host tool step',
+    );
+  } finally {
+    releaseUsageHandler.resolve();
+    await fakeProvider.close();
+  }
+});
+
+for (const [scenario, siblingToolCallId, expectedReason] of [
+  ['mixed execute/pause decisions', 'call_sibling', 'multiple_tool_calls'],
+  ['repeated provider call ID', 'call_safe_query', 'provider_event'],
+]) {
+  test(`Pi dispatcher rejects ${scenario} before host effects`, async () => {
+    const fakeProvider = await createFakeChatServer({
+      toolCallOnFirst: true,
+      siblingToolCallOnFirst: true,
+      siblingToolCallId,
+      toolCallName: Tools.file_search,
+      toolCallArguments: '{"query":"maintenance manual"}',
+    });
+    const hostEvents = [];
+    let hostToolCalls = 0;
+    let gateCalls = 0;
+
+    try {
+      const outcome = await withTimeout(
+        executePiGeneration({
+          messages: [
+            new SystemMessage('Use the configured test provider.'),
+            new HumanMessage('Search for two maintenance documents.'),
+          ],
+          createModelBinding: () =>
+            createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => undefined),
+          toolDefinitions: [
+            {
+              name: Tools.file_search,
+              description: 'Search agent files.',
+              parameters: {
+                type: 'object',
+                properties: { query: { type: 'string' } },
+                required: ['query'],
+              },
+            },
+          ],
+          executeHostToolCall: async () => {
+            hostToolCalls += 1;
+            return { toolCallId: 'host-call-1', status: 'success', content: 'unexpected result' };
+          },
+          createToolStepIdentity: () => ({
+            id: 'unsupported-tool-step',
+            index: 0,
+            messageId: 'unsupported-response',
+            runId: 'unsupported-run',
+            agentId: 'unsupported-agent',
+          }),
+          createToolCallId: () => 'host-call-1',
+          toolExecutionGate: async () => {
+            gateCalls += 1;
+            return gateCalls === 1 ? { kind: 'execute' } : { kind: 'pause' };
+          },
+          createStepIdentity: () => ({
+            id: 'unsupported-content-step',
+            index: 0,
+            messageId: 'unsupported-response',
+            runId: 'unsupported-run',
+            agentId: 'unsupported-agent',
+          }),
+          handleHostEvent: (event) => {
+            hostEvents.push(event);
+          },
+        }),
+        5_000,
+        'Pi did not settle the unsupported tool batch',
+      );
+
+      assert.equal(outcome.status, 'unsupported');
+      assert.equal(outcome.reason, expectedReason);
+      if (scenario === 'repeated provider call ID') {
+        assert.deepEqual(outcome.failure, {
+          kind: 'repeated_call_id',
+          api: 'openai-completions',
+          callId: 'call_safe_query',
+          firstIndex: 0,
+          repeatedIndex: 1,
+        });
+      }
+      assert.equal(
+        fakeProvider.getRequestCount(),
+        1,
+        'no model continuation follows the unsupported batch',
+      );
+      assert.equal(
+        gateCalls,
+        0,
+        'the whole assistant tool-call batch is rejected before any per-tool gate decision',
+      );
+      assert.equal(hostToolCalls, 0, 'no call in the batch reaches the host tool handler');
+      assert.equal(
+        hostEvents.some(
+          (event) =>
+            (event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS) ||
+            (event.event === GraphEvents.ON_RUN_STEP_CLOSED &&
+              event.data.type === StepTypes.TOOL_CALLS),
+        ),
+        false,
+        'blocked unexecuted calls do not create or close host tool steps',
+      );
+    } finally {
+      await fakeProvider.close();
+    }
+  });
+}
+
+test('Pi tool gate fails closed before provider invocation for uncovered APIs', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let bindingDisposals = 0;
+  let gateCalls = 0;
+  let hostEvents = 0;
+
+  try {
+    await assert.rejects(
+      executePiGeneration({
+        messages: [
+          new SystemMessage('Use the configured test provider.'),
+          new HumanMessage('Run a host tool.'),
+        ],
+        createModelBinding: () =>
+          createFakeOpenAIModelBinding(
+            fakeProvider.baseUrl,
+            () => {
+              bindingDisposals += 1;
+            },
+            'anthropic-messages',
+          ),
+        toolExecutionGate: async () => {
+          gateCalls += 1;
+          return { kind: 'execute' };
+        },
+        createStepIdentity: () => ({
+          id: 'unsupported-api-step',
+          index: 0,
+          messageId: 'unsupported-api-message',
+          runId: 'unsupported-api-run',
+          agentId: 'unsupported-api-agent',
+        }),
+        handleHostEvent: () => {
+          hostEvents += 1;
+        },
+      }),
+      { name: 'AgentRuntimeUnavailableError' },
+    );
+
+    assert.equal(fakeProvider.getRequestCount(), 0, 'uncovered adapters do not reach the provider');
+    assert.equal(bindingDisposals, 1, 'the rejected request-scoped binding is disposed');
+    assert.equal(gateCalls, 0, 'the tool gate is never evaluated');
+    assert.equal(hostEvents, 0, 'no host events are emitted');
   } finally {
     await fakeProvider.close();
   }

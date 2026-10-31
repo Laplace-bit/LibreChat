@@ -6,10 +6,12 @@ import {
   type ToolExecuteResult,
 } from '@librechat/agents';
 import type { LCTool } from '@librechat/agents';
+import type { PiToolExecutionGate } from './toolExecution';
 import type { PiHostEvent } from './events';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiHostEventSequencer } from './bridge';
+import { createPiPauseController } from './pause';
 import { createPiTools } from './tools';
 
 const fileSearchDefinition: LCTool = {
@@ -21,6 +23,14 @@ const fileSearchDefinition: LCTool = {
     required: ['query'],
   },
 };
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 function isToolExecuteBatchRequest(
   data: Parameters<EventHandler['handle']>[1],
@@ -49,9 +59,10 @@ function createAuthorizedHandler(
   };
 }
 
-function createHarness(result: ToolExecuteResult) {
+function createHarness(result: ToolExecuteResult, evaluateTool?: PiToolExecutionGate) {
   const events: PiHostEvent[] = [];
   const batches: ToolExecuteBatchRequest[] = [];
+  const pauseController = createPiPauseController();
   const eventSequencer = createPiHostEventSequencer((event) => {
     events.push(event);
   });
@@ -75,11 +86,14 @@ function createHarness(result: ToolExecuteResult) {
     createToolCallId: () => 'host-call-1',
     executeHostToolCall,
     handleHostEvent: eventSequencer.enqueue,
+    ...(evaluateTool == null
+      ? {}
+      : { pauseGate: { controller: pauseController, evaluate: evaluateTool } }),
     now: () => 42,
   });
   const [tool] = createPiTools({ definitions: [fileSearchDefinition], execute: executePiTool });
 
-  return { batches, events, eventSequencer, tool };
+  return { batches, events, eventSequencer, pauseController, tool };
 }
 
 describe('createPiHostToolExecutor', () => {
@@ -163,6 +177,86 @@ describe('createPiHostToolExecutor', () => {
       isError: true,
     });
     expect(JSON.stringify(result)).not.toContain('private-secret');
+  });
+
+  it('pauses before host dispatch and emits no terminal tool-step event', async () => {
+    const { batches, events, eventSequencer, pauseController, tool } = createHarness(
+      {
+        toolCallId: 'host-call-1',
+        status: 'success',
+        content: 'This result must not be reached.',
+      },
+      async () => ({ kind: 'pause' }),
+    );
+
+    await expect(tool.execute('pi-call-1', { query: 'maintenance manual' })).resolves.toMatchObject(
+      {
+        details: { status: 'paused' },
+        terminate: true,
+      },
+    );
+    await eventSequencer.drain();
+
+    expect(batches).toHaveLength(0);
+    expect(events).toEqual([]);
+    expect(pauseController.signal).toEqual({
+      kind: 'tool_approval',
+      toolCall: {
+        toolCallId: 'pi-call-1',
+        name: Tools.file_search,
+        args: { query: 'maintenance manual' },
+      },
+    });
+  });
+
+  it('lets an external abort win when it arrives while the tool gate is deciding', async () => {
+    const controller = new AbortController();
+    const gateStarted = deferred<void>();
+    const releaseGate = deferred<void>();
+    const events: PiHostEvent[] = [];
+    const eventSequencer = createPiHostEventSequencer((event) => {
+      events.push(event);
+    });
+    const pauseController = createPiPauseController();
+    let hostToolCalls = 0;
+    const executePiTool = createPiHostToolExecutor({
+      createStepIdentity: () => ({
+        id: 'pi-step-1',
+        index: 0,
+        messageId: 'response-1',
+        runId: 'run-1',
+        agentId: 'agent-1',
+      }),
+      createToolCallId: () => 'host-call-1',
+      executeHostToolCall: async () => {
+        hostToolCalls += 1;
+        return { toolCallId: 'host-call-1', status: 'success', content: 'unexpected' };
+      },
+      handleHostEvent: eventSequencer.enqueue,
+      pauseGate: {
+        controller: pauseController,
+        evaluate: async () => {
+          gateStarted.resolve(undefined);
+          await releaseGate.promise;
+          return { kind: 'pause' };
+        },
+      },
+    });
+    const [tool] = createPiTools({ definitions: [fileSearchDefinition], execute: executePiTool });
+    const execution = tool.execute('pi-call-1', { query: 'maintenance manual' }, controller.signal);
+
+    await gateStarted.promise;
+    controller.abort();
+    releaseGate.resolve(undefined);
+
+    await expect(execution).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'Pi tool execution was aborted',
+    });
+    await eventSequencer.drain();
+    expect(pauseController.signal).toBeUndefined();
+    expect(hostToolCalls).toBe(0);
+    expect(events).toEqual([]);
   });
 
   it('settles a cancelled host tool step and returns only a safe AbortError', async () => {

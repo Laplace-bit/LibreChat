@@ -1,4 +1,6 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
+import type { PiPauseController, PiPauseSignal } from './pause';
+import type { PiProviderEventFailure } from './providerEvents';
 import type { HostPiSession } from './session';
 import type { PiHostEvent } from './events';
 
@@ -7,6 +9,7 @@ export interface PiHostEventBridgeOptions {
   prompt: string;
   promptOptions?: PromptOptions;
   signal?: AbortSignal;
+  pauseController?: PiPauseController;
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   /** Shared with direct host tool events so the full run has one FIFO. */
@@ -72,7 +75,12 @@ export function createPiHostEventSequencer(
   };
 }
 
-export type PiHostSessionOutcome = { status: 'completed' } | { status: 'cancelled' };
+export type PiHostSessionOutcome =
+  | { status: 'completed' }
+  | { status: 'cancelled' }
+  | { status: 'paused'; signal: Extract<PiPauseSignal, { kind: 'tool_approval' }> }
+  | { status: 'unsupported'; reason: 'multiple_tool_calls' }
+  | { status: 'unsupported'; reason: 'provider_event'; failure: PiProviderEventFailure };
 
 /**
  * Delivers translated Pi events to the host in order. The caller supplies the host event
@@ -130,6 +138,11 @@ export async function executePiHostSession(
     for (const hostEvent of hostEvents) {
       enqueueHostEvent(hostEvent);
     }
+    if (event.type === 'agent_end' && options.pauseController?.signal != null) {
+      // The tool result has already entered Pi's transcript at agent_end. Abort
+      // only now to stop AgentSession's outer auto-continue without racing it.
+      void options.session.abort().catch(() => undefined);
+    }
   });
 
   const stopListening = () => {
@@ -158,13 +171,43 @@ export async function executePiHostSession(
     if (handlerFailure != null) {
       throw handlerFailure.error;
     }
+    const requestedPause = options.pauseController?.signal;
     if (promptFailure != null) {
       if (promptWasCancelled) {
+        if (options.signal?.aborted) {
+          return { status: 'cancelled' };
+        }
+        if (requestedPause?.kind === 'tool_approval') {
+          return { status: 'paused', signal: requestedPause };
+        }
+        if (requestedPause?.kind === 'unsupported_tool_batch') {
+          return { status: 'unsupported', reason: 'multiple_tool_calls' };
+        }
+        if (requestedPause?.kind === 'unsupported_provider_event') {
+          return {
+            status: 'unsupported',
+            reason: 'provider_event',
+            failure: requestedPause.failure,
+          };
+        }
         return { status: 'cancelled' };
       }
       throw promptFailure.error;
     }
-    if (options.signal?.aborted || sessionAborted) {
+    // An external Stop wins if it races a pending pause while host events drain.
+    if (options.signal?.aborted) {
+      return { status: 'cancelled' };
+    }
+    if (requestedPause?.kind === 'tool_approval') {
+      return { status: 'paused', signal: requestedPause };
+    }
+    if (requestedPause?.kind === 'unsupported_tool_batch') {
+      return { status: 'unsupported', reason: 'multiple_tool_calls' };
+    }
+    if (requestedPause?.kind === 'unsupported_provider_event') {
+      return { status: 'unsupported', reason: 'provider_event', failure: requestedPause.failure };
+    }
+    if (sessionAborted) {
       return { status: 'cancelled' };
     }
     return { status: 'completed' };

@@ -5278,8 +5278,13 @@ class AgentClient extends BaseClient {
             handleHostEvent: handlePiHostEvent,
           });
 
-          this.executionOutcome = { engine: 'pi', status: outcome.status };
           this.options.startupTelemetry?.mark('pi_session_settled');
+          if (outcome.status !== 'completed' && outcome.status !== 'cancelled') {
+            /** Pi pause outcomes are not host-staged or resumable yet. Treat them as
+             *  unavailable until AgentClient can persist and recover the exact action. */
+            throw new AgentRuntimeUnavailableError();
+          }
+          this.executionOutcome = { engine: 'pi', status: outcome.status };
           if (outcome.status === 'cancelled' && abortController.signal.aborted !== true) {
             throw new AgentRuntimeUnavailableError();
           }

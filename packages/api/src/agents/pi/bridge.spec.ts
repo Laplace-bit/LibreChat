@@ -1,9 +1,11 @@
 import { GraphEvents } from '@librechat/agents';
-import { StepTypes } from 'librechat-data-provider';
+import { StepTypes, Tools } from 'librechat-data-provider';
 import type { AgentSessionEvent, AgentSessionEventListener } from '@earendil-works/pi-coding-agent';
 import type { PiHostContentEvent } from './events';
 import type { HostPiSession } from './session';
+import type { PiPauseSignal } from './pause';
 import { createPiHostEventSequencer, executePiHostSession } from './bridge';
+import { createPiPauseController } from './pause';
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -81,6 +83,15 @@ function sessionEvent(type: 'agent_end' | 'agent_settled'): AgentSessionEvent {
 }
 
 describe('executePiHostSession', () => {
+  const pauseSignal = {
+    kind: 'tool_approval',
+    toolCall: {
+      toolCallId: 'pi-call-1',
+      name: Tools.file_search,
+      args: { query: 'maintenance manual' },
+    },
+  } satisfies PiPauseSignal;
+
   it('delivers translated host events serially and drains them before completing', async () => {
     const handlerStarted = deferred<void>();
     const releaseHandler = deferred<void>();
@@ -217,6 +228,91 @@ describe('executePiHostSession', () => {
       }),
     ).resolves.toEqual({ status: 'cancelled' });
     expect(harness.unsubscribeCount).toBe(1);
+  });
+
+  it('returns a typed pause only after Pi has settled and the event FIFO drains', async () => {
+    const handlerStarted = deferred<void>();
+    const releaseHandler = deferred<void>();
+    const delivered: string[] = [];
+    const pauseController = createPiPauseController();
+    const harness = createSession(async (emit) => {
+      pauseController.request(pauseSignal.toolCall);
+      emit(sessionEvent('agent_end'));
+      emit({ type: 'agent_settled', aborted: true });
+    });
+    const execution = executePiHostSession({
+      session: harness.session,
+      prompt: 'hello',
+      pauseController,
+      translateEvent: (event) => [createHostEvent(event.type)],
+      handleHostEvent: async (event) => {
+        if (event.event !== GraphEvents.ON_RUN_STEP_CLOSED) {
+          throw new Error('Expected a run-step close event');
+        }
+        delivered.push(`start:${event.data.id}`);
+        if (event.data.id === 'agent_end') {
+          handlerStarted.resolve(undefined);
+          await releaseHandler.promise;
+        }
+        delivered.push(`end:${event.data.id}`);
+      },
+    });
+    let settled = false;
+    void execution.then(() => {
+      settled = true;
+    });
+
+    await handlerStarted.promise;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releaseHandler.resolve(undefined);
+
+    await expect(execution).resolves.toEqual({ status: 'paused', signal: pauseSignal });
+    expect(harness.abortCount).toBe(1);
+    expect(delivered).toEqual([
+      'start:agent_end',
+      'end:agent_end',
+      'start:agent_settled',
+      'end:agent_settled',
+    ]);
+  });
+
+  it('treats a duplicate pause request for the same tool call as idempotent', () => {
+    const pauseController = createPiPauseController();
+
+    pauseController.request(pauseSignal.toolCall);
+    pauseController.request(pauseSignal.toolCall);
+
+    expect(pauseController.signal).toEqual(pauseSignal);
+  });
+
+  it('lets an external abort override a pause requested while host events drain', async () => {
+    const controller = new AbortController();
+    const handlerStarted = deferred<void>();
+    const releaseHandler = deferred<void>();
+    const pauseController = createPiPauseController();
+    const harness = createSession(async (emit) => {
+      pauseController.request(pauseSignal.toolCall);
+      emit(sessionEvent('agent_end'));
+      emit({ type: 'agent_settled', aborted: true });
+    });
+    const execution = executePiHostSession({
+      session: harness.session,
+      prompt: 'hello',
+      signal: controller.signal,
+      pauseController,
+      translateEvent: () => [createHostEvent('pending-event')],
+      handleHostEvent: async () => {
+        handlerStarted.resolve(undefined);
+        await releaseHandler.promise;
+      },
+    });
+
+    await handlerStarted.promise;
+    controller.abort();
+    releaseHandler.resolve(undefined);
+
+    await expect(execution).resolves.toEqual({ status: 'cancelled' });
   });
 
   it('does not subscribe when the host signal was already aborted', async () => {

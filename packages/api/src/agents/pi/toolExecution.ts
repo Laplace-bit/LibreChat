@@ -1,6 +1,7 @@
 import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import { GraphEvents, type ToolExecuteResult } from '@librechat/agents';
 import type { Agents } from 'librechat-data-provider';
+import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause';
 import type { PiMessageStepIdentity } from './events';
 import type { PiFileSearchArguments } from './tools';
 import type { PiHostEvent } from './events';
@@ -10,6 +11,13 @@ export interface PiToolExecutionInput {
   name: typeof Tools.file_search;
   args: PiFileSearchArguments;
 }
+
+export type PiToolGateDecision = { kind: 'execute' } | { kind: 'pause' };
+
+export type PiToolExecutionGate = (
+  input: PiToolExecutionInput,
+  signal?: AbortSignal,
+) => PiToolGateDecision | Promise<PiToolGateDecision>;
 
 export interface PiHostToolCall {
   id: string;
@@ -23,6 +31,10 @@ export interface PiToolExecutionOptions {
   createToolCallId(): string;
   executeHostToolCall(call: PiHostToolCall, signal?: AbortSignal): Promise<ToolExecuteResult>;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
+  pauseGate?: {
+    controller: PiPauseController;
+    evaluate: PiToolExecutionGate;
+  };
   now?: () => number;
 }
 
@@ -57,6 +69,14 @@ function abortError(): Error {
   const error = new Error('Pi tool execution was aborted');
   error.name = 'AbortError';
   return error;
+}
+
+function toPauseToolCall(input: PiToolExecutionInput): PiPauseToolCall {
+  return {
+    toolCallId: input.toolCallId,
+    name: input.name,
+    args: { query: input.args.query },
+  };
 }
 
 function buildRunStep(
@@ -173,12 +193,56 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
   signal?: AbortSignal,
 ) => Promise<{
   content: Array<{ type: 'text'; text: string }>;
-  details: { status: HostToolStatus };
+  details: { status: HostToolStatus | 'paused' | 'unsupported_batch' };
   isError?: boolean;
+  terminate?: boolean;
 }> {
   const now = options.now ?? Date.now;
+  const createPauseResult = (signal: PiPauseSignal) =>
+    signal.kind === 'tool_approval'
+      ? {
+          content: [{ type: 'text' as const, text: 'This tool call is paused for host review.' }],
+          details: { status: 'paused' as const },
+          terminate: true,
+        }
+      : {
+          content: [{ type: 'text' as const, text: 'This tool batch cannot be paused safely.' }],
+          details: { status: 'unsupported_batch' as const },
+          isError: true,
+          terminate: true,
+        };
 
   return async (input, signal) => {
+    if (signal?.aborted) {
+      throw abortError();
+    }
+
+    if (options.pauseGate != null) {
+      const pendingPause = options.pauseGate.controller.signal;
+      if (pendingPause != null) {
+        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+      }
+      const decision = await options.pauseGate.evaluate(input, signal);
+      if (signal?.aborted) {
+        throw abortError();
+      }
+      const pendingPauseAfterGate = options.pauseGate.controller.signal;
+      if (pendingPauseAfterGate != null) {
+        return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+      }
+      switch (decision.kind) {
+        case 'execute':
+          break;
+        case 'pause': {
+          return createPauseResult(options.pauseGate.controller.request(toPauseToolCall(input)));
+        }
+        default: {
+          const exhaustive: never = decision;
+          throw exhaustive;
+        }
+      }
+    }
+
     if (signal?.aborted) {
       throw abortError();
     }

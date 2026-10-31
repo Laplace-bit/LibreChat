@@ -155,6 +155,7 @@ export * from './agents/pi/history';
 export * from './agents/pi/resume';
 export * from './agents/runtime/selection';
 export * from './agents/runtime/execution';
+export * from './agents/runtime/dispatcher';
 export * from './agents/runtime/errors';
 /* Diagnostics */
 export { memoryDiagnostics } from './utils/memory';

@@ -228,6 +228,7 @@ const {
   createAgentRuntimeExecutionProgress,
   markAgentRuntimeExecutionStarted,
   settleAgentRuntimeExecution,
+  createAgentRuntimeDispatcher,
   assertPiCompatible,
   isPiManagedCodeExecutionCompatible,
   isPiCodeExecutionToolName,
@@ -286,6 +287,10 @@ const { getAccessibleMCPServers } = require('~/server/services/MCP');
 const BaseClient = require('~/app/clients/BaseClient');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
+const agentRuntimeDispatcher = createAgentRuntimeDispatcher({
+  createLegacyRun: createRun,
+  executePiGeneration,
+});
 
 const loadAgent = (params) =>
   loadAgentFn(params, {
@@ -5411,38 +5416,46 @@ class AgentClient extends BaseClient {
             model:
               this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
           });
-          const outcome = await executePiGeneration({
-            messages: piMessages,
-            createModelBinding: piModelBindingFactory,
-            toolDefinitions: piToolDefinitions,
-            executeHostToolCall: executePiHostToolCall,
-            ...(piCodeSessionBridge == null
-              ? {}
-              : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
-            toolExecutionGate: piToolExecutionGate,
-            createToolStepIdentity: createPiStepIdentity,
-            createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
-            signal: abortController.signal,
-            onSessionCreated: () => {
-              this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+          const execution = await agentRuntimeDispatcher.executeTurn({
+            engine: 'pi',
+            selection: runtimeResolution.selection,
+            input: {
+              messages: piMessages,
+              createModelBinding: piModelBindingFactory,
+              toolDefinitions: piToolDefinitions,
+              executeHostToolCall: executePiHostToolCall,
+              ...(piCodeSessionBridge == null
+                ? {}
+                : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
+              toolExecutionGate: piToolExecutionGate,
+              createToolStepIdentity: createPiStepIdentity,
+              createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
+              signal: abortController.signal,
+              onSessionCreated: () => {
+                this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+              },
+              usageAttribution: {
+                provider: this.options.agent.provider,
+                agentId: this.options.agent.id,
+                runId: this.responseMessageId,
+              },
+              contextUsage: {
+                tokenCounter,
+                runId: this.responseMessageId,
+                agentId: this.options.agent.id,
+                maxContextTokens: effectiveMaxContextTokens,
+                reserveRatio: summarizationConfig?.reserveRatio,
+                calibrationRatio,
+                summaryTokens: continuationSummary?.tokenCount,
+              },
+              createStepIdentity: createPiStepIdentity,
+              handleHostEvent: handlePiHostEvent,
             },
-            usageAttribution: {
-              provider: this.options.agent.provider,
-              agentId: this.options.agent.id,
-              runId: this.responseMessageId,
-            },
-            contextUsage: {
-              tokenCounter,
-              runId: this.responseMessageId,
-              agentId: this.options.agent.id,
-              maxContextTokens: effectiveMaxContextTokens,
-              reserveRatio: summarizationConfig?.reserveRatio,
-              calibrationRatio,
-              summaryTokens: continuationSummary?.tokenCount,
-            },
-            createStepIdentity: createPiStepIdentity,
-            handleHostEvent: handlePiHostEvent,
           });
+          if (execution.engine !== 'pi') {
+            throw new AgentRuntimeUnavailableError();
+          }
+          const outcome = execution.outcome;
 
           this.options.startupTelemetry?.mark('pi_session_settled');
           if (outcome.status === 'paused') {
@@ -5469,7 +5482,7 @@ class AgentClient extends BaseClient {
           return;
         }
 
-        const createRunPromise = createRun({
+        const createRunOptions = {
           scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
           recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
             getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
@@ -5554,68 +5567,68 @@ class AgentClient extends BaseClient {
           ),
           subagentTasks: this.options.subagentTasks,
           runFiles: this.options.runFiles,
-        }).then((createdRun) => {
-          if (!createdRun) {
-            throw new Error('Failed to create run');
-          }
-          this.options.startupTelemetry?.mark('run_created');
-          return createdRun;
-        });
+        };
 
-        const [createRunResult, checkpointPruneResult] = await Promise.allSettled([
-          createRunPromise,
+        const execution = await agentRuntimeDispatcher.executeTurn({
+          engine: 'legacy',
+          selection: runtimeResolution.selection,
+          createRunOptions,
           checkpointPrunePromise,
-        ]);
-        if (createRunResult.status === 'rejected') {
-          throw createRunResult.reason;
-        }
-        if (checkpointPruneResult.status === 'rejected') {
-          throw checkpointPruneResult.reason;
-        }
-        run = createRunResult.value;
+          onRunBuilt: () => {
+            this.options.startupTelemetry?.mark('run_created');
+          },
+          onRunCreated: async (createdRun) => {
+            run = createdRun;
+            this.run = run;
+            this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+            if (this._resolveRun) {
+              this._resolveRun(run);
+              this._resolveRun = null;
+            }
 
-        this.run = run;
-        this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-        if (this._resolveRun) {
-          this._resolveRun(run);
-          this._resolveRun = null;
-        }
+            if (streamId && run.Graph) {
+              GenerationJobManager.setGraph(streamId, run.Graph, this.jobCreatedAt);
+            }
 
-        if (streamId && run.Graph) {
-          GenerationJobManager.setGraph(streamId, run.Graph, this.jobCreatedAt);
-        }
+            if (userMCPAuthMap != null) {
+              config.configurable.userMCPAuthMap = userMCPAuthMap;
+            }
 
-        if (userMCPAuthMap != null) {
-          config.configurable.userMCPAuthMap = userMCPAuthMap;
-        }
-
-        /** @deprecated Agent Chain */
-        config.configurable.last_agent_id = agents[agents.length - 1].id;
-
-        this.options.startupTelemetry?.mark('stream_processing_started');
-        /** Flag durable BEFORE the run can claim a label: gap reconciliation
-         *  is gated on it, and ordering it here (one settled-on-failure
-         *  await) keeps the claim-time reservation emit immediate — see
-         *  `emitLabelEvent` in buildActivityLabelWiring. */
-        if (this.activityLabelsMarkedPromise != null) {
-          await this.activityLabelsMarkedPromise;
-        }
-        /** The inherited tier must be on the job before any Stop can read it. */
-        await this.publishRunContextMeta?.();
-        try {
-          const invocationMessages = await prepareRetainedAnswerInvocationMessages(
-            messages,
-            this.eventActorContinuation === 'warm',
-            () => run.graphRunnable.getState(config),
-          );
-          await run.processStream({ messages: invocationMessages }, config, {
+            /** @deprecated Agent Chain */
+            config.configurable.last_agent_id = agents[agents.length - 1].id;
+          },
+          beforeProcess: async () => {
+            this.options.startupTelemetry?.mark('stream_processing_started');
+            /** Flag durable BEFORE the run can claim a label: gap reconciliation
+             *  is gated on it, and ordering it here (one settled-on-failure
+             *  await) keeps the claim-time reservation emit immediate — see
+             *  `emitLabelEvent` in buildActivityLabelWiring. */
+            if (this.activityLabelsMarkedPromise != null) {
+              await this.activityLabelsMarkedPromise;
+            }
+            /** The inherited tier must be on the job before any Stop can read it. */
+            await this.publishRunContextMeta?.();
+          },
+          prepareProcessInput: async (createdRun) => {
+            const invocationMessages = await prepareRetainedAnswerInvocationMessages(
+              messages,
+              this.eventActorContinuation === 'warm',
+              () => createdRun.graphRunnable.getState(config),
+            );
+            return { messages: invocationMessages };
+          },
+          afterProcess: () => reasoningLabel?.complete(),
+          config,
+          processOptions: {
             callbacks: {
               [Callback.TOOL_ERROR]: logToolError,
             },
-          });
-        } finally {
-          reasoningLabel?.complete();
+          },
+        });
+        if (execution.engine !== 'legacy') {
+          throw new AgentRuntimeUnavailableError();
         }
+        run = execution.run;
         this.completeActivityPhase(run, activityPhase);
 
         // HITL: if the run paused for tool approval, mark the job
@@ -5881,7 +5894,8 @@ class AgentClient extends BaseClient {
     if (
       piApprovalContinuation == null ||
       piApprovalDecision == null ||
-      this.options.agentRuntime?.engine !== 'pi'
+      this.options.agentRuntime?.engine !== 'pi' ||
+      this.runtimeProgress?.selection?.engine !== 'pi'
     ) {
       throw new AgentRuntimeUnavailableError();
     }
@@ -6218,42 +6232,50 @@ class AgentClient extends BaseClient {
         };
       };
 
-      outcome = await executePiGeneration({
-        messages: piMessages,
-        createModelBinding,
-        toolDefinitions: piToolDefinitions,
-        executeHostToolCall: executePiHostToolCall,
-        initialToolUsageCounts: buildPiToolUsageCounts({
-          runSteps,
-          pendingTool: {
-            name: piApprovalContinuation.toolName,
-            turn: piApprovalContinuation.toolTurn,
+      const execution = await agentRuntimeDispatcher.resumeTurn({
+        engine: 'pi',
+        selection: this.runtimeProgress.selection,
+        input: {
+          messages: piMessages,
+          createModelBinding,
+          toolDefinitions: piToolDefinitions,
+          executeHostToolCall: executePiHostToolCall,
+          initialToolUsageCounts: buildPiToolUsageCounts({
+            runSteps,
+            pendingTool: {
+              name: piApprovalContinuation.toolName,
+              turn: piApprovalContinuation.toolTurn,
+            },
+          }),
+          ...(piCodeSessionBridge == null
+            ? {}
+            : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
+          toolExecutionGate: piToolExecutionGate,
+          createToolStepIdentity: createPiStepIdentity,
+          createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
+          resumeToolResult: {
+            continuation: piApprovalContinuation,
+            toolArguments: continuationToolArguments,
+            execute: createApprovedToolResult,
           },
-        }),
-        ...(piCodeSessionBridge == null
-          ? {}
-          : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
-        toolExecutionGate: piToolExecutionGate,
-        createToolStepIdentity: createPiStepIdentity,
-        createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
-        resumeToolResult: {
-          continuation: piApprovalContinuation,
-          toolArguments: continuationToolArguments,
-          execute: createApprovedToolResult,
+          signal: abortController.signal,
+          onSessionCreated: () => {
+            this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+          },
+          usageAttribution: {
+            provider: this.options.agent.provider,
+            agentId: this.options.agent.id,
+            runId: this.responseMessageId,
+          },
+          contextUsage,
+          createStepIdentity: createPiStepIdentity,
+          handleHostEvent: handlePiHostEvent,
         },
-        signal: abortController.signal,
-        onSessionCreated: () => {
-          this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-        },
-        usageAttribution: {
-          provider: this.options.agent.provider,
-          agentId: this.options.agent.id,
-          runId: this.responseMessageId,
-        },
-        contextUsage,
-        createStepIdentity: createPiStepIdentity,
-        handleHostEvent: handlePiHostEvent,
       });
+      if (execution.engine !== 'pi') {
+        throw new AgentRuntimeUnavailableError();
+      }
+      outcome = execution.outcome;
       this.collectedUsage.push(...outcome.usage);
       if (outcome.status === 'paused') {
         await this.handlePiToolApprovalInterrupt(outcome.signal, streamId);
@@ -6769,7 +6791,7 @@ class AgentClient extends BaseClient {
       const activityHandlers =
         activityPhase?.handlers(offsetHandlers) ??
         (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
-      run = await createRun({
+      const createRunOptions = {
         scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
         recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
           getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
@@ -6847,55 +6869,59 @@ class AgentClient extends BaseClient {
         ),
         subagentTasks: this.options.subagentTasks,
         runFiles: this.options.runFiles,
+      };
+
+      const execution = await agentRuntimeDispatcher.resumeTurn({
+        engine: 'legacy',
+        selection: runtimeResolution.selection,
+        createRunOptions,
+        onRunCreated: async (createdRun) => {
+          run = createdRun;
+          hydrateResumeRunSteps(runSteps, this.stepMap, run.Graph, seedContent);
+
+          this.run = run;
+          this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+          if (this._resolveRun) {
+            this._resolveRun(run);
+            this._resolveRun = null;
+          }
+
+          // Do NOT cache the rebuilt graph on resume: it was created with `messages: []`, so
+          // RedisJobStore.getContentParts() (which prefers a cached graph over reconstructing
+          // from the chunk log) would return only the resumed segment and drop the pre-pause
+          // assistant/tool-call content on a same-replica reload/status poll. Skipping it makes
+          // introspection fall back to the durable chunk reconstruction, which is complete.
+          // `setContentParts` still points the in-memory store at the seeded client content.
+          if (streamId && this.contentParts) {
+            GenerationJobManager.setContentParts(streamId, this.contentParts, this.jobCreatedAt);
+          }
+
+          // Carry the user's MCP auth into the rebuilt run so an approved MCP tool executes
+          // with the same OAuth/user credentials it had before the pause.
+          if (userMCPAuthMap != null) {
+            config.configurable.userMCPAuthMap = userMCPAuthMap;
+          }
+
+          /** @deprecated Agent Chain */
+          config.configurable.last_agent_id = agents[agents.length - 1].id;
+        },
+        beforeResume: async () => {
+          /** Same flag-before-run ordering as chatCompletion's processStream. */
+          if (this.activityLabelsMarkedPromise != null) {
+            await this.activityLabelsMarkedPromise;
+          }
+          await this.publishRunContextMeta?.();
+        },
+        afterResume: () => reasoningLabel?.complete(),
+        resumeValue,
+        config,
+        resumeOptions: { callbacks: { [Callback.TOOL_ERROR]: logToolError } },
+        commandOptions,
       });
-
-      if (!run) {
-        throw new Error('Failed to create run for resume');
+      if (execution.engine !== 'legacy') {
+        throw new AgentRuntimeUnavailableError();
       }
-
-      hydrateResumeRunSteps(runSteps, this.stepMap, run.Graph, seedContent);
-
-      this.run = run;
-      this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-      if (this._resolveRun) {
-        this._resolveRun(run);
-        this._resolveRun = null;
-      }
-
-      // Do NOT cache the rebuilt graph on resume: it was created with `messages: []`, so
-      // RedisJobStore.getContentParts() (which prefers a cached graph over reconstructing
-      // from the chunk log) would return only the resumed segment and drop the pre-pause
-      // assistant/tool-call content on a same-replica reload/status poll. Skipping it makes
-      // introspection fall back to the durable chunk reconstruction, which is complete.
-      // `setContentParts` still points the in-memory store at the seeded client content.
-      if (streamId && this.contentParts) {
-        GenerationJobManager.setContentParts(streamId, this.contentParts, this.jobCreatedAt);
-      }
-
-      // Carry the user's MCP auth into the rebuilt run so an approved MCP tool executes
-      // with the same OAuth/user credentials it had before the pause.
-      if (userMCPAuthMap != null) {
-        config.configurable.userMCPAuthMap = userMCPAuthMap;
-      }
-
-      /** @deprecated Agent Chain */
-      config.configurable.last_agent_id = agents[agents.length - 1].id;
-
-      /** Same flag-before-run ordering as chatCompletion's processStream. */
-      if (this.activityLabelsMarkedPromise != null) {
-        await this.activityLabelsMarkedPromise;
-      }
-      await this.publishRunContextMeta?.();
-      try {
-        await run.resume(
-          resumeValue,
-          config,
-          { callbacks: { [Callback.TOOL_ERROR]: logToolError } },
-          commandOptions,
-        );
-      } finally {
-        reasoningLabel?.complete();
-      }
+      run = execution.run;
       this.completeActivityPhase(run, activityPhase);
 
       config.signal = null;

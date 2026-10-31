@@ -63,14 +63,56 @@ function createInput(
 
 describe('createPiGenerationExecutor', () => {
   it('creates one session and disposes it after a successful turn', async () => {
+    const lifecycle: string[] = [];
     const harness = createSession(async (emit) => {
+      lifecycle.push('provider-operation');
       emit({ type: 'agent_settled', aborted: false });
     });
-    const createSessionDependency = jest.fn(async () => harness.session);
+    const createSessionDependency = jest.fn(async () => {
+      lifecycle.push('session-created');
+      return harness.session;
+    });
     const execute = createPiGenerationExecutor({ createSession: createSessionDependency });
 
-    await expect(execute(createInput())).resolves.toEqual({ status: 'completed' });
+    await expect(
+      execute(
+        createInput({
+          onSessionCreated: () => lifecycle.push('runtime-started'),
+        }),
+      ),
+    ).resolves.toEqual({ status: 'completed' });
     expect(createSessionDependency).toHaveBeenCalledTimes(1);
+    expect(harness.disposeCount).toBe(1);
+    expect(lifecycle).toEqual(['session-created', 'runtime-started', 'provider-operation']);
+  });
+
+  it('does not mark Pi started when session initialization fails', async () => {
+    const onSessionCreated = jest.fn();
+    const execute = createPiGenerationExecutor({
+      createSession: async () => {
+        throw new Error('model binding unavailable');
+      },
+    });
+
+    await expect(execute(createInput({ onSessionCreated }))).rejects.toThrow(
+      'model binding unavailable',
+    );
+    expect(onSessionCreated).not.toHaveBeenCalled();
+  });
+
+  it('disposes the session if the host start marker fails', async () => {
+    const harness = createSession(async () => undefined);
+    const execute = createPiGenerationExecutor({ createSession: async () => harness.session });
+
+    await expect(
+      execute(
+        createInput({
+          onSessionCreated: () => {
+            throw new Error('host progress update failed');
+          },
+        }),
+      ),
+    ).rejects.toThrow('host progress update failed');
     expect(harness.disposeCount).toBe(1);
   });
 

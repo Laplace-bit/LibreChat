@@ -66,6 +66,8 @@ export interface PiGenerationDispatchInput {
     toolArguments: PiToolArguments;
     execute(): Promise<Pick<ToolResultMessage, 'content' | 'isError'>>;
   };
+  /** Called when the executor has created the isolated host Pi session. */
+  onSessionCreated?(): void;
   signal?: AbortSignal;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
 }
@@ -237,6 +239,7 @@ export function createPiGenerationDispatcher(
           : { toolBatchPolicy: { controller: pauseController } }),
         translateEvent,
         handleHostEvent: eventSequencer.enqueue,
+        ...(input.onSessionCreated == null ? {} : { onSessionCreated: input.onSessionCreated }),
         eventSequencer,
       };
 

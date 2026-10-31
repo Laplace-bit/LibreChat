@@ -117,6 +117,29 @@ describe('createPiGenerationDispatcher approval continuation', () => {
     });
   }
 
+  it('forwards the session-created lifecycle boundary to the Pi executor', async () => {
+    const onSessionCreated = jest.fn();
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      value.onSessionCreated?.();
+      return { status: 'completed' as const };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage('hello')],
+          createModelBinding,
+          onSessionCreated,
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0][0].onSessionCreated).toBe(onSessionCreated);
+    expect(onSessionCreated).toHaveBeenCalledTimes(1);
+  });
+
   it('executes the approved host result once and continues the exact Pi tool call', async () => {
     const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
       expect(value.operation).toEqual({ kind: 'continue_tool_result', toolCallId: 'pi-call-1' });

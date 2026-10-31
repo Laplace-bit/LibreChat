@@ -3480,7 +3480,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                       errorText: generationError,
                       liveUserMessage: userMessage,
                       liveResponseMessageId,
-                      runCreated: client?.run != null || client?.executionOutcome?.engine === 'pi',
+                      runCreated: client?.runtimeProgress?.started === true,
                       sender: client?.sender,
                       initialAgentId: verifiedInitialAgentId,
                     }),

@@ -13,6 +13,8 @@ export interface PiGenerationExecutorInput extends HostPiSessionOptions {
     | { kind: 'continue_tool_result'; toolCallId: string };
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
+  /** Called once after the isolated host session exists and before provider work begins. */
+  onSessionCreated?(): void;
   eventSequencer?: PiHostEventSequencer;
   pauseController?: PiPauseController;
 }
@@ -30,7 +32,14 @@ export function createPiGenerationExecutor(
       return { status: 'cancelled' };
     }
 
-    const { operation, translateEvent, handleHostEvent, eventSequencer, ...sessionOptions } = input;
+    const {
+      operation,
+      translateEvent,
+      handleHostEvent,
+      onSessionCreated,
+      eventSequencer,
+      ...sessionOptions
+    } = input;
     let session: HostPiSession;
     try {
       session = await dependencies.createSession(sessionOptions);
@@ -46,6 +55,7 @@ export function createPiGenerationExecutor(
       | { ok: true; outcome: PiHostSessionOutcome }
       | { ok: false; error: unknown };
     try {
+      onSessionCreated?.();
       const outcome = await executePiHostSession({
         session,
         operation,

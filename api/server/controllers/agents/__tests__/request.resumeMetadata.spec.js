@@ -4405,6 +4405,10 @@ describe('ResumableAgentController resume metadata', () => {
         sendMessage: jest.fn(async (_text, options) => {
           options.onStart(serverUserMessage, 'server-response-uuid');
           client.run = {};
+          client.runtimeProgress = {
+            selection: { engine: 'legacy' },
+            started: true,
+          };
           throw new Error('failed inside the run');
         }),
       };
@@ -4461,6 +4465,46 @@ describe('ResumableAgentController resume metadata', () => {
       );
       expect(errorRow).toMatchObject({ error: true });
       expect(errorRow).not.toHaveProperty('langfuseSampled');
+    });
+
+    it.each([
+      [
+        'after a Pi session was created',
+        { selection: { engine: 'pi', sdkVersion: '1.4.0' }, started: true, status: 'failed' },
+        true,
+      ],
+      [
+        'before a Pi session was created',
+        { selection: { engine: 'pi', sdkVersion: '1.4.0' }, started: false },
+        false,
+      ],
+    ])('uses runtime progress for a failure %s', async (_label, runtimeProgress, runCreated) => {
+      mockGetFailedTurnTraceFields.mockResolvedValue({});
+      const client = {
+        options: {},
+        sendMessage: jest.fn(async (_text, options) => {
+          options.onStart(
+            { messageId: 'server-user', conversationId, isCreatedByUser: true, text: 'Hi' },
+            'server-response-uuid',
+          );
+          client.runtimeProgress = runtimeProgress;
+          throw new Error('failed in the pinned runtime');
+        }),
+      };
+
+      await AgentController(
+        createFailedRequest(),
+        createResumableResponse(),
+        jest.fn(),
+        jest.fn().mockResolvedValue({ client }),
+        null,
+      );
+      await flushBackgroundGeneration();
+
+      expect(mockGetFailedTurnTraceFields).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ runCreated }),
+      );
     });
 
     it('does not overwrite an existing response row', async () => {

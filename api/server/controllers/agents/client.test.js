@@ -289,6 +289,7 @@ jest.mock('@librechat/agents', () => ({
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../../packages/api/src/agents/runtime/execution'),
   buildAgentScopedContext: (...args) => mockBuildAgentScopedContext(...args),
   checkAccess: jest.fn(),
   createRun: (...args) => mockCreateRun(...args),
@@ -10384,7 +10385,8 @@ describe('AgentClient - Pi generation dispatch', () => {
         [UsageEvents.ON_CONTEXT_USAGE]: { handle: contextUsageHandler },
       },
     });
-    mockExecutePiGeneration.mockImplementation(async ({ handleHostEvent }) => {
+    mockExecutePiGeneration.mockImplementation(async ({ handleHostEvent, onSessionCreated }) => {
+      onSessionCreated?.();
       await handleHostEvent({ event: UsageEvents.ON_CONTEXT_USAGE, data: contextUsage });
       await handleHostEvent({ event: UsageEvents.ON_TOKEN_USAGE, data: usage });
       return { status: 'completed', usage: [usage] };
@@ -10415,7 +10417,11 @@ describe('AgentClient - Pi generation dispatch', () => {
     );
     expect(usageHandler).toHaveBeenCalledWith(UsageEvents.ON_TOKEN_USAGE, usage, expect.anything());
     expect(eventOrder).toEqual([UsageEvents.ON_CONTEXT_USAGE, UsageEvents.ON_TOKEN_USAGE]);
-    expect(client.executionOutcome).toEqual({ engine: 'pi', status: 'completed' });
+    expect(client.runtimeProgress).toEqual({
+      selection: { engine: 'pi', sdkVersion: '1.4.0' },
+      started: true,
+      status: 'completed',
+    });
     expect(client.run).toBeUndefined();
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
@@ -10429,12 +10435,41 @@ describe('AgentClient - Pi generation dispatch', () => {
 
     await client.chatCompletion({ payload: [] });
 
-    expect(client.executionOutcome).toBeUndefined();
+    expect(client.runtimeProgress).toEqual({
+      selection: { engine: 'pi', sdkVersion: '1.4.0' },
+      started: false,
+    });
     expect(client.contentParts).toContainEqual(
       expect.objectContaining({ type: ContentTypes.ERROR }),
     );
     expect(client.contentParts.some((part) => part.type !== ContentTypes.ERROR)).toBe(false);
     expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+  });
+
+  it('records a Pi session before provider failures and records pre-session failures as not started', async () => {
+    const client = createPiClient();
+    mockExecutePiGeneration.mockImplementation(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      throw new Error('provider failed after session creation');
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(client.runtimeProgress).toEqual({
+      selection: { engine: 'pi', sdkVersion: '1.4.0' },
+      started: true,
+      status: 'failed',
+    });
+
+    const preSessionClient = createPiClient();
+    mockExecutePiGeneration.mockRejectedValue(new Error('model binding failed before session'));
+
+    await preSessionClient.chatCompletion({ payload: [] });
+
+    expect(preSessionClient.runtimeProgress).toEqual({
+      selection: { engine: 'pi', sdkVersion: '1.4.0' },
+      started: false,
+    });
   });
 
   it.each([

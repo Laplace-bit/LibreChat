@@ -225,6 +225,9 @@ const {
   AgentRuntimeUnavailableError,
   getAgentRuntimeUserFacingError,
   resolveStoredAgentRuntime,
+  createAgentRuntimeExecutionProgress,
+  markAgentRuntimeExecutionStarted,
+  settleAgentRuntimeExecution,
   assertPiCompatible,
   isPiManagedCodeExecutionCompatible,
   isPiCodeExecutionToolName,
@@ -665,8 +668,8 @@ class AgentClient extends BaseClient {
     /** `run` is exclusively a real Legacy AgentRun. Pi execution has no fabricated Graph. */
     /** @type {AgentRun} */
     this.run;
-    /** @type {{ engine: 'pi'; status: 'completed' | 'cancelled' | 'paused' } | undefined} */
-    this.executionOutcome = undefined;
+    /** @type {import('@librechat/api').AgentRuntimeExecutionProgress | undefined} */
+    this.runtimeProgress = undefined;
 
     /** Resolves with the agent run once `chatCompletion` initializes it (or
      *  `null` if initialization fails), letting immediate-mode title generation
@@ -5115,6 +5118,7 @@ class AgentClient extends BaseClient {
         if (runtimeResolution.status !== 'resolved') {
           throw new AgentRuntimeUnavailableError();
         }
+        this.runtimeProgress = createAgentRuntimeExecutionProgress(runtimeResolution.selection);
         const isPiRuntime = runtimeResolution.selection.engine === 'pi';
         const request = this.options.req;
         const agents = [this.options.agent];
@@ -5419,6 +5423,9 @@ class AgentClient extends BaseClient {
             createToolStepIdentity: createPiStepIdentity,
             createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
             signal: abortController.signal,
+            onSessionCreated: () => {
+              this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+            },
             usageAttribution: {
               provider: this.options.agent.provider,
               agentId: this.options.agent.id,
@@ -5448,7 +5455,14 @@ class AgentClient extends BaseClient {
           } else if (outcome.status === 'unsupported') {
             throw new AgentRuntimeUnavailableError();
           }
-          this.executionOutcome = { engine: 'pi', status: outcome.status };
+          if (outcome.status === 'completed' || outcome.status === 'paused') {
+            this.runtimeProgress = settleAgentRuntimeExecution(
+              this.runtimeProgress,
+              outcome.status,
+            );
+          } else if (outcome.status === 'cancelled') {
+            this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, 'cancelled');
+          }
           if (outcome.status === 'cancelled' && abortController.signal.aborted !== true) {
             throw new AgentRuntimeUnavailableError();
           }
@@ -5561,6 +5575,7 @@ class AgentClient extends BaseClient {
         run = createRunResult.value;
 
         this.run = run;
+        this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
         if (this._resolveRun) {
           this._resolveRun(run);
           this._resolveRun = null;
@@ -5607,6 +5622,12 @@ class AgentClient extends BaseClient {
         // `requires_action` + emit the prompt and leave the turn unfinalized
         // (the resume route continues it). No-op when the run completed.
         await this.handleRunInterrupt(run, streamId);
+
+        let runtimeStatus = abortController.signal.aborted ? 'cancelled' : 'completed';
+        if (this.pendingApproval != null) {
+          runtimeStatus = 'paused';
+        }
+        this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, runtimeStatus);
 
         config.signal = null;
       };
@@ -5671,6 +5692,10 @@ class AgentClient extends BaseClient {
       this.applyHideSequentialOutputsFilter();
       this.rebaseActivityPhaseBounds(contentBeforeReshape);
     } catch (err) {
+      this.runtimeProgress = settleAgentRuntimeExecution(
+        this.runtimeProgress,
+        isAgentRunCancellation(err, abortController?.signal) ? 'cancelled' : 'failed',
+      );
       if (
         err?.code === 'SCHEDULED_HITL_REQUIRES_SHARED_STORE' ||
         err?.code === 'SCHEDULED_HITL_REQUIRES_DURABLE_CHECKPOINT' ||
@@ -6217,6 +6242,9 @@ class AgentClient extends BaseClient {
           execute: createApprovedToolResult,
         },
         signal: abortController.signal,
+        onSessionCreated: () => {
+          this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
+        },
         usageAttribution: {
           provider: this.options.agent.provider,
           agentId: this.options.agent.id,
@@ -6239,11 +6267,19 @@ class AgentClient extends BaseClient {
       } else if (outcome.status === 'cancelled' && !abortController.signal.aborted) {
         throw new AgentRuntimeUnavailableError();
       }
-      this.executionOutcome = { engine: 'pi', status: outcome.status };
+      if (outcome.status === 'completed' || outcome.status === 'paused') {
+        this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, outcome.status);
+      } else if (outcome.status === 'cancelled') {
+        this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, 'cancelled');
+      }
       if (outcome.status !== 'paused') {
         this.completeActivityPhase(null, activityPhase);
       }
     } catch (error) {
+      this.runtimeProgress = settleAgentRuntimeExecution(
+        this.runtimeProgress,
+        isAgentRunCancellation(error, abortController.signal) ? 'cancelled' : 'failed',
+      );
       if (
         error?.code === 'RUN_REPLACED' ||
         error?.code === PENDING_ACTION_EXPIRED_CODE ||
@@ -6307,7 +6343,12 @@ class AgentClient extends BaseClient {
     piApprovalContinuation,
     piApprovalDecision,
   }) {
-    if (this.options.agentRuntime?.engine === 'pi') {
+    const runtimeResolution = resolveStoredAgentRuntime(this.options.agentRuntime);
+    if (runtimeResolution.status !== 'resolved') {
+      throw new AgentRuntimeUnavailableError();
+    }
+    this.runtimeProgress = createAgentRuntimeExecutionProgress(runtimeResolution.selection);
+    if (runtimeResolution.selection.engine === 'pi') {
       return this.resumePiCompletion({
         piApprovalContinuation,
         piApprovalDecision,
@@ -6815,6 +6856,7 @@ class AgentClient extends BaseClient {
       hydrateResumeRunSteps(runSteps, this.stepMap, run.Graph, seedContent);
 
       this.run = run;
+      this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
       if (this._resolveRun) {
         this._resolveRun(run);
         this._resolveRun = null;
@@ -6862,6 +6904,12 @@ class AgentClient extends BaseClient {
       // question). Re-arm the same interrupt gate so the cycle can repeat.
       await this.handleRunInterrupt(run, streamId);
 
+      let runtimeStatus = abortController.signal.aborted ? 'cancelled' : 'completed';
+      if (this.pendingApproval != null) {
+        runtimeStatus = 'paused';
+      }
+      this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, runtimeStatus);
+
       // Mirror chatCompletion: settle label fills before the filter below can
       // shift part positions out from under an in-flight fill's claimed index.
       await this.settleActivityLabels();
@@ -6876,6 +6924,10 @@ class AgentClient extends BaseClient {
       this.applyHideSequentialOutputsFilter();
       this.rebaseActivityPhaseBounds(contentBeforeReshape);
     } catch (err) {
+      this.runtimeProgress = settleAgentRuntimeExecution(
+        this.runtimeProgress,
+        isAgentRunCancellation(err, abortController?.signal) ? 'cancelled' : 'failed',
+      );
       if (isAgentAttachmentLimitError(err) || isAttachmentObjectNotFoundError(err)) {
         logger.warn(
           '[api/server/controllers/agents/client.js #resumeCompletion] Attachment rejected',

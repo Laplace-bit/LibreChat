@@ -2859,6 +2859,45 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
     });
 
+    it('starts one Pi continuation when two route requests race for the same approval', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
+      let actionClaimed = false;
+      mockGenerationJobManager.approvals.resolve.mockImplementation(async () => {
+        if (actionClaimed) {
+          return false;
+        }
+        actionClaimed = true;
+        return true;
+      });
+      const resumedClient = makeClient();
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+      let releasedSlots = 0;
+      let signalBothResumesSettled;
+      const bothResumesSettled = new Promise((resolve) => {
+        signalBothResumesSettled = resolve;
+      });
+      mockDecrementPendingRequest.mockImplementation(async () => {
+        releasedSlots += 1;
+        if (releasedSlots === 2) {
+          signalBothResumesSettled();
+        }
+      });
+
+      const responses = await Promise.all([post(approveBody()), post(approveBody())]);
+      await bothResumesSettled;
+      await flush();
+
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledTimes(2);
+      expect(mockInitializeClient).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.beginProviderExecution).toHaveBeenCalledTimes(1);
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledTimes(1);
+    });
+
     it('409 when the job is not in requires_action (already terminal; no expire)', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob({ status: 'running' }));
       const res = await post(approveBody());

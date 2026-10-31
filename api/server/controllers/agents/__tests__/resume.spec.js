@@ -280,6 +280,91 @@ function makeToolApprovalJob(overrides = {}) {
   };
 }
 
+/** A paused Pi host-tool call with the durable continuation and host projection it requires. */
+function makePiToolApprovalJob(overrides = {}) {
+  const args = { query: 'maintenance manual' };
+  const continuation = {
+    version: 1,
+    actionId: ACTION_ID,
+    piToolCallId: 'pi-call-1',
+    hostToolCallId: 'tc1',
+    toolTurn: 1,
+    toolName: Tools.file_search,
+    args,
+    allowedDecisions: ['approve', 'reject'],
+    stepIdentity: {
+      id: 'pi-step-1',
+      index: 0,
+      messageId: RESPONSE_MSG_ID,
+      runId: RESPONSE_MSG_ID,
+      agentId: AGENT_ID,
+    },
+    stepCreatedAt: 100,
+  };
+  const job = makeToolApprovalJob({
+    ...overrides,
+    metadata: {
+      agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+      piResumeContinuation: continuation,
+      ...overrides.metadata,
+      pendingAction: {
+        actionId: ACTION_ID,
+        expiresAt: Date.now() + 60_000,
+        payload: {
+          type: 'tool_approval',
+          action_requests: [{ name: Tools.file_search, arguments: args, tool_call_id: 'tc1' }],
+          review_configs: [
+            {
+              action_name: Tools.file_search,
+              tool_call_id: 'tc1',
+              allowed_decisions: ['approve', 'reject'],
+            },
+          ],
+        },
+        ...overrides.metadata?.pendingAction,
+      },
+    },
+  });
+  return { job, continuation, args };
+}
+
+function makePiApprovalResumeState({ args, stepIdentity }) {
+  return {
+    aggregatedContent: [
+      {
+        type: 'tool_call',
+        tool_call: {
+          id: 'tc1',
+          stepId: stepIdentity.id,
+          name: Tools.file_search,
+          args: JSON.stringify(args),
+        },
+      },
+    ],
+    runSteps: [
+      {
+        id: stepIdentity.id,
+        runId: stepIdentity.runId,
+        agentId: stepIdentity.agentId,
+        type: 'tool_calls',
+        index: stepIdentity.index,
+        created_at: 100,
+        status: 'in_progress',
+        stepDetails: {
+          type: 'tool_calls',
+          tool_calls: [
+            {
+              id: 'tc1',
+              type: 'function',
+              function: { name: Tools.file_search, arguments: args },
+            },
+          ],
+        },
+      },
+    ],
+  };
+}
+
 /** A live, resolvable paused ask-user-question job. */
 function makeAskUserJob(overrides = {}) {
   const job = makeToolApprovalJob(overrides);
@@ -2683,6 +2768,95 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockCheckAndIncrementPendingRequest).not.toHaveBeenCalled();
       expect(mockClaimScheduleResume).not.toHaveBeenCalled();
       expect(mockInitializeClient).not.toHaveBeenCalled();
+    });
+
+    it('resumes a valid Pi approval through the route and finalizes the existing generation', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob();
+      const resumeState = makePiApprovalResumeState({
+        args,
+        stepIdentity: continuation.stepIdentity,
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
+      const resumedClient = makeClient({
+        contentParts: [{ type: 'text', text: 'The maintenance manual is ready.' }],
+      });
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+
+      const res = await post(approveBody());
+
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('resuming');
+      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
+        CONVO_ID,
+        ACTION_ID,
+        expect.objectContaining({ providerExecutionId: expect.any(String) }),
+        1000,
+      );
+      await settled;
+      await flush();
+
+      expect(mockInitializeClient).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agentRuntime: expect.objectContaining({ engine: 'pi', sdkVersion: '1.4.0' }),
+          isResume: true,
+        }),
+      );
+      expect(mockGenerationJobManager.beginProviderExecution).toHaveBeenCalledTimes(1);
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({
+          piApprovalContinuation: continuation,
+          piApprovalDecision: { kind: 'execute', args },
+          runSteps: resumeState.runSteps,
+          seedContent: resumeState.aggregatedContent,
+        }),
+      );
+      expect(mockSaveMessage).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          messageId: RESPONSE_MSG_ID,
+          content: [{ type: 'text', text: 'The maintenance manual is ready.' }],
+          unfinished: false,
+        }),
+        expect.anything(),
+      );
+      expect(mockGenerationJobManager.publishTerminalClaim).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects stale Pi host state before claiming the approval or rebuilding a client', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob();
+      const resumeState = makePiApprovalResumeState({
+        args: { query: 'changed after pause' },
+        stepIdentity: continuation.stepIdentity,
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
+
+      const res = await post(approveBody());
+
+      expect(res.status).toBe(409);
+      expect(res.body.code).toBe('PI_CONTINUATION_STALE');
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+      expect(args).toEqual({ query: 'maintenance manual' });
+    });
+
+    it('does not dispatch a Pi continuation when another resume wins the approval CAS', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
+      mockGenerationJobManager.approvals.resolve.mockResolvedValue(false);
+
+      const res = await post(approveBody());
+
+      expect(res.status).toBe(409);
+      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledTimes(1);
+      expect(mockInitializeClient).not.toHaveBeenCalled();
+      expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
     });
 
     it('409 when the job is not in requires_action (already terminal; no expire)', async () => {

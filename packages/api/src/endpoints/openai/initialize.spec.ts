@@ -29,6 +29,7 @@ jest.mock('~/utils', () => ({
 }));
 
 import { getAzureCredentials } from '~/utils';
+import { OPENAI_COMPLETIONS_API } from '~/agents/pi/model';
 import { initializeOpenAI } from './initialize';
 
 const realGetOpenAIConfig =
@@ -447,6 +448,56 @@ describe('initializeOpenAI – Pi provider authorization', () => {
     }
   });
 
+  it('creates a Pi factory for explicitly selected official OpenAI Chat Completions', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = {
+      model: 'gpt-4o',
+      useResponsesApi: false,
+      temperature: 0.4,
+      top_p: 0.8,
+    };
+
+    try {
+      const options = await initializeOpenAI(params);
+      const factory = getInitializeResultPiModelBindingFactory(options);
+
+      expect((options.llmConfig as Record<string, unknown>).useResponsesApi).toBe(false);
+      expect(factory).toBeDefined();
+      if (factory === undefined) {
+        throw new Error('Expected a request-scoped OpenAI Completions binding factory');
+      }
+      const binding = await factory();
+      expect(binding.model).toMatchObject({
+        id: 'gpt-4o',
+        api: OPENAI_COMPLETIONS_API,
+        baseUrl: 'https://api.openai.com/v1',
+      });
+      await binding.dispose();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
+  it('does not create a Completions factory when a reasoning parameter is configured', async () => {
+    const restoreIsolatedEnv = isolateProviderEnvironment();
+    const params = createParams({ OPENAI_API_KEY: 'sk-server-admin' });
+    params.model_parameters = {
+      model: 'gpt-4o',
+      useResponsesApi: false,
+      reasoning_effort: ReasoningEffort.high,
+    };
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      restoreIsolatedEnv();
+    }
+  });
+
   it.each([
     ['user-provided API key', { OPENAI_API_KEY: AuthType.USER_PROVIDED }, undefined],
     [
@@ -537,7 +588,11 @@ describe('initializeOpenAI – Pi provider authorization', () => {
       { model: 'gpt-4o', useResponsesApi: true, reasoning_effort: ReasoningEffort.high },
       'reasoningMismatch',
     ],
-    ['Chat Completions mode', { model: 'gpt-4o', useResponsesApi: false }, undefined],
+    [
+      'reasoning in Chat Completions server configuration',
+      { model: 'gpt-4o', useResponsesApi: false },
+      'completionsReasoning',
+    ],
     ['provider-native OpenRouter mode', { model: 'gpt-4o', useResponsesApi: true }, 'openrouter'],
     ['default query override', { model: 'gpt-4o', useResponsesApi: true }, 'defaultQuery'],
     ['custom dispatcher', { model: 'gpt-4o', useResponsesApi: true }, 'dispatcher'],
@@ -558,8 +613,10 @@ describe('initializeOpenAI – Pi provider authorization', () => {
           model: 'gpt-4o',
           user: 'user-1',
           streaming: true,
-          useResponsesApi: true,
-          ...(outputMode === 'reasoningMismatch' ? { reasoning: { effort: 'low' } } : {}),
+          useResponsesApi: modelParameters.useResponsesApi === false ? false : true,
+          ...(outputMode === 'reasoningMismatch' || outputMode === 'completionsReasoning'
+            ? { reasoning: { effort: 'low' } }
+            : {}),
           firstPartyEndpoint: true,
         },
         configOptions,

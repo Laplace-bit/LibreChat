@@ -19,9 +19,9 @@ import {
   getAzureCredentials,
 } from '~/utils';
 import { setInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
+import { OPENAI_API, OPENAI_BASE_URL, OPENAI_COMPLETIONS_API } from '~/agents/pi/model';
 import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
 import { resolveModelTransportTimeouts } from '~/agents/config';
-import { OPENAI_API, OPENAI_BASE_URL } from '~/agents/pi/model';
 import { createPiOpenAIModelBinding } from '~/agents/pi/model';
 import { getOpenAIEndpointParameters } from './parameters';
 import { resolveEndpointRuntime } from '~/types';
@@ -46,6 +46,28 @@ const PI_SUPPORTED_LLM_CONFIG_KEYS = new Set([
   'streaming',
   'useResponsesApi',
   'reasoning',
+  'temperature',
+  'topP',
+  'maxTokens',
+  'firstPartyEndpoint',
+]);
+
+const PI_SUPPORTED_COMPLETIONS_MODEL_PARAMETER_KEYS = new Set([
+  'model',
+  'useResponsesApi',
+  'temperature',
+  'top_p',
+  'topP',
+  'max_tokens',
+  'maxTokens',
+]);
+
+const PI_SUPPORTED_COMPLETIONS_LLM_CONFIG_KEYS = new Set([
+  'apiKey',
+  'model',
+  'user',
+  'streaming',
+  'useResponsesApi',
   'temperature',
   'topP',
   'maxTokens',
@@ -94,6 +116,16 @@ function hasOnlySupportedParameters(parameters: Readonly<Record<string, unknown>
   return Object.entries(parameters).every(
     ([key, value]) =>
       PI_SUPPORTED_MODEL_PARAMETER_KEYS.has(key) && (key !== 'useResponsesApi' || value === true),
+  );
+}
+
+function hasOnlySupportedCompletionsParameters(
+  parameters: Readonly<Record<string, unknown>>,
+): boolean {
+  return Object.entries(parameters).every(
+    ([key, value]) =>
+      PI_SUPPORTED_COMPLETIONS_MODEL_PARAMETER_KEYS.has(key) &&
+      (key !== 'useResponsesApi' || value === false),
   );
 }
 
@@ -233,6 +265,21 @@ function createAuthorizedPiOpenAIModelCandidate({
   modelName: string | undefined;
   requestUserId: string | undefined;
 }): AuthorizedPiOpenAIModelCandidate | undefined {
+  const isResponsesRequest =
+    modelParameters != null &&
+    modelParameters.useResponsesApi !== false &&
+    hasOnlySupportedParameters(modelParameters) &&
+    readProperty(options.llmConfig, 'useResponsesApi') === true &&
+    hasMatchingPiReasoningConfig(options.llmConfig, modelParameters.reasoning_effort) &&
+    Object.keys(options.llmConfig).every((key) => PI_SUPPORTED_LLM_CONFIG_KEYS.has(key));
+  const isCompletionsRequest =
+    modelParameters?.useResponsesApi === false &&
+    hasOnlySupportedCompletionsParameters(modelParameters) &&
+    readProperty(options.llmConfig, 'useResponsesApi') === false &&
+    Object.keys(options.llmConfig).every((key) =>
+      PI_SUPPORTED_COMPLETIONS_LLM_CONFIG_KEYS.has(key),
+    );
+
   if (
     endpoint !== EModelEndpoint.openAI ||
     typeof adminApiKey !== 'string' ||
@@ -251,17 +298,14 @@ function createAuthorizedPiOpenAIModelCandidate({
     !/^[A-Za-z0-9._-]+$/u.test(modelName) ||
     modelParameters == null ||
     modelParameters.model !== modelName ||
-    !hasOnlySupportedParameters(modelParameters) ||
-    !hasMatchingPiReasoningConfig(options.llmConfig, modelParameters.reasoning_effort) ||
+    (!isResponsesRequest && !isCompletionsRequest) ||
     hasEntries(options.tools) ||
     options.provider != null ||
     hasEntries(readProperty(options.llmConfig, 'modelKwargs')) ||
-    !Object.keys(options.llmConfig).every((key) => PI_SUPPORTED_LLM_CONFIG_KEYS.has(key)) ||
     readProperty(options.llmConfig, 'apiKey') !== adminApiKey ||
     readProperty(options.llmConfig, 'model') !== modelName ||
     readProperty(options.llmConfig, 'user') !== requestUserId ||
     readProperty(options.llmConfig, 'streaming') !== true ||
-    readProperty(options.llmConfig, 'useResponsesApi') !== true ||
     readProperty(options.llmConfig, 'firstPartyEndpoint') !== true ||
     hasEntries(readProperty(allConfig ?? {}, 'headers')) ||
     hasEntries(readProperty(openAIConfig ?? {}, 'headers')) ||
@@ -294,14 +338,9 @@ function createAuthorizedPiOpenAIModelCandidate({
     return undefined;
   }
 
-  const reasoningEffort = isPiOpenAIReasoningEffort(modelParameters.reasoning_effort)
-    ? modelParameters.reasoning_effort
-    : undefined;
-
-  return {
-    source: 'server-admin-config',
-    provider: 'openai',
-    api: OPENAI_API,
+  const candidateBase = {
+    source: 'server-admin-config' as const,
+    provider: 'openai' as const,
     baseUrl: OPENAI_BASE_URL,
     modelId: modelName,
     serverAdminApiKey: adminApiKey,
@@ -311,9 +350,23 @@ function createAuthorizedPiOpenAIModelCandidate({
       headersTimeout: transportTimeouts.headersTimeout,
       ...(typeof proxy === 'string' && proxy.trim() !== '' ? { proxy: proxy.trim() } : {}),
     },
-    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(sampling === undefined ? {} : { sampling }),
   };
+
+  if (isResponsesRequest) {
+    const reasoningEffort = isPiOpenAIReasoningEffort(modelParameters.reasoning_effort)
+      ? modelParameters.reasoning_effort
+      : undefined;
+    return {
+      ...candidateBase,
+      api: OPENAI_API,
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    };
+  }
+  if (isCompletionsRequest) {
+    return { ...candidateBase, api: OPENAI_COMPLETIONS_API };
+  }
+  return undefined;
 }
 
 /**

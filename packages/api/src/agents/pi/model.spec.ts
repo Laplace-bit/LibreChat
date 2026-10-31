@@ -8,10 +8,13 @@ import type { Dispatcher } from 'undici';
 import {
   createPiOpenAIModelBinding,
   OPENAI_API,
+  OPENAI_COMPLETIONS_API,
   OPENAI_BASE_URL,
   PiOpenAIModelBindingError,
   PI_OPENAI_PROVIDER_ID,
+  type AuthorizedPiOpenAICompletionsModelCandidate,
   type AuthorizedPiOpenAIModelCandidate,
+  type AuthorizedPiOpenAIResponsesModelCandidate,
   type PiOpenAIModelBindingDependencies,
 } from './model';
 import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
@@ -59,12 +62,27 @@ const catalogModel: Model<Api> = {
 };
 
 function candidate(
-  overrides: Partial<AuthorizedPiOpenAIModelCandidate> = {},
-): AuthorizedPiOpenAIModelCandidate {
+  overrides: Partial<AuthorizedPiOpenAIResponsesModelCandidate> = {},
+): AuthorizedPiOpenAIResponsesModelCandidate {
   return {
     source: 'server-admin-config',
     provider: 'openai',
     api: OPENAI_API,
+    baseUrl: OPENAI_BASE_URL,
+    modelId: MODEL_ID,
+    serverAdminApiKey: API_KEY,
+    transport: { bodyTimeout: 900_000, headersTimeout: 300_000 },
+    ...overrides,
+  };
+}
+
+function completionsCandidate(
+  overrides: Partial<AuthorizedPiOpenAICompletionsModelCandidate> = {},
+): AuthorizedPiOpenAICompletionsModelCandidate {
+  return {
+    source: 'server-admin-config',
+    provider: 'openai',
+    api: OPENAI_COMPLETIONS_API,
     baseUrl: OPENAI_BASE_URL,
     modelId: MODEL_ID,
     serverAdminApiKey: API_KEY,
@@ -257,12 +275,16 @@ async function runPiTransportRequest({
   proxyMode,
   responseMode,
   modelId,
+  api,
   reasoningEffort,
+  sampling,
 }: {
   proxyMode: TransportProxyMode;
   responseMode: TransportResponseMode;
   modelId?: string;
-  reasoningEffort?: AuthorizedPiOpenAIModelCandidate['reasoningEffort'];
+  api?: typeof OPENAI_API | typeof OPENAI_COMPLETIONS_API;
+  reasoningEffort?: AuthorizedPiOpenAIResponsesModelCandidate['reasoningEffort'];
+  sampling?: AuthorizedPiOpenAIModelCandidate['sampling'];
 }) {
   const bodyTimeout = responseMode === 'body-timeout' ? 1_000 : 5_000;
   const headersTimeout = responseMode === 'headers-timeout' ? 1_000 : 5_000;
@@ -276,26 +298,40 @@ async function runPiTransportRequest({
     getProxyDispatcher(explicitProxy, dispatcherOptions) ?? getDirectDispatcher(dispatcherOptions);
   transportDispatchers.add(dispatcher);
 
+  const selectedApi = api ?? OPENAI_API;
+  const selectedPath = selectedApi === OPENAI_API ? '/responses' : '/chat/completions';
+  const selectedCanonicalURL = `${OPENAI_BASE_URL}${selectedPath}`;
+  const transport = {
+    ...dispatcherOptions,
+    ...(explicitProxy === undefined ? {} : { proxy: explicitProxy }),
+  };
   let requestedCanonicalUrl: string | undefined;
-  const binding = await createPiOpenAIModelBinding(
-    candidate({
-      modelId: modelId ?? MODEL_ID,
-      transport: {
-        ...dispatcherOptions,
-        ...(explicitProxy === undefined ? {} : { proxy: explicitProxy }),
-      },
-      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-    }),
-    {
-      rewriteRequestUrlForTest: (url) => {
-        if (url.href !== `${OPENAI_BASE_URL}/responses`) {
-          throw new Error('The Pi provider did not request the canonical OpenAI Responses URL.');
-        }
-        requestedCanonicalUrl = url.href;
-        return new URL('/responses', origin.url);
-      },
+  const bindingCandidate =
+    selectedApi === OPENAI_API
+      ? candidate({
+          api: selectedApi,
+          modelId: modelId ?? MODEL_ID,
+          transport,
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          ...(sampling === undefined ? {} : { sampling }),
+        })
+      : completionsCandidate({
+          api: selectedApi,
+          modelId: modelId ?? MODEL_ID,
+          transport,
+          ...(sampling === undefined ? {} : { sampling }),
+        });
+  const binding = await createPiOpenAIModelBinding(bindingCandidate, {
+    rewriteRequestUrlForTest: (url) => {
+      if (url.href !== selectedCanonicalURL) {
+        throw new Error(
+          `The Pi provider did not request the canonical OpenAI URL for ${selectedApi}.`,
+        );
+      }
+      requestedCanonicalUrl = url.href;
+      return new URL(selectedPath, origin.url);
     },
-  );
+  });
   let failure: unknown;
   const transportErrors: string[] = [];
   const undiciErrors = channel('undici:request:error');
@@ -309,7 +345,7 @@ async function runPiTransportRequest({
     const originalProviderConfig =
       binding.modelRuntime.getRegisteredProviderConfig(PI_OPENAI_PROVIDER_ID);
     if (originalProviderConfig?.streamSimple === undefined) {
-      throw new Error('The real Pi runtime did not register the OpenAI Responses adapter.');
+      throw new Error(`The real Pi runtime did not register the OpenAI ${selectedApi} adapter.`);
     }
     const stream = binding.modelRuntime.stream(
       binding.model,
@@ -457,6 +493,64 @@ describe('createPiOpenAIModelBinding', () => {
     expect(JSON.parse(result.requestBodies[0] ?? '{}').reasoning).toEqual({ effort: 'high' });
   });
 
+  it('maps only API-neutral model metadata into a typed OpenAI Completions model', async () => {
+    const harness = createHarness();
+    const binding = await createPiOpenAIModelBinding(
+      completionsCandidate({ requestUserId: 'auth-user-123', sampling: { temperature: 0.4 } }),
+      harness.dependencies,
+    );
+    const registeredProvider = harness.registerProvider.mock.calls[0]?.[1];
+    const registeredModel = registeredProvider?.models?.[0];
+
+    expect(registeredProvider).toMatchObject({
+      api: OPENAI_COMPLETIONS_API,
+      baseUrl: OPENAI_BASE_URL,
+    });
+    expect(registeredModel).toMatchObject({
+      id: MODEL_ID,
+      api: OPENAI_COMPLETIONS_API,
+      provider: PI_OPENAI_PROVIDER_ID,
+      baseUrl: OPENAI_BASE_URL,
+      reasoning: false,
+      samplingParams: { temperature: 0.4, user: 'auth-user-123' },
+    });
+    expect(registeredModel).not.toHaveProperty('compat');
+    expect(binding.model).toMatchObject({
+      api: OPENAI_COMPLETIONS_API,
+      provider: PI_OPENAI_PROVIDER_ID,
+      baseUrl: OPENAI_BASE_URL,
+    });
+    expect(harness.runtime.setRuntimeApiKey).toHaveBeenCalledWith(PI_OPENAI_PROVIDER_ID, API_KEY);
+
+    await binding.dispose();
+  });
+
+  it('sends Chat Completions to the fixed path through the configured proxy and timeout policy', async () => {
+    const result = await runPiTransportRequest({
+      proxyMode: 'explicit',
+      responseMode: 'headers-timeout',
+      api: OPENAI_COMPLETIONS_API,
+      sampling: { temperature: 0.3, topP: 0.7 },
+    });
+
+    expect(result.failure).toBeDefined();
+    expect(result.transportErrors).toContain('UND_ERR_HEADERS_TIMEOUT');
+    expect(result.requestedCanonicalUrl).toBe(`${OPENAI_BASE_URL}/chat/completions`);
+    expect(result.paths).toEqual(['/chat/completions']);
+    expect(result.proxyTraffic).toBeGreaterThan(0);
+    expect(result.requestHeaders[0]?.authorization).toBe(`Bearer ${API_KEY}`);
+    expect(result.requestBodies).toHaveLength(1);
+    expect(JSON.parse(result.requestBodies[0] ?? '{}')).toMatchObject({
+      model: MODEL_ID,
+      messages: [{ role: 'user', content: 'local transport check' }],
+      stream: true,
+      temperature: 0.3,
+      top_p: 0.7,
+    });
+    expect(JSON.parse(result.requestBodies[0] ?? '{}')).not.toHaveProperty('reasoning');
+    expect(JSON.parse(result.requestBodies[0] ?? '{}')).not.toHaveProperty('reasoning_effort');
+  });
+
   it('registers one fixed OpenAI Responses catalog model with isolated credentials', async () => {
     const harness = createHarness();
     const binding = await createPiOpenAIModelBinding(
@@ -513,7 +607,7 @@ describe('createPiOpenAIModelBinding', () => {
     ['request-style apiKey field', { apiKey: API_KEY }],
     ['custom base URL', { baseUrl: 'https://api.example.test/v1' }],
     ['alternate provider', { provider: 'azure' }],
-    ['alternate API', { api: 'openai-completions' }],
+    ['unsupported API', { api: 'azure-openai-responses' }],
     ['non-admin source', { source: 'user-config' }],
   ])('rejects %s before creating a runtime', async (_caseName, override) => {
     const harness = createHarness();
@@ -547,6 +641,28 @@ describe('createPiOpenAIModelBinding', () => {
       createPiOpenAIModelBinding({ ...candidate(), reasoningEffort: 'none' }, harness.dependencies),
     ).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' });
     expect(harness.dependencies.createRuntime).not.toHaveBeenCalled();
+  });
+
+  it('rejects reasoning configuration on the OpenAI Completions candidate', async () => {
+    const harness = createHarness();
+    const invalidCandidate: unknown = {
+      ...completionsCandidate(),
+      reasoningEffort: 'high',
+    };
+
+    await expect(
+      createPiOpenAIModelBinding(invalidCandidate, harness.dependencies),
+    ).rejects.toMatchObject({ code: 'INVALID_CANDIDATE' });
+    expect(harness.dependencies.createRuntime).not.toHaveBeenCalled();
+  });
+
+  it('rejects reasoning models on the OpenAI Completions binding', async () => {
+    const harness = createHarness({ catalogModel: { ...catalogModel, reasoning: true } });
+
+    await expect(
+      createPiOpenAIModelBinding(completionsCandidate(), harness.dependencies),
+    ).rejects.toMatchObject({ code: 'UNSUPPORTED_MODEL' });
+    expect(harness.runtime.unregisterProvider).toHaveBeenCalledTimes(1);
   });
 
   it.each([

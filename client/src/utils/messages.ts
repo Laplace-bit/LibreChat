@@ -1,3 +1,5 @@
+import { isEmptyContentPart } from '@librechat/chat/react';
+import { getBranchSiblingIndexesForTarget } from '@librechat/chat';
 import { QueryKeys, Constants, buildTree, ContentTypes } from 'librechat-data-provider';
 import {
   hasStreamStartFailed,
@@ -6,10 +8,12 @@ import {
   STREAM_START_FAILED_METADATA_KEY,
 } from '@librechat/chat';
 import type { Agents, TMessage, TMessageContentParts } from 'librechat-data-provider';
+import type { BranchSiblingIndex } from '@librechat/chat';
 import type { QueryClient } from '@tanstack/react-query';
 import type { LocalizeFunction, TMessageProps } from '~/common';
 
 export {
+  isEmptyContentPart,
   hasStreamStartFailed,
   stripStreamedIndexStamps,
   createDualMessageContent,
@@ -27,12 +31,10 @@ export function isUnacknowledgedUserMessage(message: TMessage): boolean {
   );
 }
 
-type SiblingIndexLookup = (parentMessageId: string | null | undefined) => number;
+export { getBranchSiblingIndexesForTarget };
+export type { BranchSiblingIndex };
 
-export type BranchSiblingIndex = {
-  parentMessageId: string | null | undefined;
-  siblingIdx: number;
-};
+type SiblingIndexLookup = (parentMessageId: string | null | undefined) => number;
 
 export const selectActiveBranchTail = (
   messages: TMessage[] | null | undefined,
@@ -91,54 +93,6 @@ export const getMessageBranchSiblingParentIds = (
     }
   }
   return Array.from(parentIds);
-};
-
-export const getBranchSiblingIndexesForTarget = (
-  messages: TMessage[] | null | undefined,
-  targetMessageId: string | null | undefined,
-  rootSiblingKey: string | null | undefined,
-): BranchSiblingIndex[] => {
-  if (!targetMessageId) {
-    return [];
-  }
-
-  const messagesTree = buildTree({ messages: messages ?? null });
-  if (!messagesTree?.length) {
-    return [];
-  }
-
-  const branchIndexes: BranchSiblingIndex[] = [];
-  const stack = [
-    { siblings: messagesTree, parentMessageId: rootSiblingKey, index: 0, branchCount: 0 },
-  ];
-  while (stack.length > 0) {
-    const frame = stack[stack.length - 1];
-    const index = frame.index++;
-    const message = frame.siblings[index];
-    if (!message) {
-      stack.pop();
-      continue;
-    }
-    branchIndexes.length = frame.branchCount;
-    if (frame.siblings.length > 1) {
-      branchIndexes.push({
-        parentMessageId: frame.parentMessageId,
-        siblingIdx: frame.siblings.length - index - 1,
-      });
-    }
-    if (message.messageId === targetMessageId) {
-      return branchIndexes;
-    }
-    if (message.children?.length) {
-      stack.push({
-        siblings: message.children,
-        parentMessageId: message.messageId,
-        index: 0,
-        branchCount: branchIndexes.length,
-      });
-    }
-  }
-  return [];
 };
 
 export const getLatestText = (message?: TMessage | null, includeIndex?: boolean): string => {
@@ -202,25 +156,6 @@ const getPartToolCall = (part: TMessageContentParts): Agents.ToolCall | undefine
   part.type === ContentTypes.TOOL_CALL
     ? (part[ContentTypes.TOOL_CALL] as Agents.ToolCall | undefined)
     : undefined;
-
-/** Slots the persistence compaction leaves nothing behind for: the
- * dual-message `type: ''` placeholders, text/think parts that never received a
- * delta, and tool calls missing their `tool_call` payload. */
-export const isEmptyContentPart = (part: TMessageContentParts): boolean => {
-  if (!part.type) {
-    return true;
-  }
-  if (part.type === ContentTypes.TEXT) {
-    return getPartTextValue(part.text).length === 0;
-  }
-  if (part.type === ContentTypes.THINK) {
-    return getPartTextValue(part.think).length === 0;
-  }
-  if (part.type === ContentTypes.TOOL_CALL) {
-    return getPartToolCall(part) == null;
-  }
-  return false;
-};
 
 /** One side extending the other is the same part observed at two moments —
  * a flushed tail or a server-side trim — while divergent content is a
@@ -367,13 +302,7 @@ export const preserveStreamedContentIdentity = (
 export const getPartKeyIndex = (part: TMessageContentParts | undefined, idx: number): number =>
   part?.streamedIndex ?? idx;
 
-/**
- * Whether a draft message has enough content to submit: non-whitespace
- * text, or at least one attached file. Lets users send a file without
- * having to type a placeholder message alongside it.
- */
-export const isSubmittableMessage = (text?: string | null, fileCount = 0): boolean =>
-  (text ?? '').trim() !== '' || fileCount > 0;
+export { isSubmittableMessage } from '@librechat/chat';
 
 export const markStreamStartFailedMetadata = (
   metadata?: TMessage['metadata'],
@@ -497,129 +426,8 @@ export const getHeaderPrefixForScreenReader = (
     : `${localize('com_ui_response')}${suffix}: `;
 };
 
-export type MessageTimestamp = {
-  /** Localized relative time, e.g. "2 hours ago". */
-  relative: string;
-  /** Localized absolute date and time, e.g. "Jun 12, 2026, 3:42 PM". */
-  absolute: string;
-  /** ISO 8601 string for the `<time>` element's `dateTime` attribute. */
-  iso: string;
-  /**
-   * True when the message is recent enough that the relative form ("10 minutes ago")
-   * reads better than the absolute date. Past this window the absolute date is clearer.
-   */
-  isRecent: boolean;
-};
-
-/** Below this age the relative form is preferred over the absolute date. */
-const RECENT_THRESHOLD_MS = 24 * 60 * 60 * 1000;
-
-/** Returns true when `value` parses to a valid date. */
-export const isValidTimestamp = (value?: string | null): value is string => {
-  if (!value) {
-    return false;
-  }
-  return !Number.isNaN(new Date(value).getTime());
-};
-
-const RELATIVE_TIME_DIVISIONS: { amount: number; unit: Intl.RelativeTimeFormatUnit }[] = [
-  { amount: 60, unit: 'second' },
-  { amount: 60, unit: 'minute' },
-  { amount: 24, unit: 'hour' },
-  { amount: 7, unit: 'day' },
-  { amount: 4.34524, unit: 'week' },
-  { amount: 12, unit: 'month' },
-  { amount: Number.POSITIVE_INFINITY, unit: 'year' },
-];
-
-/**
- * Intl formatters are expensive to construct and every message row formats its
- * timestamp on each render, so they are built once per locale (and clock format).
- */
-const resolvedLocales = new Map<string, string | undefined>();
-const relativeFormatters = new Map<string, Intl.RelativeTimeFormat>();
-const absoluteFormatters = new Map<string, Intl.DateTimeFormat>();
-
-/** Returns the locale only when it is a syntactically valid BCP-47 tag, else undefined. */
-const resolveLocale = (locale?: string): string | undefined => {
-  if (!locale) {
-    return undefined;
-  }
-  if (resolvedLocales.has(locale)) {
-    return resolvedLocales.get(locale);
-  }
-  let resolved: string | undefined;
-  try {
-    Intl.DateTimeFormat.supportedLocalesOf(locale);
-    resolved = locale;
-  } catch {
-    resolved = undefined;
-  }
-  resolvedLocales.set(locale, resolved);
-  return resolved;
-};
-
-const getRelativeFormatter = (locale?: string): Intl.RelativeTimeFormat => {
-  const key = locale ?? '';
-  let formatter = relativeFormatters.get(key);
-  if (!formatter) {
-    formatter = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
-    relativeFormatters.set(key, formatter);
-  }
-  return formatter;
-};
-
-const getAbsoluteFormatter = (locale?: string, hour12?: boolean): Intl.DateTimeFormat => {
-  const key = `${locale ?? ''}|${String(hour12)}`;
-  let formatter = absoluteFormatters.get(key);
-  if (!formatter) {
-    formatter = new Intl.DateTimeFormat(locale, {
-      dateStyle: 'medium',
-      timeStyle: 'short',
-      hour12,
-    });
-    absoluteFormatters.set(key, formatter);
-  }
-  return formatter;
-};
-
-const formatRelativeTime = (from: Date, to: Date, locale?: string): string => {
-  const formatter = getRelativeFormatter(locale);
-  let duration = (from.getTime() - to.getTime()) / 1000;
-  for (const division of RELATIVE_TIME_DIVISIONS) {
-    if (Math.abs(duration) < division.amount) {
-      return formatter.format(Math.round(duration), division.unit);
-    }
-    duration /= division.amount;
-  }
-  return formatter.format(Math.round(duration), 'year');
-};
-
-/**
- * Formats a message timestamp into locale-aware relative and absolute strings.
- * Returns null when the value is missing or unparseable, so callers can skip
- * rendering the timestamp entirely.
- */
-export const getMessageTimestamp = (
-  value?: string | null,
-  locale?: string,
-  hour12?: boolean,
-): MessageTimestamp | null => {
-  if (!isValidTimestamp(value)) {
-    return null;
-  }
-
-  const date = new Date(value);
-  const now = new Date(Date.now());
-  const safeLocale = resolveLocale(locale);
-
-  return {
-    iso: date.toISOString(),
-    relative: formatRelativeTime(date, now, safeLocale),
-    absolute: getAbsoluteFormatter(safeLocale, hour12).format(date),
-    isRecent: Math.abs(now.getTime() - date.getTime()) < RECENT_THRESHOLD_MS,
-  };
-};
+export { isValidTimestamp, getMessageTimestamp } from '@librechat/chat/components';
+export type { MessageTimestamp } from '@librechat/chat/components';
 
 export function areMessageFilesEqual(prevFiles?: TMessage['files'], nextFiles?: TMessage['files']) {
   if (prevFiles === nextFiles) {

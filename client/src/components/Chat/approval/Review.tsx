@@ -1,6 +1,8 @@
 import { memo, useEffect, useMemo } from 'react';
 import { useAtom, useAtomValue } from 'jotai';
+import { isCancelKey } from '@librechat/chat';
 import { Button, TooltipAnchor } from '@librechat/client';
+import { useComposerOverlay } from '@librechat/chat/react';
 import { ChevronDown, ChevronUp, ShieldQuestion, TriangleAlert } from 'lucide-react';
 import type { Agents } from 'librechat-data-provider';
 import type { KeyboardEvent, RefObject } from 'react';
@@ -15,8 +17,6 @@ import {
 } from '~/components/Chat/approval/state';
 import { buildApprovalPreview, buildApprovalPreviews } from '~/components/Chat/approval/preview';
 import ToolApproval from '~/components/Chat/Messages/Content/ToolApproval';
-import { useComposerOverlay } from '~/components/Chat/Input/overlay';
-import { isCancelKey } from '~/utils/shortcuts';
 import { useLocalize } from '~/hooks';
 
 function usePendingToolApproval(conversationId: string) {

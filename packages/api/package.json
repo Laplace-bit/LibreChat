@@ -44,7 +44,7 @@
     "test:integration": "jest --testPathPatterns=\"\\.integration\\.(spec|test)\\.ts$\" --coverage=false --runInBand --forceExit",
     "test:s3-integration": "jest --testPathPatterns=\"src/storage/s3/.*\\.integration\\.spec\\.ts$\" --coverage=false --runInBand",
     "test:agents-integration": "jest --testPathPatterns=\"src/agents/.*\\.integration\\.spec\\.ts$\" --coverage=false --runInBand --forceExit",
-    "test:pi-runtime": "npm run build && node --test src/agents/pi/session.integration.mjs",
+    "test:pi-runtime": "npm run build && node --test src/agents/pi/session.integration.mjs src/agents/pi/concurrency.integration.mjs",
     "verify": "npm run test:ci",
     "b:clean": "bun run rimraf dist",
     "b:build": "bun run b:clean && bun run tsdown && bun run openapi:copy",

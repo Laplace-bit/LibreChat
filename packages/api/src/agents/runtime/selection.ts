@@ -43,7 +43,7 @@ export function findPiAgentInRuntimeGraph(input: {
   );
 }
 
-/** Typed boundary error used while the Pi execution dispatcher is not yet available. */
+/** Typed boundary error for an unsupported or unavailable selected runtime path. */
 export class AgentRuntimeUnavailableError extends Error {
   readonly code = 'AGENT_RUNTIME_UNAVAILABLE';
   readonly status = 503;

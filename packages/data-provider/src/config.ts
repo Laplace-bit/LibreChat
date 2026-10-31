@@ -1679,8 +1679,8 @@ export const agentsEndpointSchema = baseEndpointSchema
   .merge(
     z.object({
       /* agents specific */
-      /** Per-agent Pi canary allowlist. Pi remains unavailable until its execution dispatcher
-       * is wired; selecting an allowlisted agent currently fails closed with HTTP 503. */
+      /** Per-agent Pi canary allowlist. Only the currently supported single-root turn subset
+       * dispatches; unsupported tools and lifecycle modes fail closed. */
       runtime: agentRuntimeRolloutSchema,
       hostFileEdits: hostFileEditLimitsSchema.optional(),
       /** Maximum provider error characters retained in unprotected terminal failures. */

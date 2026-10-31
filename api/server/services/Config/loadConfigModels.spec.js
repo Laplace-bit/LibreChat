@@ -390,6 +390,9 @@ describe('loadConfigModels', () => {
       });
       getAppConfig.mockResolvedValue({
         endpoints: {
+          // Avoid live DNS in this unit test; endpoint URL policy has its own
+          // deterministic coverage in packages/api/src/auth/domain.spec.ts.
+          allowedAddresses: ['api.x.com:443'],
           custom: [
             {
               name: 'UserEndpoint',

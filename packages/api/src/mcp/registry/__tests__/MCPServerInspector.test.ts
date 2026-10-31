@@ -70,7 +70,9 @@ describe('MCPServerInspector', () => {
         method: 'protected-resource-metadata',
       });
 
-      const result = await MCPServerInspector.inspect('test_server', rawConfig, mockConnection);
+      const result = await MCPServerInspector.inspect('test_server', rawConfig, mockConnection, [
+        'api.example.com',
+      ]);
 
       expect(result).toEqual({
         type: 'streamable-http',
@@ -89,7 +91,9 @@ describe('MCPServerInspector', () => {
         headers: { Authorization: 'Bearer {{LIBRECHAT_OPENID_ACCESS_TOKEN}}' },
       } as t.MCPOptions;
 
-      const result = await MCPServerInspector.inspect('test_server', rawConfig, mockConnection);
+      const result = await MCPServerInspector.inspect('test_server', rawConfig, mockConnection, [
+        'api.example.com',
+      ]);
 
       expect(result.requiresOAuth).toBe(false);
       expect(result.oauthMetadata).toBeNull();

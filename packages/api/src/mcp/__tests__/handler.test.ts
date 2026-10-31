@@ -165,6 +165,7 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
           mockUserId,
           { Authorization: header },
           configured ? config : undefined,
+          ['auth.example.com'],
         );
 
         expect(result.flowMetadata.clientInfo?.client_secret).toBe(secret);
@@ -192,6 +193,7 @@ describe('MCPOAuthHandler - Configurable OAuth Metadata', () => {
           mockUserId,
           {},
           configured ? config : undefined,
+          ['auth.example.com'],
         ),
       ).rejects.toBe(error);
       expect(logger.error).toHaveBeenCalledWith('[MCPOAuth] Failed to initiate OAuth flow', {

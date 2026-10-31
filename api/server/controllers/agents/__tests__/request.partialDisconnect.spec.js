@@ -53,6 +53,11 @@ jest.mock('@librechat/api', () => ({
   stampPreliminaryPrivateTextMessage: (_req, message) => message,
   getAgentErrorMetadata: (...args) =>
     jest.requireActual('@librechat/api').getAgentErrorMetadata(...args),
+  AgentRuntimeUnavailableError: jest.requireActual('@librechat/api').AgentRuntimeUnavailableError,
+  assertAgentRuntimeCompatibleGraph: (...args) =>
+    jest.requireActual('@librechat/api').assertAgentRuntimeCompatibleGraph(...args),
+  selectAgentRuntimeForAgent: (...args) =>
+    jest.requireActual('@librechat/api').selectAgentRuntimeForAgent(...args),
   applyForcedTemporaryRequest: jest.fn(),
   resolveResumableRetention: jest.requireActual('@librechat/api').resolveResumableRetention,
   markAbortedCompactionContent: (...args) =>

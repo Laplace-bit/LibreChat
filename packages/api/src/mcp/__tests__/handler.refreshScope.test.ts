@@ -39,6 +39,7 @@ const mockDiscover = discoverAuthorizationServerMetadata as jest.MockedFunction<
 
 describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () => {
   const refreshToken = 'refresh-token-abc';
+  const allowedDomains = ['auth.example.com'];
   const originalFetch = global.fetch;
   const mockFetch = jest.fn() as unknown as jest.MockedFunction<typeof fetch>;
 
@@ -107,7 +108,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
       const text = jest.fn(async () => 'invalid_client invalid_grant invalid_scope not supported');
       responseQueue = [{ status, ok: false, text, body: { cancel } } as unknown as Response];
       await expect(
-        MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}),
+        MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}, allowedDomains),
       ).rejects.toMatchObject({
         name: 'MCPTokenRefreshUnavailableError',
         cause: { message: `Token refresh temporarily unavailable (HTTP ${status})` },
@@ -121,7 +122,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
   it('keeps an outage after the scope fallback retryable', async () => {
     responseQueue = [scopeRejection, new Response('{"error":"invalid_client"}', { status: 503 })];
     await expect(
-      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}),
+      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}, allowedDomains),
     ).rejects.toMatchObject({ name: 'MCPTokenRefreshUnavailableError' });
     expect(sentBodies).toHaveLength(2);
     expect(sentBodies[1]).not.toContain('scope=');
@@ -139,7 +140,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
       } as unknown as Response,
     ];
     await expect(
-      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}),
+      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}, allowedDomains),
     ).rejects.toMatchObject({ name: 'MCPTokenRefreshUnavailableError' });
   });
 
@@ -159,6 +160,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
                 scope: 'read',
               }
             : {},
+          allowedDomains,
         ),
       ).rejects.toMatchObject({ name: 'MCPTokenRefreshUnavailableError' });
       expect(sentBodies).toHaveLength(1);
@@ -168,7 +170,13 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
   it('retries without scope when the server rejects the scope parameter, then succeeds', async () => {
     responseQueue = [scopeRejection, success];
 
-    const result = await MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {});
+    const result = await MCPOAuthHandler.refreshOAuthTokens(
+      refreshToken,
+      metadata,
+      {},
+      {},
+      allowedDomains,
+    );
 
     expect(sentBodies).toHaveLength(2);
     expect(sentBodies[0]).toContain('scope=');
@@ -188,7 +196,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
     ];
 
     await expect(
-      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}),
+      MCPOAuthHandler.refreshOAuthTokens(refreshToken, metadata, {}, {}, allowedDomains),
     ).rejects.toThrow(/invalid_grant|Token refresh failed/);
     expect(sentBodies).toHaveLength(1);
     expect(sentBodies[0]).toContain('scope=');
@@ -198,7 +206,7 @@ describe('MCPOAuthHandler.refreshOAuthTokens — scope parameter fallback', () =
     const noScope = { ...metadata, clientInfo: { client_id: 'client-abc' } };
     responseQueue = [success];
 
-    await MCPOAuthHandler.refreshOAuthTokens(refreshToken, noScope, {}, {});
+    await MCPOAuthHandler.refreshOAuthTokens(refreshToken, noScope, {}, {}, allowedDomains);
 
     expect(sentBodies).toHaveLength(1);
     expect(sentBodies[0]).not.toContain('scope=');

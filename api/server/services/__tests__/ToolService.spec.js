@@ -4505,6 +4505,7 @@ describe('ToolService - Action Capability Gating', () => {
       mockLoadActionSets.mockResolvedValue([actionA, actionB]);
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       await loadAgentTools({
@@ -4525,6 +4526,7 @@ describe('ToolService - Action Capability Gating', () => {
       mockLoadActionSets.mockResolvedValue([actionB, actionA]);
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       await loadAgentTools({
@@ -4541,7 +4543,7 @@ describe('ToolService - Action Capability Gating', () => {
     it('loadToolsForExecution resolves both actions when they share a hostname', async () => {
       mockLoadActionSets.mockResolvedValue([actionA, actionB]);
       const req = createMockReq([AgentCapabilities.actions]);
-      req.config = {};
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
 
       await loadToolsForExecution({
         req,
@@ -4569,7 +4571,7 @@ describe('ToolService - Action Capability Gating', () => {
             model: 'gpt-4o-mini',
             endpoint: 'openAI',
           },
-          config: {},
+          config: { actions: { allowedDomains: [SHARED_DOMAIN] } },
         },
         res: {},
         apiKey: 'sk-test',
@@ -4622,6 +4624,7 @@ describe('ToolService - Action Capability Gating', () => {
       const legacyToolName = `echoMessage${actionDelimiter}${LEGACY_ENCODED_DOMAIN}`;
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       await loadAgentTools({
@@ -4642,6 +4645,7 @@ describe('ToolService - Action Capability Gating', () => {
       const legacyToolName = `echoMessage${actionDelimiter}${LEGACY_ENCODED_DOMAIN}`;
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       mockLoadToolDefinitions.mockImplementationOnce(async (_options, dependencies) => {
@@ -4704,6 +4708,7 @@ describe('ToolService - Action Capability Gating', () => {
       const underscoreTool = `get_foo_bar${actionDelimiter}${ENCODED_DOMAIN}`;
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       await loadAgentTools({
@@ -4739,6 +4744,7 @@ describe('ToolService - Action Capability Gating', () => {
       const rawNameB = `listItems${actionDelimiter}shared---dom`;
       const capabilities = [AgentCapabilities.tools, AgentCapabilities.actions];
       const req = createMockReq(capabilities);
+      req.config.actions = { allowedDomains: [SHARED_DOMAIN] };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
 
       await loadAgentTools({

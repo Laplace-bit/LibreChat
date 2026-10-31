@@ -32,6 +32,22 @@ export default {
   coverageReporters: ['text', 'cobertura'],
   testResultsProcessor: 'jest-junit',
   transform: {
+    '^.+/src/agents/pi/(model|session)\\.ts$': [
+      'babel-jest',
+      {
+        presets: [
+          [
+            '@babel/preset-env',
+            {
+              targets: { node: 'current' },
+              // Preserve Pi's ESM-only lazy imports for Jest's VM module loader.
+              exclude: ['@babel/plugin-transform-dynamic-import'],
+            },
+          ],
+          '@babel/preset-typescript',
+        ],
+      },
+    ],
     '\\.[jt]sx?$': [
       'babel-jest',
       {

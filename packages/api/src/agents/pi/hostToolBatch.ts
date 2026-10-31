@@ -4,8 +4,10 @@ import {
   type ToolExecuteBatchRequest,
   type ToolExecuteResult,
 } from '@librechat/agents';
+import type { PiCodeSessionBridge, PiCodeSessionSnapshot } from './codeSession';
 import type { PiHostToolCall } from './toolExecution';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
+import { isPiCodeExecutionToolName } from './toolNames';
 
 export interface PiHostToolBatchOptions {
   handler?: EventHandler;
@@ -15,6 +17,7 @@ export interface PiHostToolBatchOptions {
   threadId: string;
   runId: string;
   metadata: Record<string, unknown>;
+  codeSessionBridge?: PiCodeSessionBridge;
   onError?: (error: AgentRuntimeUnavailableError) => void;
 }
 
@@ -74,7 +77,10 @@ export function createPiHostToolBatchExecutor(
     run_id: options.runId,
   };
 
-  return (call, signal) => {
+  const executeCall = (
+    hostCall: PiHostToolCall & { codeSessionContext?: PiCodeSessionSnapshot },
+    signal?: AbortSignal,
+  ): Promise<ToolExecuteResult> => {
     if (signal?.aborted === true) {
       return Promise.reject(createAbortError());
     }
@@ -106,7 +112,7 @@ export function createPiHostToolBatchExecutor(
         }
 
         const [result] = results;
-        if (result == null || typeof result !== 'object' || result.toolCallId !== call.id) {
+        if (result == null || typeof result !== 'object' || result.toolCallId !== hostCall.id) {
           fail(new Error('The host tool handler returned a result for a different call.'));
           return;
         }
@@ -138,10 +144,13 @@ export function createPiHostToolBatchExecutor(
         const batch: ToolExecuteBatchRequest = {
           toolCalls: [
             {
-              id: call.id,
-              name: call.name,
-              args: call.args,
-              stepId: call.stepId,
+              id: hostCall.id,
+              name: hostCall.name,
+              args: hostCall.args,
+              stepId: hostCall.stepId,
+              ...(hostCall.codeSessionContext == null
+                ? {}
+                : { codeSessionContext: hostCall.codeSessionContext }),
             },
           ],
           userId: options.userId,
@@ -163,5 +172,15 @@ export function createPiHostToolBatchExecutor(
         fail(error);
       }
     });
+  };
+
+  return (call, signal) => {
+    if (isPiCodeExecutionToolName(call.name) && options.codeSessionBridge == null) {
+      return Promise.reject(reportUnavailable(options.onError));
+    }
+    if (options.codeSessionBridge == null) {
+      return executeCall(call, signal);
+    }
+    return options.codeSessionBridge.execute(call, (hostCall) => executeCall(hostCall, signal));
   };
 }

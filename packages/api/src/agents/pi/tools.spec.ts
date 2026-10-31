@@ -1,5 +1,5 @@
 import { Tools } from 'librechat-data-provider';
-import { CalculatorToolDefinition } from '@librechat/agents';
+import { CalculatorToolDefinition, Constants } from '@librechat/agents';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { LCTool } from '@librechat/agents';
 import {
@@ -7,10 +7,11 @@ import {
   createPiTools,
   executePiToolCall,
   PiToolCompatibilityError,
+  type PiHostToolDefinition,
   type PiHostToolExecutionInput,
   type PiHostToolExecutor,
 } from './tools';
-import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
+import { PI_BASH_TOOL_NAME, PI_CALCULATOR_TOOL_NAME, PI_READ_FILE_TOOL_NAME } from './toolNames';
 
 const fileSearchParameters: NonNullable<LCTool['parameters']> = {
   type: 'object',
@@ -39,6 +40,35 @@ const calculatorDefinition: LCTool = {
   },
 };
 
+const bashDefinition: PiHostToolDefinition = {
+  name: Constants.BASH_TOOL,
+  description: 'Run a command in the managed code sandbox.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string', description: 'Describe the current action.' },
+      command: { type: 'string', description: 'Command to run.' },
+      args: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['command'],
+  },
+};
+
+const readFileDefinition: PiHostToolDefinition = {
+  name: Constants.READ_FILE,
+  description: 'Read a text or image from the managed code sandbox.',
+  parameters: {
+    type: 'object',
+    properties: {
+      intent: { type: 'string', description: 'Describe the current action.' },
+      path: { type: 'string', description: 'Sandbox file path.' },
+      start_line: { type: 'integer', minimum: 1 },
+      max_lines: { type: 'integer', minimum: 1, maximum: 500 },
+    },
+    required: ['path'],
+  },
+};
+
 function successfulResult(): AgentToolResult {
   return {
     content: [{ type: 'text', text: 'Search result' }],
@@ -51,6 +81,82 @@ function hostExecutor(implementation: PiHostToolExecutor = async () => successfu
 }
 
 describe('createPiTools', () => {
+  it('creates strict managed Code API tool schemas and forwards only validated args', async () => {
+    const execute = hostExecutor();
+    const tools = createPiTools({ definitions: [bashDefinition, readFileDefinition], execute });
+    const [bash, readFile] = tools;
+
+    expect(bash).toMatchObject({
+      name: PI_BASH_TOOL_NAME,
+      executionMode: 'sequential',
+      parameters: {
+        additionalProperties: false,
+        required: ['command'],
+        properties: {
+          command: { type: 'string' },
+          args: { type: 'array', items: { type: 'string' } },
+          intent: { type: 'string' },
+        },
+      },
+    });
+    expect(readFile).toMatchObject({
+      name: PI_READ_FILE_TOOL_NAME,
+      parameters: {
+        additionalProperties: false,
+        required: ['path'],
+        properties: {
+          path: { type: 'string' },
+          start_line: { type: 'integer', minimum: 1 },
+          max_lines: { type: 'integer', minimum: 1, maximum: 500 },
+          intent: { type: 'string' },
+        },
+      },
+    });
+
+    await bash.execute('pi-bash-1', {
+      command: 'python script.py',
+      args: ['--mode', 'check'],
+      intent: 'Checking the generated report',
+    });
+    await readFile.execute('pi-read-1', { path: '/mnt/data/report.txt', start_line: 4 });
+
+    expect(execute).toHaveBeenNthCalledWith(
+      1,
+      {
+        toolCallId: 'pi-bash-1',
+        name: PI_BASH_TOOL_NAME,
+        args: {
+          command: 'python script.py',
+          args: ['--mode', 'check'],
+          intent: 'Checking the generated report',
+        },
+      },
+      undefined,
+    );
+    expect(execute).toHaveBeenNthCalledWith(
+      2,
+      {
+        toolCallId: 'pi-read-1',
+        name: PI_READ_FILE_TOOL_NAME,
+        args: { path: '/mnt/data/report.txt', start_line: 4 },
+      },
+      undefined,
+    );
+  });
+
+  it('rejects read_file ranges above the host hard limit before dispatch', async () => {
+    const execute = hostExecutor();
+    const [, readFile] = createPiTools({
+      definitions: [bashDefinition, readFileDefinition],
+      execute,
+    });
+
+    await expect(
+      readFile.execute('pi-read-too-many', { path: 'report.txt', max_lines: 501 }),
+    ).rejects.toThrow(new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID'));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('creates one file_search ToolDefinition with a strict TypeBox query schema', () => {
     const execute = hostExecutor();
 
@@ -183,6 +289,16 @@ describe('convertPiToolSchema', () => {
     });
   });
 
+  it.each([bashDefinition, readFileDefinition])(
+    'converts the reviewed code tool schema for $name',
+    (definition) => {
+      expect(convertPiToolSchema(definition.name, definition.parameters)).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+      });
+    },
+  );
+
   it.each([
     [Tools.file_search, undefined],
     [Tools.file_search, { type: 'array', items: { type: 'string' } }],
@@ -247,6 +363,25 @@ describe('convertPiToolSchema', () => {
 });
 
 describe('executePiToolCall', () => {
+  it('rejects caller-supplied Code API route, session, and credential arguments', async () => {
+    const execute = hostExecutor();
+
+    await expect(
+      executePiToolCall({
+        execute,
+        name: PI_BASH_TOOL_NAME,
+        toolCallId: 'pi-bash-2',
+        arguments: {
+          command: 'echo unsafe',
+          baseUrl: 'https://attacker.example',
+          session_id: 'attacker-session',
+          apiKey: 'secret',
+        },
+      }),
+    ).rejects.toThrow(new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID'));
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('passes only validated file_search arguments and forwards the cancellation signal', async () => {
     const controller = new AbortController();
     const execute = hostExecutor();

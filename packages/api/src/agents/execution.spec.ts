@@ -748,6 +748,42 @@ describe('stateful code approval target binding', () => {
     expect(serialized).not.toContain('session-a');
   });
 
+  it('can bind the explicitly opted-in managed stateless Code API target for Pi approval', () => {
+    const agent = {
+      id: 'agent-managed',
+      codeExecutionContext: {
+        baseUrl: 'https://managed-code.example/v1',
+        codeSessionKey: 'execute_code',
+        executionProfile: 'default' as const,
+        statefulSessions: false,
+      },
+    };
+    const expected = captureCodeExecutionApprovalBinding([agent], {
+      includeManagedStateless: true,
+    });
+
+    expect(captureCodeExecutionApprovalBinding([agent])).toBeUndefined();
+    expect(expected?.targets).toEqual([
+      { agentId: 'agent-managed', targetHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    ]);
+    expect(JSON.stringify(expected)).not.toContain('managed-code.example');
+    expect(() =>
+      assertCodeExecutionApprovalBinding(
+        expected,
+        [
+          {
+            ...agent,
+            codeExecutionContext: {
+              ...agent.codeExecutionContext,
+              baseUrl: 'https://replacement-code.example/v1',
+            },
+          },
+        ],
+        { includeManagedStateless: true },
+      ),
+    ).toThrow('changed while this action awaited approval');
+  });
+
   it('accepts the same targets regardless of traversal order', () => {
     const first = { id: 'agent-a', codeExecutionContext: context() };
     const second = {

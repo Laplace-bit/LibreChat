@@ -53,6 +53,7 @@ const {
   createAgentEventActorDetachedActionLifecycle,
   findAgentEventAppliedAction,
   assertCodeExecutionApprovalBinding,
+  isPiCodeExecutionToolName,
   collectReachableAgents,
   rejectChangedResumeProjectContext,
   PROJECT_CONTEXT_CHANGED_REASON,
@@ -2032,7 +2033,13 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         ...(client.agentConfigs?.values() ?? []),
       ]);
       // Re-resolve the approved code target before provider/tool execution on this replica.
-      assertCodeExecutionApprovalBinding(pendingAction.codeExecutionBinding, reachableAgents);
+      assertCodeExecutionApprovalBinding(
+        pendingAction.codeExecutionBinding,
+        reachableAgents,
+        piContinuation && isPiCodeExecutionToolName(piContinuation.toolName)
+          ? { includeManagedStateless: true }
+          : undefined,
+      );
 
       // Bind the rebuilt client to the in-flight turn's identity (no new user message).
       client.conversationId = streamId;

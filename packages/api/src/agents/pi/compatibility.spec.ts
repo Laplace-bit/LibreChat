@@ -1,5 +1,6 @@
+import { assertPiCompatible, isPiManagedCodeExecutionCompatible } from './compatibility';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { assertPiCompatible } from './compatibility';
+import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 
 describe('assertPiCompatible', () => {
   const supported = {
@@ -18,10 +19,35 @@ describe('assertPiCompatible', () => {
     expect(() =>
       assertPiCompatible({
         ...supported,
-        callableToolNames: ['file_search', 'calculator'],
-        supportedToolNames: ['file_search', 'calculator'],
+        callableToolNames: [...PI_SUPPORTED_HOST_TOOLS],
+        supportedToolNames: [...PI_SUPPORTED_HOST_TOOLS],
       }),
     ).not.toThrow();
+  });
+
+  it('permits only an explicitly configured managed Code API context for Pi code tools', () => {
+    const agent = {
+      codeEnvAvailable: true,
+      statefulCodeSessions: false,
+      codeExecutionContext: {
+        baseUrl: 'https://code.example/v1',
+        codeSessionKey: 'execute_code',
+        executionProfile: 'default',
+        statefulSessions: false,
+      },
+    };
+
+    expect(isPiManagedCodeExecutionCompatible(agent, 'https://code.example/v1/')).toBe(true);
+    expect(isPiManagedCodeExecutionCompatible(agent, undefined)).toBe(false);
+    expect(
+      isPiManagedCodeExecutionCompatible(
+        {
+          ...agent,
+          codeExecutionContext: { ...agent.codeExecutionContext, statefulSessions: true },
+        },
+        'https://code.example/v1',
+      ),
+    ).toBe(false);
   });
 
   it.each([

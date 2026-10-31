@@ -226,7 +226,10 @@ const {
   getAgentRuntimeUserFacingError,
   resolveStoredAgentRuntime,
   assertPiCompatible,
+  isPiManagedCodeExecutionCompatible,
+  isPiCodeExecutionToolName,
   PI_SUPPORTED_HOST_TOOLS,
+  createPiCodeSessionBridge,
   createPiToolApprovalGate,
   createPiHostToolBatchExecutor,
   settlePiHostToolResult,
@@ -4638,6 +4641,14 @@ class AgentClient extends BaseClient {
     });
     const request = this.options.req;
     const appConfig = request?.config;
+    const codeExecutionBinding = isPiCodeExecutionToolName(toolCall.name)
+      ? captureCodeExecutionApprovalBinding([this.options.agent], {
+          includeManagedStateless: true,
+        })
+      : undefined;
+    if (isPiCodeExecutionToolName(toolCall.name) && codeExecutionBinding == null) {
+      throw new AgentRuntimeUnavailableError();
+    }
     const checkpointerCfg = appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
     const resumeContext = pickResumeContext(request?.body, request?.reasoningOverrideBase);
     const resumeModelParameters = captureResumeModelParameters(
@@ -4661,6 +4672,7 @@ class AgentClient extends BaseClient {
       requestFingerprint: computeLegacyAgentRequestFingerprint(request?.body ?? {}),
       requestFingerprintV2: computeAgentRequestFingerprint(request?.body ?? {}),
       resumeContext,
+      ...(codeExecutionBinding == null ? {} : { codeExecutionBinding }),
       toolApprovalAliases: [],
     });
     const piResumeContinuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
@@ -5109,6 +5121,7 @@ class AgentClient extends BaseClient {
         }
         let piModelBindingFactory;
         let piToolDefinitions = [];
+        let piCodeSessionBridge;
         if (isPiRuntime) {
           const unsupportedModes = [];
           if (
@@ -5165,6 +5178,12 @@ class AgentClient extends BaseClient {
               PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) &&
               callableToolNames.includes(definition.name),
           );
+          const piHasCodeExecutionTools = piToolDefinitions.some((definition) =>
+            isPiCodeExecutionToolName(definition.name),
+          );
+          if (piHasCodeExecutionTools && !isPiManagedCodeExecutionCompatible(this.options.agent)) {
+            unsupportedModes.push('code_api_environment');
+          }
           assertPiCompatible({
             rootAgentId: this.options.agent?.id,
             loadedAgentIds: agents.map((agent) => agent?.id),
@@ -5175,6 +5194,10 @@ class AgentClient extends BaseClient {
           piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
           if (piModelBindingFactory == null) {
             throw new AgentRuntimeUnavailableError();
+          }
+          if (piHasCodeExecutionTools) {
+            const codeSessionKey = this.options.agent.codeSessionKey ?? Constants.EXECUTE_CODE;
+            piCodeSessionBridge = createPiCodeSessionBridge(initialSessions?.get(codeSessionKey));
           }
         }
         const initialModelBoundAdmission = isPiRuntime
@@ -5351,6 +5374,9 @@ class AgentClient extends BaseClient {
                   threadId: this.conversationId,
                   runId: this.responseMessageId,
                   metadata: piMetadata,
+                  ...(piCodeSessionBridge == null
+                    ? {}
+                    : { codeSessionBridge: piCodeSessionBridge }),
                   onError: (error) =>
                     logger.error(
                       '[AgentClient] Pi host tool execution failed',
@@ -5381,6 +5407,9 @@ class AgentClient extends BaseClient {
             createModelBinding: piModelBindingFactory,
             toolDefinitions: piToolDefinitions,
             executeHostToolCall: executePiHostToolCall,
+            ...(piCodeSessionBridge == null
+              ? {}
+              : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
             toolExecutionGate: piToolExecutionGate,
             createToolStepIdentity: createPiStepIdentity,
             createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
@@ -5893,6 +5922,9 @@ class AgentClient extends BaseClient {
           PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) &&
           callableToolNames.includes(definition.name),
       );
+      const piHasCodeExecutionTools = piToolDefinitions.some((definition) =>
+        isPiCodeExecutionToolName(definition.name),
+      );
       const unsupportedModes = [];
       if (
         this.eventActorContinuation != null ||
@@ -5924,6 +5956,9 @@ class AgentClient extends BaseClient {
       if (collectAttachedCodeEnvironmentAgentIds(agents).size > 0) {
         unsupportedModes.push('code_api_environment');
       }
+      if (piHasCodeExecutionTools && !isPiManagedCodeExecutionCompatible(this.options.agent)) {
+        unsupportedModes.push('code_api_environment');
+      }
       assertPiCompatible({
         rootAgentId: this.options.agent?.id,
         loadedAgentIds: agents.map((agent) => agent?.id),
@@ -5936,6 +5971,9 @@ class AgentClient extends BaseClient {
       ) {
         throw new AgentRuntimeUnavailableError();
       }
+      const piCodeSessionBridge = isPiCodeExecutionToolName(piApprovalContinuation.toolName)
+        ? createPiCodeSessionBridge(piApprovalContinuation.codeSessionContext)
+        : undefined;
 
       const messageFormatOptions = {
         ...(anyAgentReplaysReasoningContent(agents) ? { preserveReasoningContent: true } : {}),
@@ -6047,6 +6085,7 @@ class AgentClient extends BaseClient {
               threadId: this.conversationId,
               runId: this.responseMessageId,
               metadata: piMetadata,
+              ...(piCodeSessionBridge == null ? {} : { codeSessionBridge: piCodeSessionBridge }),
               onError: (error) =>
                 logger.error(
                   '[AgentClient] Pi resumed host tool execution failed',
@@ -6154,6 +6193,9 @@ class AgentClient extends BaseClient {
         createModelBinding,
         toolDefinitions: piToolDefinitions,
         executeHostToolCall: executePiHostToolCall,
+        ...(piCodeSessionBridge == null
+          ? {}
+          : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
         toolExecutionGate: piToolExecutionGate,
         createToolStepIdentity: createPiStepIdentity,
         createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,

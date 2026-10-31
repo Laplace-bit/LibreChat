@@ -1,3 +1,4 @@
+import { Constants } from '@librechat/agents';
 import { Tools } from 'librechat-data-provider';
 import type { Agents } from 'librechat-data-provider';
 import type { PiPauseToolCall } from './pause';
@@ -87,6 +88,82 @@ function hostState(args: Record<string, unknown> = { query: 'maintenance manual'
 }
 
 describe('Pi approval continuation', () => {
+  it('persists the managed Code API session snapshot and requires an approval target binding', () => {
+    const toolCall: PiPauseToolCall = {
+      toolCallId: 'pi-code-call',
+      name: Constants.BASH_TOOL,
+      args: { command: 'python report.py' },
+      codeSessionContext: {
+        session_id: 'exec-session',
+        files: [
+          {
+            id: 'upload-1',
+            resource_id: 'user-1',
+            name: 'input.csv',
+            storage_session_id: 'storage-1',
+            kind: 'user',
+          },
+        ],
+      },
+      hostExecution: {
+        toolCallId: 'host-code-call',
+        toolTurn: 0,
+        stepIdentity: {
+          id: 'code-step',
+          index: 0,
+          messageId: 'response-1',
+          runId: 'response-1',
+          agentId: 'agent-1',
+        },
+        createdAt: 101,
+      },
+      review: { allowedDecisions: ['approve', 'reject'] },
+    };
+    const payload = buildPiApprovalInterruptPayload({
+      hostToolCallId: toolCall.hostExecution.toolCallId,
+      toolName: toolCall.name,
+      args: toolCall.args,
+      allowedDecisions: toolCall.review.allowedDecisions,
+    });
+    const binding = {
+      version: 1 as const,
+      targets: [{ agentId: 'agent-1', targetHash: 'a'.repeat(64) }],
+    };
+    const pendingAction = buildPendingAction(payload, {
+      streamId: 'conversation-1',
+      conversationId: 'conversation-1',
+      runId: 'response-1',
+      responseMessageId: 'response-1',
+      codeExecutionBinding: binding,
+    });
+    const continuation = createPiApprovalContinuation(pendingAction.actionId, toolCall);
+
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toEqual(continuation);
+    expect(
+      resolvePiApprovalContinuation({
+        value: continuation,
+        pendingAction: { ...pendingAction, codeExecutionBinding: undefined },
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+    expect(
+      resolvePiApprovalContinuation({
+        value: { ...continuation, codeSessionContext: { session_id: 'exec-session', files: [{}] } },
+        pendingAction,
+        responseMessageId: 'response-1',
+        agentId: 'agent-1',
+      }),
+    ).toBeUndefined();
+  });
+
   it('validates the server envelope against the exact pending action and generation', () => {
     const { continuation, pendingAction } = createApproval();
 

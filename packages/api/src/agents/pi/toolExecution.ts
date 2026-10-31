@@ -1,17 +1,26 @@
 import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import { GraphEvents, type ToolExecuteResult } from '@librechat/agents';
+import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
 import type { Agents } from 'librechat-data-provider';
 import type {
+  PiBashArguments,
   PiCalculatorArguments,
   PiFileSearchArguments,
   PiHostToolExecutionInput,
+  PiReadFileArguments,
   PiToolArguments,
 } from './tools';
 import type { PiPauseController, PiPauseSignal, PiPauseToolCall } from './pause';
+import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
 import type { PiHostEvent } from './events';
+import {
+  isPiCodeExecutionToolName,
+  PI_BASH_TOOL_NAME,
+  PI_CALCULATOR_TOOL_NAME,
+  PI_READ_FILE_TOOL_NAME,
+} from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
-import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 
 export type PiToolExecutionInput = PiHostToolExecutionInput;
 
@@ -39,6 +48,7 @@ export type PiHostToolCall =
       args: PiFileSearchArguments;
       stepId: string;
       turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
     }
   | {
       id: string;
@@ -46,12 +56,30 @@ export type PiHostToolCall =
       args: PiCalculatorArguments;
       stepId: string;
       turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      id: string;
+      name: typeof PI_BASH_TOOL_NAME;
+      args: PiBashArguments;
+      stepId: string;
+      turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
+    }
+  | {
+      id: string;
+      name: typeof PI_READ_FILE_TOOL_NAME;
+      args: PiReadFileArguments;
+      stepId: string;
+      turn?: number;
+      codeSessionContext?: PiCodeSessionSnapshot;
     };
 
 export interface PiToolExecutionOptions {
   createStepIdentity(): PiMessageStepIdentity;
   createToolCallId(): string;
   executeHostToolCall(call: PiHostToolCall, signal?: AbortSignal): Promise<ToolExecuteResult>;
+  getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   pauseGate?: {
     controller: PiPauseController;
@@ -87,6 +115,81 @@ function hostContentToText(content: ToolExecuteResult['content']): string | unde
   return fragments.join('\n');
 }
 
+type PiToolResultContent =
+  | { type: 'text'; text: string }
+  | { type: 'image'; data: string; mimeType: string };
+
+const MAX_PI_TOOL_IMAGE_BYTES = 10 * 1024 * 1024;
+
+function isCompletePiImage(mimeType: string, bytes: Buffer): boolean {
+  if (mimeType === 'image/png') {
+    return (
+      bytes.length >= 8 &&
+      bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+    );
+  }
+  if (mimeType === 'image/jpeg') {
+    return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+  }
+  if (mimeType === 'image/gif') {
+    return (
+      bytes.length >= 6 &&
+      (bytes.toString('ascii', 0, 6) === 'GIF87a' || bytes.toString('ascii', 0, 6) === 'GIF89a')
+    );
+  }
+  if (mimeType === 'image/webp') {
+    return (
+      bytes.length >= 12 &&
+      bytes.toString('ascii', 0, 4) === 'RIFF' &&
+      bytes.toString('ascii', 8, 12) === 'WEBP'
+    );
+  }
+  return false;
+}
+
+function hostArtifactToPiImages(
+  artifact: unknown,
+):
+  | { images: Array<Extract<PiToolResultContent, { type: 'image' }>>; invalid: false }
+  | { images: []; invalid: true } {
+  if (!isRecord(artifact) || !Array.isArray(artifact.content)) {
+    return { images: [], invalid: false };
+  }
+  const imageParts = artifact.content.filter((part) => isRecord(part) && part.type === 'image_url');
+  if (imageParts.length === 0) {
+    return { images: [], invalid: false };
+  }
+  const images: Array<Extract<PiToolResultContent, { type: 'image' }>> = [];
+  let totalBytes = 0;
+  for (const part of imageParts) {
+    if (!isRecord(part) || !isRecord(part.image_url) || typeof part.image_url.url !== 'string') {
+      return { images: [], invalid: true };
+    }
+    const match = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/]+={0,2})$/.exec(
+      part.image_url.url,
+    );
+    if (!match || match[2].length > 4 * Math.ceil(MAX_PI_TOOL_IMAGE_BYTES / 3)) {
+      return { images: [], invalid: true };
+    }
+    const [, mimeType, data] = match;
+    const bytes = Buffer.from(data, 'base64');
+    if (
+      bytes.length === 0 ||
+      bytes.length > MAX_PI_TOOL_IMAGE_BYTES ||
+      bytes.toString('base64') !== data ||
+      !isCompletePiImage(mimeType, bytes)
+    ) {
+      return { images: [], invalid: true };
+    }
+    totalBytes += bytes.length;
+    if (totalBytes > MAX_PI_TOOL_IMAGE_BYTES) {
+      return { images: [], invalid: true };
+    }
+    images.push({ type: 'image', data, mimeType });
+  }
+  return { images, invalid: false };
+}
+
 function abortError(): Error {
   const error = new Error('Pi tool execution was aborted');
   error.name = 'AbortError';
@@ -97,6 +200,7 @@ function toPauseToolCall(
   input: PiToolExecutionInput,
   hostExecution: PiPauseToolCall['hostExecution'],
   review: PiPauseToolCall['review'],
+  codeSessionContext?: PiCodeSessionSnapshot,
 ): PiPauseToolCall {
   switch (input.name) {
     case Tools.file_search:
@@ -112,6 +216,24 @@ function toPauseToolCall(
         toolCallId: input.toolCallId,
         name: input.name,
         args: { input: input.args.input },
+        hostExecution,
+        review,
+      };
+    case PI_BASH_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_BASH_TOOL_NAME,
+        args: input.args,
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
+        hostExecution,
+        review,
+      };
+    case PI_READ_FILE_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_READ_FILE_TOOL_NAME,
+        args: input.args,
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
         hostExecution,
         review,
       };
@@ -132,6 +254,22 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
       return {
         id,
         name: PI_CALCULATOR_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_BASH_TOOL_NAME:
+      return {
+        id,
+        name: PI_BASH_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_READ_FILE_TOOL_NAME:
+      return {
+        id,
+        name: PI_READ_FILE_TOOL_NAME,
         args: input.args,
         stepId,
         turn: input.turn,
@@ -275,15 +413,24 @@ export async function settlePiHostToolResult(options: {
   now?: () => number;
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
 }): Promise<{
-  content: Array<{ type: 'text'; text: string }>;
+  content: PiToolResultContent[];
   details: { status: Exclude<HostToolStatus, 'cancelled'> };
   isError?: boolean;
 }> {
   const now = options.now ?? Date.now;
   const hostText = hostContentToText(options.hostResult.content);
+  const imageProjection = hostArtifactToPiImages(options.hostResult.artifact);
   const status: Exclude<HostToolStatus, 'cancelled'> =
-    options.hostResult.status === 'success' && hostText != null ? 'success' : 'error';
-  const output = hostText ?? 'The host tool returned an unsupported result format.';
+    options.hostResult.status === 'success' &&
+    !imageProjection.invalid &&
+    (hostText != null || imageProjection.images.length > 0)
+      ? 'success'
+      : 'error';
+  const output =
+    hostText ??
+    (imageProjection.images.length > 0
+      ? 'The requested image was read from the authorized host.'
+      : 'The host tool returned an unsupported result format.');
   await settlePiHostToolStep({
     ...options,
     output,
@@ -295,7 +442,10 @@ export async function settlePiHostToolResult(options: {
       ? output
       : 'The tool could not complete this request.';
   return {
-    content: [{ type: 'text', text: modelText }],
+    content: [
+      { type: 'text', text: modelText },
+      ...(status === 'success' ? imageProjection.images : []),
+    ],
     details: { status },
     ...(status === 'error' ? { isError: true } : {}),
   };
@@ -356,15 +506,12 @@ async function startPiToolStep(
  * LibreChat run-step lifecycle around it. Tool authorization, execution,
  * output filtering, and artifact persistence remain owned by the host handler.
  */
-export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
+export function createPiHostToolExecutor(
+  options: PiToolExecutionOptions,
+): (
   input: PiToolExecutionInput,
   signal?: AbortSignal,
-) => Promise<{
-  content: Array<{ type: 'text'; text: string }>;
-  details: { status: HostToolStatus | 'paused' | 'unsupported_batch' };
-  isError?: boolean;
-  terminate?: boolean;
-}> {
+) => Promise<AgentToolResult<{ status: HostToolStatus | 'paused' | 'unsupported_batch' }>> {
   const now = options.now ?? Date.now;
   let nextTurn = 0;
   const seenPiToolCallIds = new Set<string>();
@@ -470,6 +617,9 @@ export function createPiHostToolExecutor(options: PiToolExecutionOptions): (
                   allowedDecisions: decision.allowedDecisions,
                   ...(decision.description == null ? {} : { description: decision.description }),
                 },
+                isPiCodeExecutionToolName(executionInput.name)
+                  ? options.getCodeSessionContext?.()
+                  : undefined,
               ),
             ),
           );

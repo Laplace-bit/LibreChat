@@ -7,6 +7,7 @@ import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
+import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiApprovalContinuation } from './resume';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
@@ -44,6 +45,8 @@ export interface PiGenerationDispatchInput {
   toolDefinitions?: readonly LCTool[];
   /** Executes a tool through the existing host handler. */
   executeHostToolCall?: (call: PiHostToolCall, signal?: AbortSignal) => Promise<ToolExecuteResult>;
+  /** Server-owned context persisted if a Code API tool waits for approval. */
+  getCodeSessionContext?(): PiCodeSessionSnapshot | undefined;
   /** Optional internal gate. Production request wiring does not supply this yet. */
   toolExecutionGate?: PiToolExecutionGate;
   /** Host-generated identities for LibreChat tool call steps. */
@@ -107,6 +110,9 @@ export function createPiGenerationDispatcher(
           createStepIdentity: input.createToolStepIdentity,
           createToolCallId: input.createToolCallId,
           executeHostToolCall: input.executeHostToolCall,
+          ...(input.getCodeSessionContext == null
+            ? {}
+            : { getCodeSessionContext: input.getCodeSessionContext }),
           handleHostEvent: eventSequencer.enqueue,
           ...(input.toolExecutionGate == null
             ? {}

@@ -112,13 +112,10 @@ function hashCodeExecutionTarget(agentId: string | null, context: CodeExecutionC
 const CODE_EXECUTION_TARGET_HASH = /^[a-f0-9]{64}$/;
 const MAX_CODE_EXECUTION_APPROVAL_TARGETS = 128;
 
-/**
- * Captures an opaque identity for every stateful code target reachable by a
- * paused run. Raw base URLs, worker IDs and session hints never enter the
- * pending-action client projection.
- */
+/** Captures opaque identities for code targets reachable by a paused run. */
 export function captureCodeExecutionApprovalBinding(
   agents: readonly (CodeExecutionApprovalAgent | null | undefined)[],
+  options: { includeManagedStateless?: boolean } = {},
 ): Agents.CodeExecutionApprovalBinding | undefined {
   const targetsByIdentity = new Map<string, Agents.CodeExecutionApprovalTargetBinding>();
   const addTarget = (target: Agents.CodeExecutionApprovalTargetBinding): void => {
@@ -127,7 +124,16 @@ export function captureCodeExecutionApprovalBinding(
   for (const agent of agents) {
     const agentId = agent?.id ?? null;
     const routeHashes = [agent?.codeExecutionContext, ...(agent?.codeExecutionChoices ?? [])]
-      .filter((context): context is CodeExecutionContext => context?.statefulSessions === true)
+      .filter(
+        (context): context is CodeExecutionContext =>
+          context?.statefulSessions === true ||
+          (options.includeManagedStateless === true &&
+            context?.statefulSessions === false &&
+            context.executionProfile === 'default' &&
+            context.codeWorkspace == null &&
+            context.environmentId == null &&
+            context.environmentType == null),
+      )
       .map((context) => hashCodeExecutionTarget(agentId, context));
     if (routeHashes.length === 0) {
       continue;
@@ -219,11 +225,12 @@ export class CodeExecutionApprovalTargetChangedError extends Error {
 export function assertCodeExecutionApprovalBinding(
   expected: unknown,
   agents: readonly (CodeExecutionApprovalAgent | null | undefined)[],
+  options: { includeManagedStateless?: boolean } = {},
 ): void {
   if (expected == null) {
     return;
   }
-  const current = captureCodeExecutionApprovalBinding(agents);
+  const current = captureCodeExecutionApprovalBinding(agents, options);
   if (
     !isCodeExecutionApprovalBinding(expected) ||
     current == null ||

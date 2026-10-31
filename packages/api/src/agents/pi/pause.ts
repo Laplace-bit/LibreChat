@@ -1,7 +1,10 @@
 import type { Agents } from 'librechat-data-provider';
 import type { PiProviderEventFailure } from './providerEvents';
+import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiHostToolExecutionInput } from './tools';
 import type { PiMessageStepIdentity } from './events';
+import { parsePiCodeSessionSnapshot } from './codeSession';
+import { isPiCodeExecutionToolName } from './toolNames';
 import { validatePiToolExecutionInput } from './tools';
 
 /** Host identity required to settle the in-progress step after an approval resume. */
@@ -19,6 +22,7 @@ export interface PiPauseReview {
 
 /** Exact, schema-validated call and host step stopped before any tool side effect. */
 export type PiPauseToolCall = PiHostToolExecutionInput & {
+  codeSessionContext?: PiCodeSessionSnapshot;
   hostExecution: PiPauseHostExecution;
   review: PiPauseReview;
 };
@@ -66,7 +70,14 @@ export function createPiPauseController(): PiPauseController {
         toolCall.toolCallId,
         toolCall.args,
       );
+      let codeSessionContext: PiCodeSessionSnapshot | undefined;
+      try {
+        codeSessionContext = parsePiCodeSessionSnapshot(toolCall.codeSessionContext);
+      } catch {
+        throw new Error('Pi approval continuation code session is invalid');
+      }
       if (
+        (!isPiCodeExecutionToolName(toolCall.name) && codeSessionContext != null) ||
         toolCall.hostExecution.toolCallId.length === 0 ||
         !Number.isSafeInteger(toolCall.hostExecution.toolTurn) ||
         toolCall.hostExecution.toolTurn < 0 ||
@@ -98,6 +109,7 @@ export function createPiPauseController(): PiPauseController {
           JSON.stringify(previousCall.hostExecution.stepIdentity) !==
             JSON.stringify(toolCall.hostExecution.stepIdentity) ||
           previousCall.hostExecution.createdAt !== toolCall.hostExecution.createdAt ||
+          JSON.stringify(previousCall.codeSessionContext) !== JSON.stringify(codeSessionContext) ||
           JSON.stringify(previousCall.review) !== JSON.stringify(toolCall.review)
         ) {
           throw new Error('A Pi tool call ID cannot refer to two different host actions');
@@ -108,6 +120,7 @@ export function createPiPauseController(): PiPauseController {
 
       const nextCall: PiPauseToolCall = {
         ...validatedCall,
+        ...(codeSessionContext == null ? {} : { codeSessionContext }),
         hostExecution: {
           ...toolCall.hostExecution,
           stepIdentity: { ...toolCall.hostExecution.stepIdentity },

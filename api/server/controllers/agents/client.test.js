@@ -10267,6 +10267,33 @@ describe('AgentClient - Pi generation dispatch', () => {
       required: ['input'],
     },
   };
+  const bashDefinition = {
+    name: 'bash_tool',
+    description: 'Run a command in the managed Code API environment.',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string' },
+        args: { type: 'array', items: { type: 'string' } },
+        intent: { type: 'string' },
+      },
+      required: ['command'],
+    },
+  };
+  const readFileDefinition = {
+    name: 'read_file',
+    description: 'Read a file in the managed Code API environment.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string' },
+        start_line: { type: 'integer', minimum: 1 },
+        max_lines: { type: 'integer', minimum: 1, maximum: 500 },
+        intent: { type: 'string' },
+      },
+      required: ['path'],
+    },
+  };
   const createPiFileSearchClient = ({
     toolApproval,
     agentOverrides = {},
@@ -10644,6 +10671,137 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
       calculatorDefinition,
     ]);
+  });
+
+  it('routes managed Code API calls through the host and folds session artifacts per run', async () => {
+    const codeBaseUrl = 'https://code.example/v1';
+    const bashToolName = 'bash_tool';
+    const readFileToolName = 'read_file';
+    const previousCodeBaseUrl = process.env.LIBRECHAT_CODE_BASEURL;
+    process.env.LIBRECHAT_CODE_BASEURL = codeBaseUrl;
+    try {
+      const inputFile = {
+        id: 'input-file',
+        resource_id: 'user-pi',
+        name: 'input.txt',
+        storage_session_id: 'storage-input',
+        kind: 'user',
+      };
+      const calls = [];
+      const toolExecuteHandler = {
+        handle: jest.fn((_event, batch) => {
+          const [toolCall] = batch.toolCalls;
+          calls.push(toolCall);
+          batch.resolve([
+            {
+              toolCallId: toolCall.id,
+              status: 'success',
+              content: toolCall.name === bashToolName ? 'Command completed.' : 'Report data.',
+              ...(toolCall.name === bashToolName
+                ? {
+                    artifact: {
+                      session_id: 'execution-after-bash',
+                      files: [
+                        {
+                          id: 'output-file',
+                          resource_id: 'user-pi',
+                          name: 'report.txt',
+                          storage_session_id: 'storage-output',
+                          kind: 'user',
+                        },
+                      ],
+                    },
+                  }
+                : {}),
+            },
+          ]);
+        }),
+      };
+      const client = createPiClient({
+        req: {
+          user: { id: 'user-pi' },
+          body: {},
+          config: { endpoints: { [EModelEndpoint.agents]: {} } },
+        },
+        agent: {
+          codeEnvAvailable: true,
+          codeSessionKey: 'execute_code',
+          codeExecutionContext: {
+            baseUrl: codeBaseUrl,
+            codeSessionKey: 'execute_code',
+            executionProfile: 'default',
+            statefulSessions: false,
+          },
+          primedCodeFiles: [inputFile],
+          tools: [{ name: bashToolName }, { name: readFileToolName }],
+          toolDefinitions: [bashDefinition, readFileDefinition],
+        },
+        eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+      });
+      mockExecutePiGeneration.mockImplementation(async ({ executeHostToolCall }) => {
+        const signal = new AbortController().signal;
+        await Promise.all([
+          executeHostToolCall(
+            {
+              id: 'pi-bash-call',
+              name: bashToolName,
+              args: { command: 'python report.py' },
+              stepId: 'pi-bash-step',
+            },
+            signal,
+          ),
+          executeHostToolCall(
+            {
+              id: 'pi-read-file-call',
+              name: readFileToolName,
+              args: { path: 'report.txt' },
+              stepId: 'pi-read-file-step',
+            },
+            signal,
+          ),
+        ]);
+        return { status: 'completed', usage: [] };
+      });
+
+      await client.chatCompletion({ payload: [] });
+
+      expect(calls).toEqual([
+        expect.objectContaining({
+          name: bashToolName,
+          codeSessionContext: {
+            session_id: 'storage-input',
+            files: [inputFile],
+          },
+        }),
+        expect.objectContaining({
+          name: readFileToolName,
+          codeSessionContext: {
+            session_id: 'execution-after-bash',
+            files: [
+              inputFile,
+              {
+                id: 'output-file',
+                resource_id: 'user-pi',
+                name: 'report.txt',
+                storage_session_id: 'storage-output',
+                kind: 'user',
+              },
+            ],
+          },
+        }),
+      ]);
+      expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(2);
+      expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
+        bashDefinition,
+        readFileDefinition,
+      ]);
+    } finally {
+      if (previousCodeBaseUrl === undefined) {
+        delete process.env.LIBRECHAT_CODE_BASEURL;
+      } else {
+        process.env.LIBRECHAT_CODE_BASEURL = previousCodeBaseUrl;
+      }
+    }
   });
 
   it('keeps Pi context overflow actionable when model-bound content protection is enabled', async () => {

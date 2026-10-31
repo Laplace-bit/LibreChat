@@ -1,11 +1,12 @@
-import { Tools } from 'librechat-data-provider';
 import type { AssistantMessage, ToolResultMessage } from '@earendil-works/pi-ai';
 import type { Agents } from 'librechat-data-provider';
+import type { PiHostToolExecutionInput, PiToolArguments } from './tools';
 import type { PiHistoryConversion, PiHistoryMessage } from './history';
+import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMessageStepIdentity } from './events';
 import type { PiPauseToolCall } from './pause';
-import type { PiToolArguments } from './tools';
-import { PI_CALCULATOR_TOOL_NAME, isPiSupportedHostToolName } from './toolNames';
+import { isPiCodeExecutionToolName, isPiSupportedHostToolName } from './toolNames';
+import { parsePiCodeSessionSnapshot } from './codeSession';
 import { validatePiToolExecutionInput } from './tools';
 
 export const PI_RESUME_CONTINUATION_VERSION = 1 as const;
@@ -22,10 +23,11 @@ export interface PiApprovalContinuation {
   readonly piToolCallId: string;
   readonly hostToolCallId: string;
   readonly toolTurn: number;
-  readonly toolName: typeof Tools.file_search | typeof PI_CALCULATOR_TOOL_NAME;
+  readonly toolName: PiHostToolExecutionInput['name'];
   readonly args: PiToolArguments;
   readonly allowedDecisions: readonly Agents.ToolApprovalDecisionType[];
   readonly description?: string;
+  readonly codeSessionContext?: PiCodeSessionSnapshot;
   readonly stepIdentity: PiMessageStepIdentity;
   readonly stepCreatedAt: number;
 }
@@ -131,6 +133,7 @@ export function createPiApprovalContinuation(
   if (actionId.length === 0) {
     throw new Error('Pi continuation requires a pending action identity');
   }
+  const codeSessionContext = parsePiCodeSessionSnapshot(toolCall.codeSessionContext);
   return {
     version: PI_RESUME_CONTINUATION_VERSION,
     actionId,
@@ -141,6 +144,7 @@ export function createPiApprovalContinuation(
     args: toolCall.args,
     allowedDecisions: [...toolCall.review.allowedDecisions],
     ...(toolCall.review.description == null ? {} : { description: toolCall.review.description }),
+    ...(codeSessionContext == null ? {} : { codeSessionContext }),
     stepIdentity: { ...toolCall.hostExecution.stepIdentity },
     stepCreatedAt: toolCall.hostExecution.createdAt,
   };
@@ -171,6 +175,9 @@ export function resolvePiApprovalContinuation(input: {
       'allowedDecisions',
       'stepIdentity',
       'stepCreatedAt',
+      ...(Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')
+        ? ['codeSessionContext']
+        : []),
       ...(Object.prototype.hasOwnProperty.call(value, 'description') ? ['description'] : []),
     ]) ||
     typeof value.actionId !== 'string' ||
@@ -185,6 +192,7 @@ export function resolvePiApprovalContinuation(input: {
     value.toolTurn < 0 ||
     typeof value.toolName !== 'string' ||
     !isPiSupportedHostToolName(value.toolName) ||
+    (isPiCodeExecutionToolName(value.toolName) && pendingAction.codeExecutionBinding == null) ||
     !Array.isArray(value.allowedDecisions) ||
     value.allowedDecisions.length === 0 ||
     !value.allowedDecisions.every(isDecision) ||
@@ -202,9 +210,16 @@ export function resolvePiApprovalContinuation(input: {
 
   let validatedCall;
   let stepIdentity;
+  let codeSessionContext: PiCodeSessionSnapshot | undefined;
   try {
     validatedCall = validatePiToolExecutionInput(value.toolName, value.piToolCallId, value.args);
     stepIdentity = parseStepIdentity(value.stepIdentity);
+    if (Object.prototype.hasOwnProperty.call(value, 'codeSessionContext')) {
+      codeSessionContext = parsePiCodeSessionSnapshot(value.codeSessionContext);
+      if (codeSessionContext == null || !isPiCodeExecutionToolName(value.toolName)) {
+        return undefined;
+      }
+    }
   } catch {
     return undefined;
   }
@@ -256,6 +271,7 @@ export function resolvePiApprovalContinuation(input: {
     args: validatedCall.args,
     allowedDecisions,
     ...(value.description == null ? {} : { description: value.description }),
+    ...(codeSessionContext == null ? {} : { codeSessionContext }),
     stepIdentity,
     stepCreatedAt: value.stepCreatedAt,
   };

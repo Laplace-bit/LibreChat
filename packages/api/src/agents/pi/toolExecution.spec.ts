@@ -1,5 +1,6 @@
 import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import {
+  Constants,
   GraphEvents,
   type EventHandler,
   type ToolExecuteBatchRequest,
@@ -7,9 +8,11 @@ import {
 } from '@librechat/agents';
 import type { LCTool } from '@librechat/agents';
 import type { PiToolExecutionGate } from './toolExecution';
+import type { PiCodeSessionBridge } from './codeSession';
 import type { PiHostEvent } from './events';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiHostToolExecutor } from './toolExecution';
+import { createPiCodeSessionBridge } from './codeSession';
 import { PI_CALCULATOR_TOOL_NAME } from './toolNames';
 import { createPiHostEventSequencer } from './bridge';
 import { createPiPauseController } from './pause';
@@ -32,6 +35,16 @@ const calculatorDefinition: LCTool = {
     type: 'object',
     properties: { input: { type: 'string' } },
     required: ['input'],
+  },
+};
+
+const readFileDefinition: LCTool = {
+  name: Constants.READ_FILE,
+  description: 'Read a sandbox file.',
+  parameters: {
+    type: 'object',
+    properties: { path: { type: 'string' } },
+    required: ['path'],
   },
 };
 
@@ -74,6 +87,7 @@ function createHarness(
   result: ToolExecuteResult,
   evaluateTool?: PiToolExecutionGate,
   definition: LCTool = fileSearchDefinition,
+  codeSessionBridge?: PiCodeSessionBridge,
 ) {
   const events: PiHostEvent[] = [];
   const batches: ToolExecuteBatchRequest[] = [];
@@ -89,6 +103,7 @@ function createHarness(
     threadId: 'thread-1',
     runId: 'run-1',
     metadata: {},
+    ...(codeSessionBridge == null ? {} : { codeSessionBridge }),
   });
   const executePiTool = createPiHostToolExecutor({
     createStepIdentity: () => ({
@@ -204,6 +219,47 @@ describe('createPiHostToolExecutor', () => {
       event: GraphEvents.ON_RUN_STEP_CLOSED,
       data: { id: 'pi-step-1', status: 'completed' },
     });
+  });
+
+  it('projects a host-validated image artifact to Pi without storing base64 in the host step', async () => {
+    const png =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/v1sAAAAASUVORK5CYII=';
+    const hostResult: ToolExecuteResult = {
+      toolCallId: 'host-call-1',
+      status: 'success',
+      content: 'Image: /mnt/data/chart.png (68 bytes, image/png)',
+      artifact: {
+        content: [{ type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } }],
+      },
+    };
+    const { events, eventSequencer, tool } = createHarness(
+      hostResult,
+      undefined,
+      readFileDefinition,
+      createPiCodeSessionBridge({ session_id: 'exec-read' }),
+    );
+
+    const result = await tool.execute('pi-read-1', { path: '/mnt/data/chart.png' });
+    await eventSequencer.drain();
+
+    expect(result).toEqual({
+      content: [
+        { type: 'text', text: 'Image: /mnt/data/chart.png (68 bytes, image/png)' },
+        { type: 'image', data: png, mimeType: 'image/png' },
+      ],
+      details: { status: 'success' },
+    });
+    expect(events[2]).toMatchObject({
+      event: GraphEvents.ON_RUN_STEP_COMPLETED,
+      data: {
+        result: {
+          tool_call: {
+            output: 'Image: /mnt/data/chart.png (68 bytes, image/png)',
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(events)).not.toContain(png);
   });
 
   it('does not forward an arbitrary host error message to Pi', async () => {

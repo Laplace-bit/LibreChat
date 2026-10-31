@@ -1,5 +1,6 @@
 import { Tools } from 'librechat-data-provider';
 import {
+  Constants,
   GraphEvents,
   type EventHandler,
   type ToolExecuteBatchRequest,
@@ -8,6 +9,7 @@ import {
 import type { PiHostToolCall } from './toolExecution';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
+import { createPiCodeSessionBridge } from './codeSession';
 
 type EventHandlerMethod = EventHandler['handle'];
 
@@ -121,6 +123,132 @@ describe('createPiHostToolBatchExecutor', () => {
       thread_id: 'untrusted-thread',
       run_id: 'untrusted-run',
     });
+  });
+
+  it('passes seeded and returned Code API refs through consecutive authorized host calls', async () => {
+    const bridge = createPiCodeSessionBridge({
+      session_id: 'exec-initial',
+      files: [
+        {
+          id: 'upload-1',
+          resource_id: 'user-1',
+          name: 'source.csv',
+          storage_session_id: 'storage-1',
+          kind: 'user',
+        },
+      ],
+    });
+    const batches: ToolExecuteBatchRequest[] = [];
+    const { handler } = createHandler((batch) => {
+      batches.push(batch);
+      const call = batch.toolCalls[0];
+      if (call?.name === Constants.BASH_TOOL) {
+        batch.resolve([
+          {
+            toolCallId: call.id,
+            status: 'success',
+            content: 'created output.csv',
+            artifact: {
+              session_id: 'exec-after-bash',
+              files: [
+                {
+                  id: 'upload-1',
+                  name: 'source.csv',
+                  storage_session_id: 'storage-1',
+                },
+                {
+                  id: 'output-1',
+                  name: 'output.csv',
+                  storage_session_id: 'storage-output',
+                },
+              ],
+            },
+          },
+        ]);
+      } else {
+        batch.resolve([successfulResult(call?.id)]);
+      }
+    });
+    const execute = createPiHostToolBatchExecutor({
+      handler,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: serverRequest,
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+      codeSessionBridge: bridge,
+    });
+
+    await execute({
+      id: 'bash-1',
+      name: Constants.BASH_TOOL,
+      args: { command: 'python transform.py' },
+      stepId: 'step-1',
+    });
+    await execute({
+      id: 'read-1',
+      name: Constants.READ_FILE,
+      args: { path: 'output.csv' },
+      stepId: 'step-2',
+    });
+
+    expect(batches[0]?.toolCalls[0]?.codeSessionContext).toEqual({
+      session_id: 'exec-initial',
+      files: [
+        {
+          id: 'upload-1',
+          resource_id: 'user-1',
+          name: 'source.csv',
+          storage_session_id: 'storage-1',
+          kind: 'user',
+        },
+      ],
+    });
+    expect(batches[1]?.toolCalls[0]?.codeSessionContext).toEqual({
+      session_id: 'exec-after-bash',
+      files: [
+        {
+          id: 'upload-1',
+          resource_id: 'user-1',
+          name: 'source.csv',
+          storage_session_id: 'storage-1',
+          kind: 'user',
+        },
+        {
+          id: 'output-1',
+          resource_id: 'output-1',
+          name: 'output.csv',
+          storage_session_id: 'storage-output',
+          kind: 'user',
+        },
+      ],
+    });
+  });
+
+  it('requires the run-scoped Code API bridge before dispatching a code tool', async () => {
+    const { handler, handle } = createHandler((batch) =>
+      batch.resolve([successfulResult('bash-1')]),
+    );
+    const execute = createPiHostToolBatchExecutor({
+      handler,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: serverRequest,
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+    });
+
+    await expect(
+      execute({
+        id: 'bash-1',
+        name: Constants.BASH_TOOL,
+        args: { command: 'echo unsafe' },
+        stepId: 'step-1',
+      }),
+    ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
+    expect(handle).not.toHaveBeenCalled();
   });
 
   it('fails closed when no event handler is available', async () => {

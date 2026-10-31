@@ -1,3 +1,4 @@
+import { ErrorTypes } from 'librechat-data-provider';
 import type { TAgentRuntimeRollout } from 'librechat-data-provider';
 
 export const LEGACY_AGENT_RUNTIME: Readonly<{ engine: 'legacy' }> = Object.freeze({
@@ -45,7 +46,7 @@ export function findPiAgentInRuntimeGraph(input: {
 
 /** Typed boundary error for an unsupported or unavailable selected runtime path. */
 export class AgentRuntimeUnavailableError extends Error {
-  readonly code = 'AGENT_RUNTIME_UNAVAILABLE';
+  readonly code: ErrorTypes.AGENT_RUNTIME_UNAVAILABLE = ErrorTypes.AGENT_RUNTIME_UNAVAILABLE;
   readonly status = 503;
   readonly statusCode = 503;
 

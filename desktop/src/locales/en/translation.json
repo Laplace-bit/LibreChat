@@ -635,6 +635,7 @@
   "com_endpoint_use_url_context": "URL Context",
   "com_endpoint_verbosity": "Verbosity",
   "com_error_agent_contact_email": "Email {{0}}",
+  "com_error_agent_runtime_unavailable": "This agent's runtime can't handle this request. Ask an administrator to move it to a compatible runtime.",
   "com_error_auth_banned": "Access is blocked for this account or address. Ask an administrator to review it.",
   "com_error_auth_failed": "Your session could not be verified. Sign in again, then resend the message.",
   "com_error_auth_rate_limited": "Too many attempts in a short time. Wait a moment and try again.",

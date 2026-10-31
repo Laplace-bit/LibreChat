@@ -20,6 +20,7 @@ import AgentError from './AgentError';
 export const errorCopy: Record<string, TranslationKeys> = {
   [ErrorTypes.MODERATION]: 'com_error_moderation',
   [ErrorTypes.INVALID_ACTION]: 'com_error_invalid_action_error',
+  [ErrorTypes.AGENT_RUNTIME_UNAVAILABLE]: 'com_error_agent_runtime_unavailable',
   [ErrorTypes.MODELS_NOT_LOADED]: 'com_error_models_not_loaded',
   [ErrorTypes.GOOGLE_TOOL_CONFLICT]: 'com_error_google_tool_conflict',
   [ErrorTypes.GOOGLE_VIDEO_UNPROCESSABLE]: 'com_error_google_video_unprocessable',

@@ -5359,6 +5359,8 @@ export enum ErrorTypes {
    * Invalid Agent Provider (excluded by Admin)
    */
   INVALID_AGENT_PROVIDER = 'invalid_agent_provider',
+  /** The selected agent runtime cannot execute this request on the current server. */
+  AGENT_RUNTIME_UNAVAILABLE = 'AGENT_RUNTIME_UNAVAILABLE',
   /**
    * Missing model selection
    */

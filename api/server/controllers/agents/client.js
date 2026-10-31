@@ -220,6 +220,7 @@ const {
   isTemporaryTurn,
   hasEntityEmbeddings,
   AgentRuntimeUnavailableError,
+  getAgentRuntimeUserFacingError,
   resolveStoredAgentRuntime,
   assertPiCompatible,
   createPiHostToolBatchExecutor,
@@ -391,6 +392,10 @@ function getUserFacingRequestError(baseMessage, error, appConfig) {
    *  client error even when content protection suppresses provider messages. */
   if (error?.code === 'PI_CONTEXT_BUDGET_EXCEEDED') {
     return JSON.stringify({ type: ErrorTypes.FINAL_CONTEXT_OVERFLOW });
+  }
+  const runtimeError = getAgentRuntimeUserFacingError(error);
+  if (runtimeError != null) {
+    return runtimeError;
   }
   const protectionEnabled = hasModelBoundContentProtection(
     appConfig?.filters,

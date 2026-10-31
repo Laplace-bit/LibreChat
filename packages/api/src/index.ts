@@ -149,6 +149,7 @@ export * from './agents/pi/prompt';
 export * from './agents/pi/compatibility';
 export * from './agents/pi/history';
 export * from './agents/runtime/selection';
+export * from './agents/runtime/errors';
 /* Diagnostics */
 export { memoryDiagnostics } from './utils/memory';
 /* RUM */

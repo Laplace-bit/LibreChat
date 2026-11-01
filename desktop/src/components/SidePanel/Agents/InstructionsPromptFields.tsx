@@ -161,6 +161,18 @@ export default function InstructionsPromptFields() {
             field.onChange(null);
             return;
           }
+          const nextGroup = groups.find((group) => group._id === nextGroupId);
+          if (nextGroup == null) {
+            return;
+          }
+          if (nextGroup.source === 'langfuse') {
+            field.onChange({
+              source: 'langfuse',
+              groupId: nextGroupId,
+              selection: { type: 'production' },
+            });
+            return;
+          }
           field.onChange({
             source: 'native',
             groupId: nextGroupId,
@@ -235,11 +247,11 @@ export default function InstructionsPromptFields() {
               )}
             </div>
             <VersionSelect
-              groupId={groupId}
-              productionId={selectedGroup?.productionId}
-              selection={link?.selection}
+              groupId={link?.source === 'native' ? groupId : ''}
+              productionId={link?.source === 'native' ? selectedGroup?.productionId : undefined}
+              selection={link?.source === 'native' ? link.selection : undefined}
               onSelect={(selection) => {
-                if (groupId === '') {
+                if (link?.source !== 'native' || groupId === '') {
                   return;
                 }
                 field.onChange({ source: 'native', groupId, selection });

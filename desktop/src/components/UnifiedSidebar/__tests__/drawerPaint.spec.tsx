@@ -23,6 +23,7 @@ const mockSidebarState = { isSmallScreen: true, expanded: false, setExpanded: je
 jest.mock('@librechat/client', () => ({
   useMediaQuery: () => false,
   useRemScale: () => 1,
+  pxToRem: (px: number) => `${px / 16}rem`,
 }));
 
 jest.mock('~/hooks/Nav/useSidebarState', () => ({
@@ -49,10 +50,17 @@ jest.mock('~/hooks/Chat/provider', () => ({
   ChatProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
-jest.mock('~/Providers', () => ({
-  ChatFormProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
-  ActivePanelProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
-}));
+jest.mock('~/Providers', () => {
+  const { atom } = jest.requireActual('jotai/vanilla');
+  const DEFAULT_PANEL = 'conversations';
+  return {
+    __esModule: true,
+    ChatFormProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+    ActivePanelProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+    activePanelAtom: atom(DEFAULT_PANEL),
+    DEFAULT_PANEL,
+  };
+});
 
 jest.mock('~/components/SidePanel/Nav', () => ({
   __esModule: true,

@@ -20,10 +20,11 @@ let mockPromptsQuery: {
   error?: unknown;
   refetch: jest.Mock;
 };
+let mockUseGetPrompts: jest.Mock;
 
 jest.mock('~/data-provider', () => ({
   useGetAllPromptGroups: () => mockGroupsQuery,
-  useGetPrompts: () => mockPromptsQuery,
+  useGetPrompts: (...args: unknown[]) => mockUseGetPrompts(...args),
 }));
 
 jest.mock('~/hooks', () => ({
@@ -139,6 +140,7 @@ beforeEach(() => {
     error: undefined,
     refetch: jest.fn(),
   };
+  mockUseGetPrompts = jest.fn(() => mockPromptsQuery);
 });
 
 describe('InstructionsPromptFields', () => {
@@ -187,6 +189,39 @@ describe('InstructionsPromptFields', () => {
     expect(methods?.getValues('instructionsPrompt')).toEqual({
       source: 'native',
       groupId: 'group1',
+      selection: { type: 'production' },
+    });
+  });
+
+  it('preserves Langfuse links without treating their versions as native prompt IDs', () => {
+    const link = {
+      source: 'langfuse',
+      groupId: 'langfuse-group1',
+      selection: { type: 'exact', version: 12 },
+    } satisfies NonNullable<AgentForm['instructionsPrompt']>;
+    mockGroupsQuery.data = [group({ _id: link.groupId, source: 'langfuse' })];
+    let methods: UseFormReturn<AgentForm> | undefined;
+    render(<Harness defaultInstructionsPrompt={link} onMethods={(m) => (methods = m)} />);
+
+    expect(
+      screen.getByText('com_agents_instructions_prompt_version_placeholder'),
+    ).toBeInTheDocument();
+    expect(methods?.getValues('instructionsPrompt')).toEqual(link);
+    expect(mockUseGetPrompts).toHaveBeenCalledWith({ groupId: '' }, { enabled: false });
+  });
+
+  it('retains the selected provider when choosing a Langfuse prompt group', () => {
+    mockGroupsQuery.data = [group({ _id: 'langfuse-group1', source: 'langfuse' })];
+    let methods: UseFormReturn<AgentForm> | undefined;
+    render(<Harness onMethods={(m) => (methods = m)} />);
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'com_ui_prompt' }), {
+      target: { value: 'langfuse-group1' },
+    });
+
+    expect(methods?.getValues('instructionsPrompt')).toEqual({
+      source: 'langfuse',
+      groupId: 'langfuse-group1',
       selection: { type: 'production' },
     });
   });

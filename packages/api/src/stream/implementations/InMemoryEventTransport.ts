@@ -1,8 +1,8 @@
 import { EventEmitter } from 'events';
 import { logger } from '@librechat/data-schemas';
 import { subagentActivityConfigSchema } from 'librechat-data-provider';
+import type { IEventTransport, ProviderOwnerContext } from '../interfaces/IJobStore';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
-import type { IEventTransport } from '../interfaces/IJobStore';
 
 interface StreamState {
   emitter: EventEmitter;
@@ -39,6 +39,8 @@ export class InMemoryEventTransport implements IEventTransport {
 
   private streams = new Map<string, StreamState>();
   private providerDrainProofs = new Map<string, number>();
+  private readonly providerRecoveryPublications = new Set<string>();
+  private readonly terminalPublications = new Set<string>();
   private providerDrainWrites = 0;
 
   private static readonly PROVIDER_DRAIN_PROOF_TTL_MS = 5 * 60_000;
@@ -257,7 +259,35 @@ export class InMemoryEventTransport implements IEventTransport {
     state?.emitter.emit('chunk', event, generationId);
   }
 
-  emitDone(streamId: string, event: unknown, generationId?: number): void {
+  emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    _providerOwner?: ProviderOwnerContext,
+    providerRecoveryId?: string,
+    terminalPublicationId?: string,
+  ): void {
+    const terminalPublicationKey =
+      terminalPublicationId == null
+        ? undefined
+        : `${streamId}:${generationId ?? ''}:${terminalPublicationId}`;
+    if (terminalPublicationKey != null && this.terminalPublications.has(terminalPublicationKey)) {
+      return;
+    }
+    if (providerRecoveryId != null) {
+      const publicationKey = `${streamId}:${generationId ?? ''}:${providerRecoveryId}`;
+      if (this.providerRecoveryPublications.has(publicationKey)) {
+        // A prior owner-recovery publication is already the terminal frame for
+        // this generation. Carry the durable outbox receipt forward without
+        // emitting it a second time.
+        if (terminalPublicationKey != null) {
+          this.terminalPublications.add(terminalPublicationKey);
+        }
+        return;
+      }
+      this.providerRecoveryPublications.add(publicationKey);
+    }
+    if (terminalPublicationKey != null) this.terminalPublications.add(terminalPublicationKey);
     const state = this.streams.get(streamId);
     state?.emitter.emit('done', event, generationId);
   }
@@ -372,6 +402,12 @@ export class InMemoryEventTransport implements IEventTransport {
       state.emitter.removeAllListeners();
       this.streams.delete(streamId);
     }
+    for (const key of this.providerRecoveryPublications) {
+      if (key.startsWith(`${streamId}:`)) this.providerRecoveryPublications.delete(key);
+    }
+    for (const key of this.terminalPublications) {
+      if (key.startsWith(`${streamId}:`)) this.terminalPublications.delete(key);
+    }
   }
 
   /**
@@ -397,6 +433,8 @@ export class InMemoryEventTransport implements IEventTransport {
     }
     this.streams.clear();
     this.providerDrainProofs.clear();
+    this.providerRecoveryPublications.clear();
+    this.terminalPublications.clear();
     this.providerDrainWrites = 0;
     logger.debug('[InMemoryEventTransport] Destroyed');
   }

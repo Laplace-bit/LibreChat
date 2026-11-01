@@ -1,6 +1,7 @@
 import type { GenerationJobManagerClass } from '~/stream';
 import type { GenerationJob } from '~/types/stream';
 import { GenerationJobManager, GenerationAdmissionDeniedError } from '~/stream';
+import { PINNED_PI_AGENT_RUNTIME } from '../runtime/selection';
 
 const ACCOUNT_DELETION_ERROR = 'Account deletion is in progress';
 const REMOTE_EXECUTION_ERROR = 'Remote agent execution failed';
@@ -203,6 +204,7 @@ export async function enrollAgentExecution(
       admissionCheck: isPrincipalActive,
       initialMetadata: {
         agent_id: agentId,
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
         endpoint: protocol,
         model: agentId,
         responseMessageId: runId,

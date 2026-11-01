@@ -616,6 +616,7 @@ export function createResponsesEventHandlers(config: StreamHandlerConfig): {
   state: StreamState;
   finalizeStream: (usage?: Usage) => void;
   emitClientToolDeferral: (callId: string, output: string) => void;
+  emitCallerToolHandoff: (call: { callId: string; name: string; arguments: string }) => void;
 } {
   const state: StreamState = {
     messageStarted: false,
@@ -702,6 +703,24 @@ export function createResponsesEventHandlers(config: StreamHandlerConfig): {
       return;
     }
     (pendingClientToolDeferrals ??= new Map()).set(callId, output);
+  };
+
+  const emitCallerToolHandoff = (call: {
+    callId: string;
+    name: string;
+    arguments: string;
+  }): void => {
+    if (state.completedToolCalls.has(call.callId)) {
+      return;
+    }
+    closeOpenStreams();
+    state.activeToolCalls.add(call.callId);
+    state.clientToolCalls.add(call.callId);
+    emitFunctionCallItemAdded(config, call.callId, call.name);
+    emitFunctionCallArgumentsDelta(config, call.callId, call.arguments);
+    state.completedToolCalls.add(call.callId);
+    emitFunctionCallArgumentsDone(config, call.callId);
+    emitFunctionCallItemDone(config, call.callId);
   };
 
   /**
@@ -902,6 +921,20 @@ export function createResponsesEventHandlers(config: StreamHandlerConfig): {
       },
     },
 
+    on_run_step_completed: {
+      handle: (_event: string, data: unknown): void => {
+        const toolCall = (data as { result?: { tool_call?: { id?: string; output?: string } } })
+          ?.result?.tool_call;
+        if (typeof toolCall?.id !== 'string') {
+          return;
+        }
+        handlers.on_tool_end.handle('on_tool_end', {
+          tool_call_id: toolCall.id,
+          output: toolCall.output ?? '',
+        });
+      },
+    },
+
     /**
      * Handle chat model end (usage collection)
      */
@@ -957,7 +990,7 @@ export function createResponsesEventHandlers(config: StreamHandlerConfig): {
     writeDone(config.res);
   };
 
-  return { handlers, state, finalizeStream, emitClientToolDeferral };
+  return { handlers, state, finalizeStream, emitClientToolDeferral, emitCallerToolHandoff };
 }
 
 /* =============================================================================
@@ -1262,6 +1295,16 @@ export function createAggregatorEventHandlers(aggregator: ResponseAggregator): R
       },
     },
 
+    on_run_step_completed: {
+      handle: (_event: string, data: unknown): void => {
+        const toolCall = (data as { result?: { tool_call?: { id?: string; output?: string } } })
+          ?.result?.tool_call;
+        if (typeof toolCall?.id === 'string') {
+          aggregator.toolOutputs.set(toolCall.id, toolCall.output ?? '');
+        }
+      },
+    },
+
     on_chat_model_end: {
       handle: (_event: string, data: unknown): void => {
         const endData = data as {
@@ -1284,4 +1327,18 @@ export function createAggregatorEventHandlers(aggregator: ResponseAggregator): R
       },
     },
   };
+}
+
+export function addCallerToolHandoff(
+  aggregator: ResponseAggregator,
+  call: { callId: string; name: string; arguments: string },
+): void {
+  if (aggregator.toolCalls.has(call.callId)) {
+    return;
+  }
+  aggregator.toolCalls.set(call.callId, {
+    id: call.callId,
+    name: call.name,
+    arguments: call.arguments,
+  });
 }

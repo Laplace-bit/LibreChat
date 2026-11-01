@@ -5207,6 +5207,7 @@ describe('ToolService - Action Capability Gating', () => {
           threadId: 'thread-pi-action-http',
           runId: 'run-pi-action-http',
           metadata: {},
+          authorize: async () => true,
           authorizedToolNames: [actionToolName],
         });
         const hostEvents = [];
@@ -5277,6 +5278,7 @@ describe('ToolService - Action Capability Gating', () => {
           threadId: 'thread-pi-action-http',
           runId: 'run-pi-action-http',
           metadata: {},
+          authorize: async () => true,
           authorizedToolNames: [],
         });
         await expect(

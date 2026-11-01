@@ -365,7 +365,11 @@ describe('Pi approval continuation', () => {
       conversion: {
         systemPrompt: 'Be useful.',
         history: [],
-        prompt: { text: 'Choose a plant.', images: [] },
+        prompt: {
+          text: 'Choose a plant.',
+          images: [],
+          content: [{ type: 'text', text: 'Choose a plant.' }],
+        },
       },
       continuation,
       toolArguments: args,
@@ -966,7 +970,15 @@ describe('Pi approval continuation', () => {
       conversion: {
         systemPrompt: 'Be useful.',
         history: [],
-        prompt: { text: 'Find the maintenance manual.', images: [] },
+        prompt: {
+          text: 'Find the maintenance manual.',
+          images: [],
+          content: [
+            { type: 'text', text: 'before' },
+            { type: 'image', mimeType: 'image/png', data: 'YQ==' },
+            { type: 'text', text: 'Find the maintenance manual.' },
+          ],
+        },
       },
       continuation,
       toolArguments: continuation.args,
@@ -980,6 +992,14 @@ describe('Pi approval continuation', () => {
     });
 
     expect(messages.map((message) => message.role)).toEqual(['user', 'assistant', 'toolResult']);
+    expect(messages[0]).toMatchObject({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'image', mimeType: 'image/png', data: 'YQ==' },
+        { type: 'text', text: 'Find the maintenance manual.' },
+      ],
+    });
     expect(messages[messages.length - 2]).toMatchObject({
       role: 'assistant',
       stopReason: 'toolUse',
@@ -1006,7 +1026,11 @@ describe('Pi approval continuation', () => {
       conversion: {
         systemPrompt: 'Be useful.',
         history: [],
-        prompt: { text: 'Find the maintenance manual.', images: [] },
+        prompt: {
+          text: 'Find the maintenance manual.',
+          images: [],
+          content: [{ type: 'text', text: 'Find the maintenance manual.' }],
+        },
       },
       continuation,
       toolArguments,

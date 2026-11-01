@@ -1,93 +1,47 @@
 import { ErrorTypes } from 'librechat-data-provider';
-import type { TAgentRuntimeRollout } from 'librechat-data-provider';
-
-export const LEGACY_AGENT_RUNTIME: Readonly<{ engine: 'legacy' }> = Object.freeze({
-  engine: 'legacy',
-});
 export const PINNED_PI_AGENT_RUNTIME: Readonly<{ engine: 'pi'; sdkVersion: '1.4.0' }> =
   Object.freeze({ engine: 'pi', sdkVersion: '1.4.0' });
 
-export type AgentRuntimeSelection = typeof LEGACY_AGENT_RUNTIME | typeof PINNED_PI_AGENT_RUNTIME;
+export type AgentRuntimeSelection = typeof PINNED_PI_AGENT_RUNTIME;
 
 export type StoredAgentRuntimeResolution =
-  | { status: 'resolved'; selection: AgentRuntimeSelection }
+  | { status: 'resolved'; selection: typeof PINNED_PI_AGENT_RUNTIME }
+  | { status: 'unselected' }
   | { status: 'unsupported' };
 
 export type ResumableAgentRuntimeResolution =
   | {
       status: 'available';
-      selection: typeof LEGACY_AGENT_RUNTIME | typeof PINNED_PI_AGENT_RUNTIME;
+      selection: typeof PINNED_PI_AGENT_RUNTIME;
     }
   | { status: 'unavailable' };
 
-/** Selects a canary only from the server-owned allowlist and an admitted agent identifier. */
-export function selectAgentRuntimeForAgent(input: {
-  agentId: unknown;
-  rollout?: TAgentRuntimeRollout;
-}): AgentRuntimeSelection {
-  if (
-    typeof input.agentId === 'string' &&
-    input.agentId.length > 0 &&
-    input.rollout?.piAgentIds.includes(input.agentId)
-  ) {
-    return PINNED_PI_AGENT_RUNTIME;
-  }
-  return LEGACY_AGENT_RUNTIME;
+/** Every new Agent generation uses the pinned Pi engine. */
+export function selectAgentRuntimeForAgent(): typeof PINNED_PI_AGENT_RUNTIME {
+  return PINNED_PI_AGENT_RUNTIME;
 }
 
-/** Finds any allowlisted Pi agent in a graph that would otherwise run Legacy. */
-export function findPiAgentInRuntimeGraph(input: {
-  agentIds: readonly unknown[];
-  rollout?: TAgentRuntimeRollout;
-}): string | undefined {
-  const allowlistedAgentIds = new Set(input.rollout?.piAgentIds ?? []);
-  return input.agentIds.find(
-    (agentId): agentId is string =>
-      typeof agentId === 'string' && agentId.length > 0 && allowlistedAgentIds.has(agentId),
-  );
-}
-
-/** Typed boundary error for an unsupported or unavailable selected runtime path. */
+/** Typed boundary error for an unsupported or unavailable Pi runtime path. */
 export class AgentRuntimeUnavailableError extends Error {
   readonly code: ErrorTypes.AGENT_RUNTIME_UNAVAILABLE = ErrorTypes.AGENT_RUNTIME_UNAVAILABLE;
   readonly status = 503;
   readonly statusCode = 503;
 
   constructor() {
-    super('The selected agent runtime is not available on this server.');
+    super('The Pi agent runtime is not available on this server.');
     this.name = 'AgentRuntimeUnavailableError';
   }
 }
 
-/** Stop legacy dispatch if a connected agent is independently pinned to Pi. */
-export function assertLegacyRuntimeCompatibleGraph(input: {
-  agentIds: readonly unknown[];
-  rollout?: TAgentRuntimeRollout;
-}): void {
-  if (findPiAgentInRuntimeGraph(input) !== undefined) {
-    throw new AgentRuntimeUnavailableError();
-  }
-}
-
-/**
- * Validate the loaded graph against the runtime pinned to this generation.
- * Pi's first dispatch slice is limited to one exact root agent; legacy retains
- * its existing guard against connected agents that are independently pinned to Pi.
- */
+/** Pi currently accepts one exact root agent; mixed and connected-agent graphs fail closed. */
 export function assertAgentRuntimeCompatibleGraph(input: {
   runtime: unknown;
   rootAgentId: unknown;
   agentIds: readonly unknown[];
-  rollout?: TAgentRuntimeRollout;
 }): void {
   const resolution = resolveStoredAgentRuntime(input.runtime);
   if (resolution.status !== 'resolved') {
     throw new AgentRuntimeUnavailableError();
-  }
-
-  if (resolution.selection.engine === 'legacy') {
-    assertLegacyRuntimeCompatibleGraph({ agentIds: input.agentIds, rollout: input.rollout });
-    return;
   }
 
   if (
@@ -121,19 +75,17 @@ export function freezeStoredAgentRuntimeIdentity(value: unknown): unknown {
 
 /**
  * Resolve the immutable runtime identity persisted on a generation job.
- * Missing metadata predates engine pinning and always means the legacy engine.
+ * Generic host jobs have no Agent runtime identity. Only pinned Pi is valid for
+ * Agent execution; an old engine identity is unsupported.
  */
 export function resolveStoredAgentRuntime(value: unknown): StoredAgentRuntimeResolution {
   if (value === undefined) {
-    return { status: 'resolved', selection: LEGACY_AGENT_RUNTIME };
+    return { status: 'unselected' };
   }
   if (!isRecord(value)) {
     return { status: 'unsupported' };
   }
   const keys = Object.keys(value);
-  if (value.engine === 'legacy' && keys.length === 1 && keys[0] === 'engine') {
-    return { status: 'resolved', selection: LEGACY_AGENT_RUNTIME };
-  }
   if (
     value.engine === 'pi' &&
     value.sdkVersion === PINNED_PI_AGENT_RUNTIME.sdkVersion &&
@@ -152,14 +104,7 @@ export function resolveResumableAgentRuntime(
   hasValidatedPiContinuation = false,
 ): ResumableAgentRuntimeResolution {
   const resolution = resolveStoredAgentRuntime(value);
-  if (resolution.status === 'resolved' && resolution.selection.engine === 'legacy') {
-    return { status: 'available', selection: LEGACY_AGENT_RUNTIME };
-  }
-  if (
-    resolution.status === 'resolved' &&
-    resolution.selection.engine === 'pi' &&
-    hasValidatedPiContinuation
-  ) {
+  if (resolution.status === 'resolved' && hasValidatedPiContinuation) {
     return { status: 'available', selection: PINNED_PI_AGENT_RUNTIME };
   }
   return { status: 'unavailable' };

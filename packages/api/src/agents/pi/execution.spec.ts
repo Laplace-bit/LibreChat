@@ -21,6 +21,9 @@ function createSession(
     prompt() {
       return runPrompt((event) => listener?.(event));
     },
+    promptContent() {
+      return runPrompt((event) => listener?.(event));
+    },
     continueFromToolResult() {
       return runPrompt((event) => listener?.(event));
     },

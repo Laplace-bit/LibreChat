@@ -89,11 +89,17 @@ export class AttachmentStorageError extends Error {
 export async function encodeAndFormatImages(
   req: ServerRequest,
   files: ImageEncodingFile[] | null | undefined,
-  params: { provider?: string; endpoint?: string; imageDetail?: Agents.ImageDetail },
+  params: {
+    provider?: string;
+    endpoint?: string;
+    imageDetail?: Agents.ImageDetail;
+    /** Force an authorized storage-strategy read instead of emitting a URL. */
+    requireInlineData?: boolean;
+  },
   { getStrategyFunctions, httpClient }: ImageEncodingDependencies,
   mode?: string,
 ): Promise<ImageResult> {
-  const { provider, endpoint } = params;
+  const { provider, endpoint, requireInlineData = false } = params;
   const effectiveEndpoint = endpoint ?? provider;
   const promises: Array<ImageEntry | Promise<ImageEntry>> = [];
   const encodingMethods: Record<string, ImageStrategy> = {};
@@ -111,6 +117,33 @@ export async function encodeAndFormatImages(
 
   for (const file of files) {
     const source = file.source ?? FileSources.local;
+    if (requireInlineData) {
+      promises.push(
+        track(
+          runGuardedEncode<ImageEntry>(file.bytes ?? 0, async () => {
+            const processedFile = await getFileStream(
+              req,
+              file,
+              encodingMethods,
+              getStrategyFunctions,
+            );
+            if (processedFile == null || processedFile.content.length === 0) {
+              throw new AttachmentStorageError();
+            }
+            return [file, processedFile.content];
+          }).catch((error: unknown): never => {
+            if (isAttachmentObjectNotFoundError(error)) {
+              throw error;
+            }
+            if (typeof error === 'object' && error != null && 'bufferedData' in error) {
+              delete (error as { bufferedData?: unknown }).bufferedData;
+            }
+            throw new AttachmentStorageError();
+          }),
+        ),
+      );
+      continue;
+    }
     if (!file.height) {
       promises.push([file, null]);
       continue;

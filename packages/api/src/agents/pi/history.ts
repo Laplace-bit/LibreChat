@@ -41,6 +41,8 @@ export class PiHistoryCompatibilityError extends Error {
 export interface PiCurrentPrompt {
   text: string;
   images: ImageContent[];
+  /** Ordered prompt parts, retained for APIs that accept mixed text and images. */
+  content: PiContentPart[];
 }
 
 export interface PiHistoryConversion {
@@ -49,7 +51,7 @@ export interface PiHistoryConversion {
   prompt: PiCurrentPrompt;
 }
 
-type PiContentPart = TextContent | ImageContent;
+export type PiContentPart = TextContent | ImageContent;
 type PiAssistantContentPart = TextContent | ThinkingContent | ToolCall;
 type PendingToolCall = { name: string };
 
@@ -308,18 +310,10 @@ function assertNoPendingToolCalls(pendingToolCalls: Map<string, PendingToolCall>
 function convertPromptContent(content: PiContentPart[]): PiCurrentPrompt {
   const images: ImageContent[] = [];
   const text: string[] = [];
-  let imageStarted = false;
   for (const part of content) {
     if (part.type === 'image') {
-      imageStarted = true;
       images.push(part);
       continue;
-    }
-    if (imageStarted && part.text.length > 0) {
-      return incompatible(
-        'unsupported_content',
-        'The Pi prompt adapter cannot preserve text that follows an inline image.',
-      );
     }
     text.push(part.text);
   }
@@ -328,7 +322,7 @@ function convertPromptContent(content: PiContentPart[]): PiCurrentPrompt {
   if (promptText.length === 0 && images.length === 0) {
     return incompatible('unsupported_content', 'The current user message is empty.');
   }
-  return { text: promptText, images };
+  return { text: promptText, images, content };
 }
 
 /**

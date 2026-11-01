@@ -9,19 +9,19 @@ This directory contains the product decisions and implementation notes for the f
 - The first business scope is read-only MES, ERP, and WMS queries, followed by cross-system analysis and reports.
 - The server owns users, roles, agent definitions, model and provider access, memory, knowledge, business connectors, authorization, and audit records.
 - The first desktop targets are macOS and Windows.
-- The backend remains unchanged during the initial client baseline. Deployment configuration and authentication integration may still need validation for a desktop origin.
+- The desktop and Web clients use the server's Pi-only Agent chat path on `feature/pi-agent-runtime`. The runtime boundary and deployment verification gates are recorded in [ADR 0001](./decisions/0001-pi-agent-runtime.md). Deployment configuration and authentication integration may still need validation for a desktop origin.
 
 The initial renderer copy is based on the Fork's current `main` commit `8d3da9bbb` (2026-10-26). Keep this reference until the first intentional upstream sync.
 
 ## Repository boundaries
 
-| Path | Ownership | Rule |
-| --- | --- | --- |
-| `client/` | Upstream-aligned web client | Keep close to the matching LibreChat release. Do not add desktop-specific behavior here. |
-| `desktop/` | Product-owned renderer copy | Port selected upstream changes here and add desktop shell integration here. |
-| `packages/client`, `packages/chat`, `packages/data-provider` | Shared dependencies | Treat changes as affecting both renderers. Build and test both entry points. |
-| `api/`, `packages/api`, `packages/data-schemas` | Server | Leave unchanged for the initial client work. |
-| `docs/agent-platform/` | Product documentation | Put decisions, architecture notes, test plans, and sync notes here. |
+| Path                                                         | Ownership                   | Rule                                                                                     |
+| ------------------------------------------------------------ | --------------------------- | ---------------------------------------------------------------------------------------- |
+| `client/`                                                    | Upstream-aligned web client | Keep close to the matching LibreChat release. Do not add desktop-specific behavior here. |
+| `desktop/`                                                   | Product-owned renderer copy | Port selected upstream changes here and add desktop shell integration here.              |
+| `packages/client`, `packages/chat`, `packages/data-provider` | Shared dependencies         | Treat changes as affecting both renderers. Build and test both entry points.             |
+| `api/`, `packages/api`, `packages/data-schemas`              | Server                      | Own the Agent runtime, permissions, durable jobs and Pi adapters.                        |
+| `docs/agent-platform/`                                       | Product documentation       | Put decisions, architecture notes, test plans, and sync notes here.                      |
 
 The copied renderer is intentionally separate from `client/` so an upstream sync does not turn every desktop customization into a conflict. This does not isolate shared packages: updates to the shared packages still need to be reviewed and may require a deliberate port into `desktop/`.
 
@@ -31,4 +31,3 @@ The copied renderer is intentionally separate from `client/` so an upstream sync
 2. Add a configurable server URL and verify login, OAuth return paths, refresh cookies, file transfers, and SSE streaming inside the shell.
 3. Define desktop packaging, signing, update delivery, and support for the customer's internal network.
 4. Run the acceptance path on both systems: sign in, query an authorized read-only business connector, stream a response, cancel it, restore the conversation, and enforce server-side authorization.
-

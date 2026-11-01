@@ -1,14 +1,17 @@
 import type {
   AgentSession,
+  AgentSessionEvent,
   AgentSessionEventListener,
   ModelRuntime,
   PromptOptions,
 } from '@earendil-works/pi-coding-agent';
-import type { PiHistoryMessage } from './history';
+import type { PiContentPart, PiHistoryMessage } from './history';
 import type { PiPauseController } from './pause';
 import type { PiToolDefinition } from './tools';
 import { createPiProviderEventObserver, isPiToolBatchEventApi } from './providerEvents';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
+
+type PiAgentMessage = Extract<AgentSessionEvent, { type: 'message_start' }>['message'];
 
 export interface PiModelBinding {
   /** A request-scoped model selected from the caller's authorized configuration. */
@@ -28,6 +31,16 @@ export interface HostPiSessionOptions {
   /** Rejects multi-call tool batches before any tool gate or host handler runs. */
   toolBatchPolicy?: { controller: PiPauseController };
   signal?: AbortSignal;
+  /**
+   * Runs at Pi's awaited finish-turn boundary, after tool results are persisted
+   * and before the next provider request polls the steering queue.
+   */
+  onTurnEnd?(context: HostPiTurnEndContext): void | Promise<void>;
+}
+
+export interface HostPiTurnEndContext {
+  signal?: AbortSignal;
+  steer: AgentSession['steer'];
 }
 
 /** Narrow, host-owned surface. The mutable Pi session itself is never exposed. */
@@ -36,6 +49,8 @@ export interface HostPiSession {
   readonly activeToolNames: readonly string[];
   subscribe(listener: AgentSessionEventListener): () => void;
   prompt(text: string, options?: PromptOptions): Promise<void>;
+  /** Starts a normal AgentSession prompt while retaining the source order of text and images. */
+  promptContent(content: readonly PiContentPart[]): Promise<void>;
   /**
    * Continue a restored transcript whose final message is the result for exactly
    * one preceding assistant tool call. This uses Pi's public Agent continuation
@@ -225,6 +240,30 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
     });
     session = result.session;
 
+    if (options.onTurnEnd != null) {
+      const previousFinishTurn = session.agent.finishTurn;
+      session.agent.finishTurn = async (turn, signal) => {
+        const decision = (await previousFinishTurn?.(turn, signal)) as
+          | { action: 'continue' }
+          | { action: 'end' }
+          | undefined;
+        if (
+          turn.message.stopReason !== 'error' &&
+          turn.message.stopReason !== 'aborted' &&
+          decision?.action !== 'end' &&
+          signal?.aborted !== true &&
+          options.signal?.aborted !== true
+        ) {
+          await options.onTurnEnd?.({
+            signal,
+            steer: (text, images, steerOptions) =>
+              requireSession().steer(text, images, steerOptions),
+          });
+        }
+        return decision;
+      };
+    }
+
     if (options.toolBatchPolicy != null) {
       const previousProviderStreamEvent = session.agent.onProviderStreamEvent;
       const providerEventObserver = createPiProviderEventObserver();
@@ -292,6 +331,120 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
         }
         promptStarted = true;
         await runOperation('prompt', () => currentSession.prompt(text, promptOptions));
+      },
+      async promptContent(content) {
+        const currentSession = requireSession();
+        if (promptStarted) {
+          throw new Error('A Pi host session accepts one initial prompt per generation');
+        }
+        promptStarted = true;
+
+        const text = content
+          .filter((part): part is Extract<PiContentPart, { type: 'text' }> => part.type === 'text')
+          .map(({ text: partText }) => partText)
+          .join('');
+        const images = content.filter(
+          (part): part is Extract<PiContentPart, { type: 'image' }> => part.type === 'image',
+        );
+
+        await runOperation('prompt', async () => {
+          const originalPrompt = currentSession.agent.prompt;
+          const callOriginalPrompt = originalPrompt.bind(currentSession.agent);
+          let intercepted = false;
+
+          const applyOrderedContent = (messages: typeof currentSession.agent.state.messages) => {
+            if (intercepted) {
+              return messages;
+            }
+
+            const userIndex = messages.findIndex((message) => message.role === 'user');
+            const userMessage = messages[userIndex];
+            if (
+              userIndex < 0 ||
+              userMessage?.role !== 'user' ||
+              !Array.isArray(userMessage.content)
+            ) {
+              throw new Error('Pi AgentSession did not provide an ordered user message');
+            }
+
+            const normalizedImages = userMessage.content.filter(
+              (part): part is Extract<PiContentPart, { type: 'image' }> =>
+                typeof part === 'object' && part !== null && part.type === 'image',
+            );
+            if (normalizedImages.length !== images.length) {
+              throw new Error('Pi could not preserve every authorized inline prompt image');
+            }
+
+            const normalizedText = userMessage.content
+              .filter(
+                (part): part is Extract<PiContentPart, { type: 'text' }> =>
+                  typeof part === 'object' && part !== null && part.type === 'text',
+              )
+              .map(({ text: partText }) => partText)
+              .join('');
+            if (!normalizedText.startsWith(text)) {
+              throw new Error('Pi AgentSession changed the ordered prompt text');
+            }
+
+            const trailingSessionHints = normalizedText.slice(text.length);
+            let imageIndex = 0;
+            const orderedParts = content.map((part) => {
+              if (part.type === 'text') {
+                return part;
+              }
+              const normalizedImage = normalizedImages[imageIndex];
+              imageIndex += 1;
+              if (normalizedImage == null) {
+                throw new Error('Pi could not preserve every authorized inline prompt image');
+              }
+              return normalizedImage;
+            });
+            if (trailingSessionHints.length > 0) {
+              orderedParts.push({ type: 'text', text: trailingSessionHints });
+            }
+
+            const reordered = [...messages];
+            reordered[userIndex] = { ...userMessage, content: orderedParts };
+            intercepted = true;
+            return reordered;
+          };
+
+          async function orderedPrompt(message: PiAgentMessage | PiAgentMessage[]): Promise<void>;
+          async function orderedPrompt(
+            text: string,
+            promptImages?: PromptOptions['images'],
+          ): Promise<void>;
+          async function orderedPrompt(
+            message: string | PiAgentMessage | PiAgentMessage[],
+            promptImages?: PromptOptions['images'],
+          ): Promise<void> {
+            if (typeof message === 'string') {
+              return callOriginalPrompt(message, promptImages);
+            }
+            if (intercepted) {
+              return callOriginalPrompt(message);
+            }
+
+            const messages = Array.isArray(message) ? message : [message];
+            return callOriginalPrompt(applyOrderedContent(messages));
+          }
+
+          currentSession.agent.prompt = orderedPrompt;
+          try {
+            await currentSession.prompt(text, {
+              expandPromptTemplates: false,
+              source: 'rpc',
+              ...(images.length === 0 ? {} : { images }),
+            });
+            if (!intercepted) {
+              throw new Error('Pi AgentSession did not submit the ordered prompt');
+            }
+          } finally {
+            if (currentSession.agent.prompt === orderedPrompt) {
+              currentSession.agent.prompt = originalPrompt;
+            }
+          }
+        });
       },
       async continueFromToolResult(toolCallId) {
         const currentSession = requireSession();

@@ -1,7 +1,11 @@
 import { GraphEvents } from '@librechat/agents';
 import { ContentTypes, StepTypes, UsageEvents } from 'librechat-data-provider';
 import type { AssistantMessage } from '@earendil-works/pi-ai';
-import { PiRuntimeResponseError, createPiContentEventTranslator } from './events';
+import {
+  PiProviderResponseError,
+  PiRuntimeResponseError,
+  createPiContentEventTranslator,
+} from './events';
 
 function assistantMessage(overrides: Partial<AssistantMessage> = {}): AssistantMessage {
   return {
@@ -90,6 +94,35 @@ describe('createPiContentEventTranslator usage mapping', () => {
         willRetry: false,
       }),
     ).toThrow(PiRuntimeResponseError);
+  });
+
+  it('reports terminal provider failures to the host observer before rejecting the turn', () => {
+    const onModelProviderError = jest.fn();
+    const translate = createPiContentEventTranslator({
+      createStepIdentity: () => ({
+        id: 'step-1',
+        index: 0,
+        messageId: 'message-1',
+        runId: 'run-1',
+        agentId: 'agent-1',
+      }),
+      onModelProviderError,
+    });
+    const failure = assistantMessage({
+      stopReason: 'error',
+      errorMessage: '503: provider unavailable',
+    });
+
+    let thrown: unknown;
+    try {
+      translate({ type: 'agent_end', messages: [failure], willRetry: false });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(PiProviderResponseError);
+    expect(thrown).toMatchObject({ status: 503, statusCode: 503 });
+    expect(onModelProviderError).toHaveBeenCalledWith(thrown);
   });
 
   it('treats a registered host tool call as a completed assistant message and accounts for usage', () => {

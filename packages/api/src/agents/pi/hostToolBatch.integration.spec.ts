@@ -195,6 +195,7 @@ describe('Pi host tool batch integration', () => {
         threadId,
         runId,
         metadata,
+        authorize: async () => true,
       });
       const executePiTool = createPiHostToolExecutor({
         createStepIdentity: () => ({
@@ -395,6 +396,7 @@ describe('Pi host tool batch integration', () => {
       threadId,
       runId,
       metadata: piMetadata,
+      authorize: async () => true,
     });
     const executePiTool = createPiHostToolExecutor({
       createStepIdentity: () => ({

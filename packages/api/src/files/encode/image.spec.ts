@@ -66,6 +66,48 @@ describe('encodeAndFormatImages', () => {
     expect(getDownloadStream).toHaveBeenCalledWith(expect.anything(), file.filepath);
   });
 
+  it('forces inline bytes through the authorized storage strategy instead of returning a URL', async () => {
+    const openAiStoredImage = { ...file, source: FileSources.openai };
+    prepareImagePayload.mockImplementation(async () => {
+      throw new Error('Pi image preparation must not resolve or fetch an arbitrary URL');
+    });
+
+    const result = await encodeAndFormatImages(
+      makeReq(),
+      [openAiStoredImage],
+      { endpoint: 'openai', requireInlineData: true },
+      deps,
+      VisionModes.agents,
+    );
+
+    expect(result.image_urls).toEqual([
+      { type: 'image_url', image_url: { url: dataUrl, detail: 'auto' } },
+    ]);
+    expect(getDownloadStream).toHaveBeenCalledWith(expect.anything(), openAiStoredImage.storageKey);
+    expect(prepareImagePayload).not.toHaveBeenCalled();
+    expect(httpClient.get).not.toHaveBeenCalled();
+    expect(memoryGuard.runGuardedEncode).toHaveBeenCalledWith(file.bytes, expect.any(Function));
+  });
+
+  it('fails closed when forced inline encoding has no authorized download strategy', async () => {
+    const openAiStoredImage = { ...file, source: FileSources.openai };
+    getStrategyFunctions.mockReturnValue({ prepareImagePayload } as unknown as ReturnType<
+      typeof getStrategyFunctions
+    >);
+
+    await expect(
+      encodeAndFormatImages(
+        makeReq(),
+        [openAiStoredImage],
+        { endpoint: 'openai', requireInlineData: true },
+        deps,
+        VisionModes.agents,
+      ),
+    ).rejects.toBeInstanceOf(AttachmentStorageError);
+    expect(prepareImagePayload).not.toHaveBeenCalled();
+    expect(httpClient.get).not.toHaveBeenCalled();
+  });
+
   it('overlaps storage reads while keeping attachment order and the first error in order', async () => {
     let active = 0;
     let peak = 0;

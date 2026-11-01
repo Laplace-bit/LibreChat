@@ -32,7 +32,6 @@ const {
   resolveConversationAnchor,
   getAgentStartupTelemetry,
   acceptAgentStartupTelemetry,
-  isSteerPreemptSupported,
   buildRecoveredSteerPayload,
   getSteerRecoveryFailure,
   deleteAgentCheckpoint,
@@ -1643,12 +1642,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   req._agentEventTriggerProjection = getAgentEventTriggerProjection(agentEventDelivery);
 
   try {
-    const selectedAgentRuntime = selectAgentRuntimeForAgent({
-      // The endpoint option was built after the agent access middleware passed. The operator
-      // allowlist is the only source that can move this admitted agent off the legacy engine.
-      agentId: endpointOption.agent_id ?? req.body?.agent_id,
-      rollout: req.config?.endpoints?.[EModelEndpoint.agents]?.runtime,
-    });
+    const selectedAgentRuntime = selectAgentRuntimeForAgent();
     if (
       selectedAgentRuntime.engine === 'pi' &&
       (isRegenerate ||
@@ -1717,18 +1711,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         endpoint: endpointOption.endpoint,
         iconURL: endpointIconURL,
         model: responseModel,
-        // Recorded HERE because this process owns the generation: the steer
-        // route may land on a different replica whose own SDK probe would
-        // answer for the wrong process during a rolling deploy.
-        preemptCapable: selectedAgentRuntime.engine === 'legacy' && isSteerPreemptSupported(),
-        // Same owner-recorded pattern: this build's drain merges queued steer
-        // quotes into the injected turn. Admission on another replica must
-        // not store/acknowledge quotes an older owner would drop.
-        steerQuotesCapable: selectedAgentRuntime.engine === 'legacy',
+        // Pi turns do not yet support in-place preemption or queued steer quotes.
+        preemptCapable: false,
+        steerQuotesCapable: false,
         // Persist the originating agent so a HITL resume can refuse to rebuild this
         // paused run on a different agent (see resume.js).
         agent_id: endpointOption.agent_id ?? req.body?.agent_id,
-        /** Engine choice is generation-scoped. Old records omit it and resolve to legacy. */
+        /** Agent execution is always pinned to the Pi version selected by this server. */
         agentRuntime: selectedAgentRuntime,
         // Persist temporary-chat state so a HITL resume keeps the resumed response
         // non-persisted instead of trusting the resume request to re-send the flag.
@@ -2090,7 +2079,6 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         client?.options?.agent?.id,
         ...Array.from(client?.agentConfigs?.values?.() ?? [], (agent) => agent?.id),
       ],
-      rollout: req.config?.endpoints?.[EModelEndpoint.agents]?.runtime,
     });
     const normalizedMCPRequestBody = createMCPRuntimeRequestBody({
       messageId: mcpRequestBody.messageId,

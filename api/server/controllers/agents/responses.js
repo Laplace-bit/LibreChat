@@ -1,7 +1,7 @@
 const { nanoid } = require('nanoid');
 const { v4: uuidv4 } = require('uuid');
 const { logger } = require('@librechat/data-schemas');
-const { Callback, formatAgentMessages } = require('@librechat/agents');
+const { formatAgentMessages } = require('@librechat/agents');
 const {
   EModelEndpoint,
   ResourceType,
@@ -10,7 +10,6 @@ const {
   AgentCapabilities,
 } = require('librechat-data-provider');
 const {
-  createRun,
   applyContextToAgent,
   buildInitialToolSessions,
   buildRunToolSet,
@@ -18,11 +17,9 @@ const {
   createAgentRunEnvelope,
   createAgentExecutionContext,
   createMCPRuntimeRequestBody,
-  assertLegacyRuntimeCompatibleGraph,
   buildAgentScopedContext,
   buildInlineMemoryContext,
   buildAgentContextAttachmentsByAgentId,
-  createSafeUser,
   initializeAgent,
   loadSkillStates,
   loadSkillAccess,
@@ -30,7 +27,6 @@ const {
   injectSkillPrimes,
   extractManualSkills,
   recordCollectedUsage,
-  createSubagentUsageSink,
   getTransactionsConfig,
   resolveAgentTokenConfig,
   resolveSubagentGraphs,
@@ -58,7 +54,6 @@ const {
   getAgentErrorMetadata,
   createToolExecuteHandler,
   createOwnedToolEndHandler,
-  resolveRecursionLimit,
   getRemoteAgentPermissions,
   resolveAgentScopedSkillIds,
   // Responses API
@@ -79,6 +74,7 @@ const {
   sendResponsesErrorResponse,
   createResponsesEventHandlers,
   createAggregatorEventHandlers,
+  addCallerToolHandoff,
   createClientToolHandoff,
   getLangfuseTraceMessageFields,
   stripActivityLabelParts,
@@ -93,10 +89,11 @@ const {
   createTerminalRunErrorObserver,
   announceReply,
   getConversationWriteContext,
-  isTemporaryTurn,
   getModelEndUsage,
   hasEntityEmbeddings,
+  isTemporaryTurn,
 } = require('@librechat/api');
+const { executeRemotePiGeneration, getRemotePiToolPlan } = require('./remotePi');
 const {
   createResponsesToolEndCallback,
   buildSummarizationHandlers,
@@ -947,7 +944,6 @@ const executeResponse = async (envelope, { req, res }) => {
 
       let handoffAgentConfigs = new Map();
       let discoveredEdges = [];
-      let discoveredMCPAuthMap;
       const subagentsCapabilityEnabled = enabledCapabilities.has(AgentCapabilities.subagents);
       const primaryHasGraphSubagents =
         subagentsCapabilityEnabled &&
@@ -1026,14 +1022,11 @@ const executeResponse = async (envelope, { req, res }) => {
           initializeAgent,
         };
         if (primaryConfig.edges?.length) {
-          ({
-            agentConfigs: handoffAgentConfigs,
-            edges: discoveredEdges,
-            userMCPAuthMap: discoveredMCPAuthMap,
-          } = await discoverConnectedAgents(discoveryParams, discoveryDeps));
+          ({ agentConfigs: handoffAgentConfigs, edges: discoveredEdges } =
+            await discoverConnectedAgents(discoveryParams, discoveryDeps));
         }
         if (subagentsCapabilityEnabled) {
-          discoveredMCPAuthMap = await resolveSubagentGraphs(
+          await resolveSubagentGraphs(
             {
               ...discoveryParams,
               rootConfigs: [primaryConfig, ...handoffAgentConfigs.values()],
@@ -1055,10 +1048,6 @@ const executeResponse = async (envelope, { req, res }) => {
           fallback: primaryConfig.endpointTokenConfig,
         });
       const runAgents = [primaryConfig, ...handoffAgentConfigs.values()];
-      assertLegacyRuntimeCompatibleGraph({
-        agentIds: runAgents.map((runAgent) => runAgent.id),
-        rollout: appConfig?.endpoints?.agents?.runtime,
-      });
       const initialSessions = buildInitialToolSessions({ agents: runAgents });
       const modelBoundAgentsById = new Map();
       const pendingModelBoundAgents = [...runAgents];
@@ -1076,7 +1065,6 @@ const executeResponse = async (envelope, { req, res }) => {
         }
       }
       const modelBoundAgents = [...modelBoundAgentsById.values()];
-      const mergedMCPAuthMap = discoveredMCPAuthMap ?? primaryConfig.userMCPAuthMap;
       assertModelBoundContent({
         onTraversalFailure: reportLocatorTraversalFailure,
         filters: appConfig?.filters,
@@ -1155,6 +1143,12 @@ const executeResponse = async (envelope, { req, res }) => {
         allMessages,
         true,
       );
+      const piToolDefinitions = getRemotePiToolPlan({
+        agent: primaryConfig,
+        agents: runAgents,
+        callableToolNames: [...toolSet],
+        clientToolNames: clientTools.clientToolNames,
+      });
       const formatted = formatAgentMessages(
         stripUnusableSummaryParts(stripActivityLabelParts(allMessages)),
         {},
@@ -1240,6 +1234,7 @@ const executeResponse = async (envelope, { req, res }) => {
           handlers: responsesHandlers,
           finalizeStream,
           emitClientToolDeferral,
+          emitCallerToolHandoff,
         } = createResponsesEventHandlers(handlerConfig);
 
         // Collect usage for balance tracking
@@ -1322,7 +1317,7 @@ const executeResponse = async (envelope, { req, res }) => {
             },
           },
           on_tool_end: createOwnedToolEndHandler(toolEndCallback, logger),
-          on_run_step_completed: { handle: () => {} },
+          on_run_step_completed: responsesHandlers.on_run_step_completed,
           on_chain_stream: { handle: () => {} },
           on_chain_end: { handle: () => {} },
           on_agent_update: { handle: () => {} },
@@ -1339,60 +1334,32 @@ const executeResponse = async (envelope, { req, res }) => {
             : {}),
         };
 
-        // Create and run the agent
         const userId = principal.userId;
-        const userMCPAuthMap = mergedMCPAuthMap;
-
-        const run = await createRun({
+        const outcome = await executeRemotePiGeneration({
+          execution,
+          req,
+          agent: primaryConfig,
           agents: runAgents,
-          messages: formattedMessages,
-          indexTokenCountMap,
-          initialSummary,
-          runId: responseId,
-          summarizationConfig,
-          appConfig,
-          signal: execution.signal,
-          customHandlers: handlers,
-          initialSessions,
-          requestBody: mcpRequestBody,
-          user: { ...createSafeUser(req.user), id: userId },
-          traceContext: { endpoint: EModelEndpoint.agents },
-          tenantId: principal.tenantId,
-          isTemporary: isTemporaryTurn(req),
-          modelCallbacks: [terminalRunError.modelCallback],
+          callableToolNames: [...toolSet],
           clientToolNames: clientTools.clientToolNames,
-          /** Bills subagent child-run model calls (reported outside the
-           *  streamEvents loop) into the same collectedUsage array. */
-          subagentUsageSink: createSubagentUsageSink(collectedUsage),
+          clientToolDefinitions: clientTools.toolDefinitions.filter(({ name }) =>
+            clientTools.clientToolNames.has(name),
+          ),
+          toolDefinitions: piToolDefinitions,
+          messages: formattedMessages,
+          summary: initialSummary,
+          conversationId,
+          userId,
+          handlers,
+          toolExecuteHandler: handlers.on_tool_execute,
+          initialSessions,
+          usageAttribution: { provider: primaryConfig.provider },
+          onModelProviderError: terminalRunError.modelCallback.handleLLMError,
         });
-
-        if (!run) {
-          throw new Error('Failed to create agent run');
+        if (outcome.status === 'caller_tool_handoff') {
+          emitCallerToolHandoff(outcome.call);
         }
-
-        // Process the stream
-        const config = {
-          runName: 'AgentRun',
-          configurable: {
-            thread_id: conversationId,
-            user_id: userId,
-            user: createSafeUser(req.user),
-            requestBody: mcpRequestBody,
-            ...(userMCPAuthMap != null && { userMCPAuthMap }),
-          },
-          recursionLimit: resolveRecursionLimit(agentsEConfig, agent),
-          signal: execution.signal,
-          streamMode: 'values',
-          version: 'v2',
-        };
-
-        await run.processStream({ messages: formattedMessages }, config, {
-          callbacks: {
-            [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-              logger.error(`[Responses API] Tool Error "${toolId}"`, getSafeErrorMetadata(error));
-            },
-          },
-        });
+        collectedUsage.push(...outcome.usage);
 
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);
@@ -1565,7 +1532,7 @@ const executeResponse = async (envelope, { req, res }) => {
             },
           },
           on_tool_end: createOwnedToolEndHandler(toolEndCallback, logger),
-          on_run_step_completed: { handle: () => {} },
+          on_run_step_completed: aggregatorHandlers.on_run_step_completed,
           on_chain_stream: { handle: () => {} },
           on_chain_end: { handle: () => {} },
           on_agent_update: { handle: () => {} },
@@ -1581,57 +1548,31 @@ const executeResponse = async (envelope, { req, res }) => {
         };
 
         const userId = principal.userId;
-        const userMCPAuthMap = mergedMCPAuthMap;
-
-        const run = await createRun({
+        const outcome = await executeRemotePiGeneration({
+          execution,
+          req,
+          agent: primaryConfig,
           agents: runAgents,
-          messages: formattedMessages,
-          indexTokenCountMap,
-          initialSummary,
-          runId: responseId,
-          summarizationConfig,
-          appConfig,
-          signal: execution.signal,
-          customHandlers: handlers,
-          initialSessions,
-          requestBody: mcpRequestBody,
-          user: { ...createSafeUser(req.user), id: userId },
-          traceContext: { endpoint: EModelEndpoint.agents },
-          tenantId: principal.tenantId,
-          isTemporary: isTemporaryTurn(req),
-          modelCallbacks: [terminalRunError.modelCallback],
+          callableToolNames: [...toolSet],
           clientToolNames: clientTools.clientToolNames,
-          /** Bills subagent child-run model calls (reported outside the
-           *  streamEvents loop) into the same collectedUsage array. */
-          subagentUsageSink: createSubagentUsageSink(collectedUsage),
+          clientToolDefinitions: clientTools.toolDefinitions.filter(({ name }) =>
+            clientTools.clientToolNames.has(name),
+          ),
+          toolDefinitions: piToolDefinitions,
+          messages: formattedMessages,
+          summary: initialSummary,
+          conversationId,
+          userId,
+          handlers,
+          toolExecuteHandler: handlers.on_tool_execute,
+          initialSessions,
+          usageAttribution: { provider: primaryConfig.provider },
+          onModelProviderError: terminalRunError.modelCallback.handleLLMError,
         });
-
-        if (!run) {
-          throw new Error('Failed to create agent run');
+        if (outcome.status === 'caller_tool_handoff') {
+          addCallerToolHandoff(aggregator, outcome.call);
         }
-
-        const config = {
-          runName: 'AgentRun',
-          configurable: {
-            thread_id: conversationId,
-            user_id: userId,
-            user: createSafeUser(req.user),
-            requestBody: mcpRequestBody,
-            ...(userMCPAuthMap != null && { userMCPAuthMap }),
-          },
-          recursionLimit: resolveRecursionLimit(agentsEConfig, agent),
-          signal: execution.signal,
-          streamMode: 'values',
-          version: 'v2',
-        };
-
-        await run.processStream({ messages: formattedMessages }, config, {
-          callbacks: {
-            [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-              logger.error(`[Responses API] Tool Error "${toolId}"`, getSafeErrorMetadata(error));
-            },
-          },
-        });
+        collectedUsage.push(...outcome.usage);
 
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);

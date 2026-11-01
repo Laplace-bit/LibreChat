@@ -1,5 +1,4 @@
 const { GraphEvents } = require('@librechat/agents');
-const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { nanoid } = require('nanoid');
 const { logger, MAX_AGENT_EVENT_ACTOR_ENCODING_LENGTH } = require('@librechat/data-schemas');
@@ -9,11 +8,9 @@ const {
   SystemMessage,
 } = require('@librechat/agents/langchain/messages');
 const {
-  createRun,
   isEnabled,
   checkAccess,
   buildRunToolSet,
-  logToolError,
   sanitizeTitle,
   payloadParser,
   createSafeUser,
@@ -31,8 +28,6 @@ const {
   isMemoryAgentEnabled,
   recordCollectedUsage,
   resolveRunUsageContext,
-  getScheduleMCPExecution,
-  createScheduledMCPPolicyRecorder,
   recordFallbackTokenUsage,
   createDetachedSubagentUsageRecorder,
   sendEvent,
@@ -45,7 +40,6 @@ const {
   resolveRetainedToolTokens,
   computeSummaryUsedTokens,
   priorRunOutputTokens,
-  createSubagentUsageSink,
   anyAgentReplaysReasoningContent,
   GenerationJobManager,
   PENDING_ACTION_EXPIRED_CODE,
@@ -60,22 +54,15 @@ const {
   computeLegacyAgentRequestFingerprint,
   getRunDiscoveredTools,
   captureAuthoredSkills,
-  restoreAuthoredSkills,
   captureResumeModelParameters,
   pickResumeContext,
   getApprovalTtlMs,
-  getAgentCheckpointer,
   hasDurableAgentInterruptCheckpoint,
   isHITLEnabled,
   resolveToolApprovalPolicy,
   buildToolApprovalHooks,
-  buildToolApprovalExecutionConfig,
   collectAttachedCodeEnvironmentAgentIds,
-  collectAttachedCodeEnvironmentPolicySettings,
   collectAttachedCodeApprovalPolicies,
-  collectAttachedCodeRoutePolicies,
-  buildAttachedCodeEnvironmentAdmissionHooks,
-  resolveAttachedCodeApprovalMode,
   resolvePersistedCodeApprovalMode,
   getCodeApprovalPreservedFields,
   markNativeCodeToolApprovalRequests,
@@ -83,32 +70,21 @@ const {
   resolveRunToolApprovalAllows,
   getRunMCPToolAliases,
   collectAllowAlwaysAliases,
-  agentRunUsesCheckpointer,
-  canAgentGraphPause,
   agentRequestsAskUserQuestion,
   isToolDeniedByApprovalPolicy,
   exemptAskUserQuestionFromApproval,
   getPluginHookSource,
-  captureAgentCheckpointGeneration,
   isContentFilterError,
   isStepLimitError,
-  deleteAgentCheckpoint,
-  LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
-  LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY,
-  LIBRECHAT_CHECKPOINT_OWNER_KEY,
-  LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY,
-  LIBRECHAT_LEGACY_CHECKPOINT_KEY,
-  checkpointOwnerNamespacePrefix,
   isAskUserQuestionAdminDisabled,
   attachAskUserQuestionArgs,
   prepareRetainedAnswers,
   withRetainedAnswerTokenCounter,
   applyRetainedAnswers,
-  prepareRetainedAnswerInvocationMessages,
   resolveRetainedAnswersConfig,
   hydrateResumeRunSteps,
-  createContentIndexOffsetHandlers,
   createSteerIndexOffsetHandlers,
+  consumeSteersAtTurnEnd,
   createSteerDrainHook,
   createSteerPreemptBoundaryHook,
   createSteerTerminalContinuationHook,
@@ -117,12 +93,12 @@ const {
   isSteerPreemptSupported,
   isSteerTerminalContinuationSupported,
   buildSteerMedia,
+  convertPiSteerContent,
   collectSteerStampTargets,
   stampSteerPartMedia,
   createActivityLabelWiring,
   createActivityPhaseWiring,
   createReasoningLabelHostWiring,
-  createMCPRuntimeRequestBody,
   generateReasoningLabelRevision,
   getLabelUsageSequenceSeed,
   createAssistantPhaseStampingHandlers,
@@ -162,7 +138,6 @@ const {
   dedupeDocumentNames,
   processTextWithTokenLimit,
   logAgentMemorySnapshot,
-  createAgentMemoryCallback,
   assertAgentAttachmentLimits,
   assertAgentAttachmentTopology,
   collectHistoricalAttachmentIds,
@@ -184,7 +159,6 @@ const {
   resolveLangChainError,
   resolveYouTubeInjectionConfig,
   decrementPendingRequest,
-  maybePrewarmCodeSandbox,
   assertModelBoundContent,
   reportLocatorTraversalFailure,
   filterFilesByEndpointRuntimeConfig,
@@ -192,13 +166,11 @@ const {
   getPrivateTextInspectionTokens,
   getPrivateTextModelHooks,
   createPrivateTextInitialAdmissionCallback,
-  withPrivateTextAdmissionConfig,
   requirePrivateTextAdmission,
   requirePrivateTextPersistence,
   rejectPrivateTextAdmission,
   createInitialModelBoundAdmissionCallback,
   hasModelBoundContentProtection,
-  assertResumeRuntimeContentAllowed,
   collectReachableAgents,
   isStatefulCodeEnvironmentToolName,
   stampMcpServerIdentities,
@@ -223,7 +195,6 @@ const {
   markCompactionOutcome,
   resolvePersistableCodeEnvironmentDecision,
   getChatProjectContextKey,
-  isTemporaryTurn,
   hasEntityEmbeddings,
   AgentRuntimeUnavailableError,
   getAgentRuntimeUserFacingError,
@@ -260,7 +231,6 @@ const {
 } = require('@librechat/api');
 const {
   Run,
-  Callback,
   Providers,
   TitleMethod,
   formatMessage,
@@ -301,7 +271,6 @@ const BaseClient = require('~/app/clients/BaseClient');
 const { getMCPManager } = require('~/config');
 const db = require('~/models');
 const agentRuntimeDispatcher = createAgentRuntimeDispatcher({
-  createLegacyRun: createRun,
   executePiGeneration,
 });
 
@@ -1050,6 +1019,68 @@ class AgentClient extends BaseClient {
       historicalFileIds: this.turnHistoricalAttachmentIds,
       attachments: admitted,
     });
+  }
+
+  /**
+   * Build the Pi turn-end bridge for the generation's existing durable steer
+   * queue. Pi consumes this immediately before its next provider-request poll;
+   * GenerationJobManager remains authoritative for claim, recovery, and fences.
+   *
+   * @param {string | undefined} streamId
+   * @param {AbortSignal} generationSignal
+   */
+  buildPiSteerTurnEndHandler(streamId, generationSignal) {
+    if (!streamId) {
+      return undefined;
+    }
+    const assertProviderOwner = async (signal) => {
+      if (generationSignal.aborted || signal?.aborted === true) {
+        return false;
+      }
+      return GenerationJobManager.assertPiProviderOwner(
+        this.conversationId,
+        this.jobCreatedAt,
+        signal,
+      );
+    };
+    const drainOptions = {
+      streamId,
+      jobCreatedAt: this.jobCreatedAt,
+      applySteer: async (item) => {
+        if (!(await assertProviderOwner())) {
+          const error = new Error('This Pi run no longer owns the queued steer.');
+          error.code = 'PROVIDER_OWNER_FENCED';
+          throw error;
+        }
+        await this.applySteerPart(streamId, item);
+      },
+      onMediaError: (item) => this.stripSteerAttachmentRefs(streamId, item),
+      buildMedia: async (item) => {
+        const media = await buildSteerMedia({
+          client: this,
+          user: this.options.req?.user,
+          item,
+          getFiles: db.getFiles,
+          assertFilesAllowed: (files) => this.admitSteerAttachments(files, item.steerId),
+        });
+        this.admittedSteerAttachments.delete(item.steerId);
+        return media;
+      },
+      assertProviderOwner,
+      isDeferred: () => generationSignal.aborted,
+    };
+
+    return async ({ signal, steer }) => {
+      await consumeSteersAtTurnEnd(drainOptions, signal, {
+        deliver: async (message) => {
+          const content = convertPiSteerContent(message.content);
+          if (generationSignal.aborted || signal?.aborted === true) {
+            return;
+          }
+          await steer(content.text, content.images, { source: 'rpc' });
+        },
+      });
+    };
   }
 
   /**
@@ -2248,6 +2279,7 @@ class AgentClient extends BaseClient {
         provider: this.options.agent.provider,
         endpoint: this.options.endpoint,
         imageDetail: this.options.imageDetail,
+        requireInlineData: true,
       },
       VisionModes.agents,
     );
@@ -4841,14 +4873,10 @@ class AgentClient extends BaseClient {
     }
   }
 
-  async chatCompletion({ payload, userMCPAuthMap, abortController = null }) {
+  async chatCompletion({ payload, abortController = null }) {
     /** The inherited state is on the job before any abortable setup begins; a
      * publish already started while loading history is simply awaited. */
     await this.publishRunContextMeta?.();
-    /** @type {Partial<GraphRunnableConfig>} */
-    let config;
-    /** @type {ReturnType<createRun>} */
-    let run;
     /** @type {Promise<(TAttachment | null)[] | undefined>} */
     let memoryPromise;
     const appConfig = this.options.req.config;
@@ -4870,24 +4898,11 @@ class AgentClient extends BaseClient {
         abortController = new AbortController();
       }
 
-      /** Scheduled approvals are unattended by definition. Their pending action,
-       * replay context, and resolution fence must be shared across workers; their
-       * LangGraph continuation must also use a durable shared checkpointer. Redis
-       * provides the first half, while handleRunInterrupt verifies the exact durable
-       * checkpoint before exposing the pause. Refuse unsupported topologies before
-       * spending on provider work. */
       /** @type {AppConfig['endpoints']['agents']} */
       const agentsEConfig = appConfig.endpoints?.[EModelEndpoint.agents];
       const topLevelAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
       const attachedCodeEnvironmentAgentIds =
         collectAttachedCodeEnvironmentAgentIds(topLevelAgents);
-      const attachedCodeEnvironmentSettings =
-        collectAttachedCodeEnvironmentPolicySettings(topLevelAgents);
-      const codeApprovalMode = resolveAttachedCodeApprovalMode(
-        this.options.req.body.codeApprovalMode,
-        collectAttachedCodeApprovalPolicies(topLevelAgents),
-        agentsEConfig?.toolApproval?.enabled !== false,
-      );
       const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
         endpoint: agentsEConfig?.toolApproval,
         attachedCodeEnvironment: attachedCodeEnvironmentAgentIds.size > 0,
@@ -4900,122 +4915,11 @@ class AgentClient extends BaseClient {
             appConfig,
           })
         : undefined;
-      const admissionToolApprovalHooks = [
-        ...(resolvedToolApprovalHooks ?? []),
-        ...buildAttachedCodeEnvironmentAdmissionHooks(
-          attachedCodeEnvironmentAgentIds,
-          attachedCodeEnvironmentSettings,
-          codeApprovalMode,
-          collectAttachedCodeRoutePolicies(topLevelAgents),
-        ),
-      ];
-      const askUserQuestionAdminDisabled = isAskUserQuestionAdminDisabled(appConfig);
       const runToolApprovalAllows = resolveRunToolApprovalAllows(
         agentsEConfig?.toolApproval,
         this.options.req?.resolvedConversation,
         this.conversationId,
       );
-      const runCanPause = canAgentGraphPause({
-        policy: effectiveToolApprovalPolicy,
-        agents: topLevelAgents,
-        hostGeneratedToolNames:
-          this.options.subagentTasks == null ? undefined : [Constants.CHECK_BACKGROUND_TASK],
-        resolvedProgrammaticHooks: admissionToolApprovalHooks,
-        pluginHookSource: getPluginHookSource(),
-        askUserQuestionAdminDisabled,
-        toolApprovalAllows: runToolApprovalAllows,
-      });
-      const runUsesCheckpointer = agentRunUsesCheckpointer({
-        policy: effectiveToolApprovalPolicy,
-        agents: topLevelAgents,
-        askUserQuestionAdminDisabled,
-      });
-      if (this.options.req?._isScheduledFire === true && runCanPause) {
-        if (!GenerationJobManager.isRedis) {
-          const error = new Error(
-            'Scheduled agent runs that can pause require a shared generation store. ' +
-              'Enable Redis streams with USE_REDIS_STREAMS=true.',
-          );
-          error.code = 'SCHEDULED_HITL_REQUIRES_SHARED_STORE';
-          throw error;
-        }
-        if (!(await getAgentCheckpointer(agentsEConfig?.checkpointer))) {
-          const error = new Error(
-            'Scheduled agent runs that can pause require a durable shared checkpointer. ' +
-              'Use the default MongoDB checkpointer.',
-          );
-          error.code = 'SCHEDULED_HITL_REQUIRES_DURABLE_CHECKPOINT';
-          throw error;
-        }
-      }
-
-      /** Fire-and-forget: boot each selected stateful environment in
-       *  parallel with generation so the first execute_code/bash call lands
-       *  on a warm VM. No-op unless a reachable agent resolved
-       *  `statefulCodeSessions`. */
-      maybePrewarmCodeSandbox({
-        req: this.options.req,
-        conversationId: this.conversationId,
-        agents: [this.options.agent, ...(this.agentConfigs?.values() ?? [])],
-      });
-
-      config = {
-        runName: 'AgentRun',
-        configurable: {
-          thread_id: this.conversationId,
-          ...buildToolApprovalExecutionConfig(this.responseMessageId, this.jobCreatedAt),
-          // LangGraph owns `checkpoint_ns` and resets it to '' at every root
-          // invocation. The saver maps this private immutable generation key
-          // into its physical namespace while tools keep the conversation id.
-          checkpoint_ns: '',
-          [LIBRECHAT_CHECKPOINT_NAMESPACE_KEY]: this.checkpointNamespace,
-          [LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY]:
-            (this.user ?? this.options.req.user?.id)
-              ? checkpointOwnerNamespacePrefix(
-                  this.user ?? this.options.req.user?.id,
-                  resolveRequestTenantId(this.options.req),
-                )
-              : undefined,
-          ...(this.eventActorCheckpointId == null
-            ? {}
-            : { checkpoint_id: this.eventActorCheckpointId }),
-          ...(this.eventActorInvocationId == null
-            ? {}
-            : {
-                [LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY]: this.eventActorInvocationId,
-                [LIBRECHAT_CHECKPOINT_OWNER_KEY]: checkpointOwnerNamespacePrefix(
-                  this.options.req.user.id,
-                  this.options.req._agentEventBindingTenantId,
-                ),
-                ...(this.eventActorCheckpointId == null
-                  ? {}
-                  : { [LIBRECHAT_LEGACY_CHECKPOINT_KEY]: this.eventActorCheckpointId }),
-                event_actor_invocation_id: this.eventActorInvocationId,
-                event_actor_depth: 1,
-              }),
-          last_agent_index: this.agentConfigs?.size ?? 0,
-          user_id: this.user ?? this.options.req.user?.id,
-          hide_sequential_outputs: this.options.agent.hide_sequential_outputs,
-          requestBody:
-            this.options.mcpRequestBody ??
-            createMCPRuntimeRequestBody({
-              messageId: this.responseMessageId,
-              conversationId: this.conversationId,
-              parentMessageId: this.parentMessageId,
-              codeEnvironmentMode:
-                this.options.req.body.codeEnvironmentMode ??
-                this.options.req.resolvedConversation?.codeEnvironmentMode,
-              codeWorkspaces:
-                this.options.req.body.codeWorkspaces ??
-                this.options.req.resolvedConversation?.codeWorkspaces,
-            }),
-          user: createSafeUser(this.options.req.user),
-        },
-        recursionLimit: resolveRecursionLimit(agentsEConfig, this.options.agent),
-        signal: abortController.signal,
-        streamMode: 'values',
-        version: 'v2',
-      };
 
       const toolSet = buildRunToolSet(
         this.options.agent,
@@ -5140,7 +5044,6 @@ class AgentClient extends BaseClient {
         (this.eventActorContinuation === 'warm' ? this.compactionSemanticIndexSnapshot : undefined);
       const continuationSummary =
         this.eventActorContinuation === 'warm' ? this.eventActorSummary : initialSummary;
-      const continuationCompactionSemanticIndex = this.compactionSemanticIndexSnapshot?.entries;
       if (boundaryTokenAdjustment) {
         logger.debug(
           `[AgentClient] Boundary token adjustment: ${boundaryTokenAdjustment.original} → ${boundaryTokenAdjustment.adjusted} (${boundaryTokenAdjustment.remainingChars}/${boundaryTokenAdjustment.totalChars} chars)`,
@@ -5243,12 +5146,10 @@ class AgentClient extends BaseClient {
           throw new AgentRuntimeUnavailableError();
         }
         this.runtimeProgress = createAgentRuntimeExecutionProgress(runtimeResolution.selection);
-        const isPiRuntime = runtimeResolution.selection.engine === 'pi';
         const request = this.options.req;
         const agents = [this.options.agent];
-        // Include additional agents when:
-        // - agentConfigs has agents (from addedConvo parallel execution or agent handoffs)
-        // - Agents without incoming edges become start nodes and run in parallel automatically
+        // Pi currently admits only a single root. Keep the complete loaded set in
+        // the compatibility check so a connected graph fails before provider work.
         if (this.agentConfigs && this.agentConfigs.size > 0) {
           agents.push(...this.agentConfigs.values());
         }
@@ -5258,179 +5159,104 @@ class AgentClient extends BaseClient {
         let piActionToolSchemas;
         let piCodeSessionBridge;
         let askUserQuestionEnabled = false;
-        if (isPiRuntime) {
-          const unsupportedModes = [];
-          if (
-            this.eventActorContinuation != null ||
-            this.eventActorInvocationId != null ||
-            request?._isAgentTrigger === true ||
-            request?._agentEventBindingParentConversationId != null
-          ) {
-            unsupportedModes.push('event_actor');
-          }
-          if (request?._isScheduledFire === true || request?.body?.scheduleId != null) {
-            unsupportedModes.push('scheduled');
-          }
-          if (
-            this.options.subagentTasks != null ||
-            this.agentConfigs?.size > 0 ||
-            (this.options.agent?.edges?.length ?? 0) > 0 ||
-            (this.options.agent?.subagents?.length ?? 0) > 0 ||
-            (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
-          ) {
-            unsupportedModes.push('background');
-          }
-          if (isCompactionTurn) {
-            unsupportedModes.push('compaction');
-          }
-          if (request?.body?.isRegenerate === true || request?.body?.isContinued === true) {
-            unsupportedModes.push('regenerate');
-          }
-          if (
-            request?._recoveredSteerId != null ||
-            request?.body?.steerId != null ||
-            request?.body?.steer != null
-          ) {
-            unsupportedModes.push('steer');
-          }
-          if (attachedCodeEnvironmentAgentIds.size > 0) {
-            unsupportedModes.push('code_api_environment');
-          }
+        const unsupportedModes = [];
+        if (
+          this.eventActorContinuation != null ||
+          this.eventActorInvocationId != null ||
+          request?._isAgentTrigger === true ||
+          request?._agentEventBindingParentConversationId != null
+        ) {
+          unsupportedModes.push('event_actor');
+        }
+        if (request?._isScheduledFire === true || request?.body?.scheduleId != null) {
+          unsupportedModes.push('scheduled');
+        }
+        if (
+          this.options.subagentTasks != null ||
+          this.agentConfigs?.size > 0 ||
+          (this.options.agent?.edges?.length ?? 0) > 0 ||
+          (this.options.agent?.subagents?.length ?? 0) > 0 ||
+          (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
+        ) {
+          unsupportedModes.push('background');
+        }
+        if (isCompactionTurn) {
+          unsupportedModes.push('compaction');
+        }
+        if (request?.body?.isRegenerate === true || request?.body?.isContinued === true) {
+          unsupportedModes.push('regenerate');
+        }
+        if (
+          request?._recoveredSteerId != null ||
+          request?.body?.steerId != null ||
+          request?.body?.steer != null
+        ) {
+          unsupportedModes.push('steer');
+        }
+        if (attachedCodeEnvironmentAgentIds.size > 0) {
+          unsupportedModes.push('code_api_environment');
+        }
 
-          const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
-          askUserQuestionEnabled =
-            !isAskUserQuestionAdminDisabled(appConfig) &&
-            agentRequestsAskUserQuestion(this.options.agent) &&
-            !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
-          const callableToolNames = [...toolSet].filter(
-            (name) =>
-              !internalToolNames.has(name) &&
-              (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
-          );
-          const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
-            ? this.options.agent.toolDefinitions
-            : [];
-          piToolDefinitions = configuredToolDefinitions.filter(
-            (definition) =>
-              (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
-                isPiMcpToolName(definition?.name) ||
-                isPiActionToolName(definition?.name)) &&
-              callableToolNames.includes(definition.name),
-          );
-          try {
-            piMcpToolSchemas = compilePiMcpToolSchemaRegistry(piToolDefinitions);
-            piActionToolSchemas = compilePiActionToolSchemaRegistry(piToolDefinitions);
-          } catch (error) {
-            if (error instanceof PiToolCompatibilityError) {
-              throw new AgentRuntimeUnavailableError();
-            }
-            throw error;
-          }
-          const piHasCodeExecutionTools = piToolDefinitions.some((definition) =>
-            isPiCodeExecutionToolName(definition.name),
-          );
-          if (piHasCodeExecutionTools && !isPiManagedCodeExecutionCompatible(this.options.agent)) {
-            unsupportedModes.push('code_api_environment');
-          }
-          assertPiCompatible({
-            rootAgentId: this.options.agent?.id,
-            loadedAgentIds: agents.map((agent) => agent?.id),
-            callableToolNames,
-            supportedToolNames: piToolDefinitions.map((definition) => definition.name),
-            unsupportedModes,
-          });
-          piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
-          if (piModelBindingFactory == null) {
+        const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
+        askUserQuestionEnabled =
+          !isAskUserQuestionAdminDisabled(appConfig) &&
+          agentRequestsAskUserQuestion(this.options.agent) &&
+          !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
+        const callableToolNames = [...toolSet].filter(
+          (name) =>
+            !internalToolNames.has(name) &&
+            (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
+        );
+        const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
+          ? this.options.agent.toolDefinitions
+          : [];
+        piToolDefinitions = configuredToolDefinitions.filter(
+          (definition) =>
+            (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
+              isPiMcpToolName(definition?.name) ||
+              isPiActionToolName(definition?.name)) &&
+            callableToolNames.includes(definition.name),
+        );
+        try {
+          piMcpToolSchemas = compilePiMcpToolSchemaRegistry(piToolDefinitions);
+          piActionToolSchemas = compilePiActionToolSchemaRegistry(piToolDefinitions);
+        } catch (error) {
+          if (error instanceof PiToolCompatibilityError) {
             throw new AgentRuntimeUnavailableError();
           }
-          if (piHasCodeExecutionTools) {
-            const codeSessionKey = this.options.agent.codeSessionKey ?? Constants.EXECUTE_CODE;
-            piCodeSessionBridge = createPiCodeSessionBridge(initialSessions?.get(codeSessionKey));
-          }
+          throw error;
         }
-        const initialModelBoundAdmission = isPiRuntime
-          ? undefined
-          : AgentClient.prototype.createInitialModelBoundAdmissionCallback.call(
-              this,
-              AgentClient.getStartingAgentIds(agents),
-            );
-        const modelBoundCallback = isPiRuntime
-          ? undefined
-          : AgentClient.prototype.createModelBoundChatModelCallback.call(
-              this,
-              initialModelBoundAdmission,
-            );
-        if (!isPiRuntime) {
-          config = withPrivateTextAdmissionConfig(config, initialModelBoundAdmission);
+        const piHasCodeExecutionTools = piToolDefinitions.some((definition) =>
+          isPiCodeExecutionToolName(definition.name),
+        );
+        if (piHasCodeExecutionTools && !isPiManagedCodeExecutionCompatible(this.options.agent)) {
+          unsupportedModes.push('code_api_environment');
         }
-
+        assertPiCompatible({
+          rootAgentId: this.options.agent?.id,
+          loadedAgentIds: agents.map((agent) => agent?.id),
+          callableToolNames,
+          supportedToolNames: piToolDefinitions.map((definition) => definition.name),
+          unsupportedModes,
+        });
+        piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
+        if (piModelBindingFactory == null) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        if (piHasCodeExecutionTools) {
+          const codeSessionKey = this.options.agent.codeSessionKey ?? Constants.EXECUTE_CODE;
+          piCodeSessionBridge = createPiCodeSessionBridge(initialSessions?.get(codeSessionKey));
+        }
         const startMemoryRun = () => {
           if (this.processMemory && !isCompactionTurn && memoryPromise == null) {
             memoryPromise = this.runMemory(memoryMessages);
           }
         };
-        if (!isPiRuntime) {
-          startMemoryRun();
-        }
+        startMemoryRun();
 
-        const { calibrationRatio, fadingTier, fadingTiers } = resolveRunSeeds(this);
+        const { calibrationRatio } = resolveRunSeeds(this);
 
         const streamId = this.options.req?._resumableStreamId;
-        // HITL: establish an empty checkpoint barrier for THIS immutable generation
-        // before exposing its graph. A retried/recovered initialization may have left
-        // partial state in the same saver scope; a predecessor uses a different scope,
-        // so even a late remote write cannot be rehydrated or deleted here. No-op when
-        // HITL is off or the generation has no remnants. Deliberately unconditional
-        // per HITL turn: any cheaper Redis flag can go stale across replicas/restarts,
-        // while these are two indexed, usually-empty deleteMany operations.
-        // Mirror createRun's checkpointer attachment gate. This is deliberately
-        // broader than pause admission: retries must prune remnants even when a
-        // policy or request hook changed from pausing to non-pausing.
-        //
-        // Start the prune alongside graph construction. The all-settled barrier
-        // below still guarantees it completes before the graph is exposed or run.
-        const shouldPruneCheckpoint =
-          !isPiRuntime && streamId && this.eventActorInvocationId == null && runUsesCheckpointer;
-        let checkpointPrunePromise = Promise.resolve();
-        if (shouldPruneCheckpoint && this.checkpointNamespace !== '') {
-          checkpointPrunePromise = deleteAgentCheckpoint(
-            this.conversationId,
-            agentsEConfig?.checkpointer,
-            undefined,
-            {
-              throwOnError: true,
-              checkpointNamespace: this.checkpointNamespace,
-            },
-          );
-        } else if (shouldPruneCheckpoint) {
-          checkpointPrunePromise = captureAgentCheckpointGeneration(
-            this.conversationId,
-            agentsEConfig?.checkpointer,
-            { throwOnError: true },
-          ).then(async (checkpointGeneration) => {
-            /** Legacy jobs share LangGraph's root/nested namespaces. Capture
-             * their immutable ids first, then prove this client still owns
-             * the exact job epoch before deleting that set. If a replacement
-             * arrived before/during capture the check fails; if it arrives
-             * after the check, its newly-written checkpoint ids are outside
-             * the snapshot and therefore cannot be deleted. */
-            const liveJob = await GenerationJobManager.getJobStore().getJob(streamId);
-            if (
-              !liveJob ||
-              liveJob.createdAt !== this.jobCreatedAt ||
-              liveJob.status !== 'running'
-            ) {
-              throw new Error('Generation replaced before legacy checkpoint cleanup');
-            }
-            await deleteAgentCheckpoint(
-              this.conversationId,
-              agentsEConfig?.checkpointer,
-              checkpointGeneration,
-              { throwOnError: true },
-            );
-          });
-        }
-
         const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
         const activityPhase = this.buildActivityPhaseWiring(streamId, abortController.signal);
         const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal);
@@ -5442,359 +5268,211 @@ class AgentClient extends BaseClient {
           activityPhase?.handlers(offsetHandlers) ??
           (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
 
-        if (isPiRuntime) {
-          const piSystemPrompt = buildPiSystemPrompt({
-            agent: this.options.agent,
-            summary: continuationSummary,
-          });
-          const summarizationConfig = this.options.agent.summarization ?? appConfig?.summarization;
-          const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
-            summarizationConfig?.reserveRatio,
-            this.options.agent.baseContextTokens,
-            this.maxContextTokens,
-          );
-          const piMessages =
-            piSystemPrompt.length > 0 ? [new SystemMessage(piSystemPrompt), ...messages] : messages;
-          const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
-          try {
-            /** Pi has no LangChain callback boundary. Inspect the exact formatted host messages
-             *  before converting them, retaining stored-message and file provenance. */
-            AgentClient.prototype.assertBuiltModelBoundContent.call(this, piMessages);
-          } catch (error) {
-            persistence?.cancel();
-            throw error;
-          }
-
-          /** The legacy first-model callback both persists deferred user input and admits
-           *  private-text sidecars. Pi performs the same ordered boundary explicitly after
-           *  its final host-side input check and before any model-side memory work. */
-          await requirePrivateTextPersistence(
-            request,
-            () => (persistence?.isPending() === true ? persistence.start() : undefined),
-            this.privateTextStart,
-          );
-          if (persistence?.isPending() === true) {
-            persistence.start();
-          }
-          await requirePrivateTextAdmission(request, abortController.signal);
-          startMemoryRun();
-
-          const piHandlers = reasoningLabel?.handlers(activityHandlers) ?? activityHandlers;
-          const baseStepIndex = this.contentParts.length;
-          let nextStepIndex = baseStepIndex;
-          const piMetadata = {
-            thread_id: this.conversationId,
-            user_id: this.user ?? request?.user?.id,
-            run_id: this.responseMessageId,
-            agent_id: this.options.agent.id,
-            agentId: this.options.agent.id,
-            last_agent_id: this.options.agent.id,
-            langgraph_node: `agent=${this.options.agent.id}`,
-            hide_sequential_outputs: false,
-          };
-
-          this.options.startupTelemetry?.mark('pi_session_started');
-          const createPiStepIdentity = () => {
-            const sequence = nextStepIndex++;
-            return {
-              id: `pi-${this.responseMessageId}-${nanoid()}`,
-              index: sequence,
-              messageId: this.responseMessageId,
-              runId: this.responseMessageId,
-              agentId: this.options.agent.id,
-            };
-          };
-          const handlePiHostEvent = async (event) => {
-            const handler = piHandlers?.[event.event];
-            if (handler == null || typeof handler.handle !== 'function') {
-              throw new AgentRuntimeUnavailableError();
-            }
-            await handler.handle(event.event, event.data, piMetadata);
-          };
-          const piToolHandler = piHandlers?.[GraphEvents.ON_TOOL_EXECUTE];
-          const executePiHostToolCall =
-            typeof piToolHandler?.handle === 'function'
-              ? createPiHostToolBatchExecutor({
-                  handler: piToolHandler,
-                  userId: this.user ?? request?.user?.id,
-                  agentId: this.options.agent.id,
-                  request,
-                  threadId: this.conversationId,
-                  runId: this.responseMessageId,
-                  metadata: piMetadata,
-                  authorizedToolNames: piToolDefinitions.map((definition) => definition.name),
-                  ...(piCodeSessionBridge == null
-                    ? {}
-                    : { codeSessionBridge: piCodeSessionBridge }),
-                  onError: (error) =>
-                    logger.error(
-                      '[AgentClient] Pi host tool execution failed',
-                      getSafeErrorMetadata(error),
-                    ),
-                })
-              : undefined;
-          const piToolExecutionGate = createPiToolApprovalGate({
-            policy: exemptAskUserQuestionFromApproval(
-              effectiveToolApprovalPolicy,
-              ASK_USER_QUESTION_TOOL_NAME,
-            ),
-            allowedTools: runToolApprovalAllows,
-            logger,
-            pluginHookSource: getPluginHookSource(),
-            resolvedHooks: resolvedToolApprovalHooks,
-            hookContext: {
-              userId: request?.user?.id,
-              conversationId: this.conversationId,
-              tenantId: resolveRequestTenantId(request ?? {}),
-              appConfig,
-            },
-            runId: this.responseMessageId,
-            threadId: this.conversationId,
-            agentId: this.options.agent.id,
-            mcpToolSchemas: piMcpToolSchemas,
-            actionToolSchemas: piActionToolSchemas,
-            model:
-              this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
-          });
-          const execution = await agentRuntimeDispatcher.executeTurn({
-            engine: 'pi',
-            selection: runtimeResolution.selection,
-            input: {
-              messages: piMessages,
-              createModelBinding: piModelBindingFactory,
-              toolDefinitions: piToolDefinitions,
-              mcpToolSchemas: piMcpToolSchemas,
-              actionToolSchemas: piActionToolSchemas,
-              executeHostToolCall: executePiHostToolCall,
-              ...(piCodeSessionBridge == null
-                ? {}
-                : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
-              toolExecutionGate: piToolExecutionGate,
-              askUserQuestionEnabled,
-              createToolStepIdentity: createPiStepIdentity,
-              createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
-              signal: abortController.signal,
-              onSessionCreated: () => {
-                this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-              },
-              usageAttribution: {
-                provider: this.options.agent.provider,
-                agentId: this.options.agent.id,
-                runId: this.responseMessageId,
-              },
-              contextUsage: {
-                tokenCounter,
-                runId: this.responseMessageId,
-                agentId: this.options.agent.id,
-                maxContextTokens: effectiveMaxContextTokens,
-                reserveRatio: summarizationConfig?.reserveRatio,
-                calibrationRatio,
-                summaryTokens: continuationSummary?.tokenCount,
-              },
-              createStepIdentity: createPiStepIdentity,
-              handleHostEvent: handlePiHostEvent,
-            },
-          });
-          if (execution.engine !== 'pi') {
-            throw new AgentRuntimeUnavailableError();
-          }
-          const outcome = execution.outcome;
-
-          this.options.startupTelemetry?.mark('pi_session_settled');
-          if (outcome.status === 'paused') {
-            await this.handlePiPauseInterrupt(
-              outcome.signal,
-              streamId,
-              piMcpToolSchemas,
-              piActionToolSchemas,
-            );
-            if (!this.pendingApproval) {
-              throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
-                code: 'RUN_REPLACED',
-              });
-            }
-            /** Match the legacy initial-turn path: the durable pause is committed before
-             * its pending-action event is exposed to the existing client UI. Resume
-             * re-pauses expose only after the route persists the new pause projection. */
-            await this.exposePendingApproval();
-          } else if (outcome.status === 'unsupported') {
-            throw new AgentRuntimeUnavailableError();
-          }
-          if (outcome.status === 'completed' || outcome.status === 'paused') {
-            this.runtimeProgress = settleAgentRuntimeExecution(
-              this.runtimeProgress,
-              outcome.status,
-            );
-          } else if (outcome.status === 'cancelled') {
-            this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, 'cancelled');
-          }
-          if (outcome.status === 'cancelled' && abortController.signal.aborted !== true) {
-            throw new AgentRuntimeUnavailableError();
-          }
-          return;
+        const piSystemPrompt = buildPiSystemPrompt({
+          agent: this.options.agent,
+          summary: continuationSummary,
+        });
+        const summarizationConfig = this.options.agent.summarization ?? appConfig?.summarization;
+        const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
+          summarizationConfig?.reserveRatio,
+          this.options.agent.baseContextTokens,
+          this.maxContextTokens,
+        );
+        const piMessages =
+          piSystemPrompt.length > 0 ? [new SystemMessage(piSystemPrompt), ...messages] : messages;
+        const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
+        try {
+          /** Pi has no LangChain callback boundary. Inspect the exact formatted host messages
+           *  before converting them, retaining stored-message and file provenance. */
+          AgentClient.prototype.assertBuiltModelBoundContent.call(this, piMessages);
+        } catch (error) {
+          persistence?.cancel();
+          throw error;
         }
 
-        const createRunOptions = {
-          scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
-          recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
-            getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
-            {
-              streamId,
-              jobCreatedAt: this.jobCreatedAt,
-              userId: this.options.req?.user?.id,
-              tenantId: this.options.req?.user?.tenantId,
-            },
-            require('~/server/services/Schedules').recordMCPToolAuthFailure,
-          ),
-          agents,
-          // Conversation-stable identity for the e2e run hook; a resumed run
-          // carries no messages, so history cannot identify the conversation.
-          conversationId: this.conversationId,
-          isTemporary: isTemporaryTurn(this.options.req),
-          messages,
-          discoveredToolNames:
-            this.eventActorContinuation === 'warm' ? this.eventActorDiscoveredToolNames : undefined,
-          modelCallbacks: [
-            modelBoundCallback,
-            createAgentMemoryCallback(this.attachmentMemoryContext ?? {}),
-            terminalRunError.modelCallback,
-          ],
-          // This controller implements the full HITL pause/resume lifecycle (handleRunInterrupt
-          // persists the pending action; the /resume route rebuilds + continues the run), so it
-          // opts into the tool-approval wiring. Non-resumable callers (OpenAI-compat, Responses)
-          // leave this off so an approval-gated tool can't pause where there's no resume path.
-          hitlCapable: true,
-          toolApprovalStorage: db,
-          resolvedToolApprovalHooks,
-          toolApprovalAllows: runToolApprovalAllows,
-          toolInputValidationErrors: this.toolInputValidationErrors,
-          // Mid-run steering: drain queued user messages at each tool-batch
-          // boundary and inject them into graph state. The offset wrapper
-          // shifts SDK content indices past any spliced steer parts.
-          steering: this.buildSteerWiring(streamId),
-          activityLabel,
-          activityPhase,
-          eventActorCheckpointing: this.eventActorInvocationId != null,
-          // The token map is positional over the DB-derived history. A warm
-          // continuation runs on checkpoint-restored state (restored messages
-          // plus the one new event), so those indices address different
-          // messages and the pruner would never recount them. Hand it an empty
-          // map so every count is derived from the messages actually in state.
-          // The active summary lives in AgentContext rather than checkpointed
-          // graph messages, so warm turns restore the actor-head copy while
-          // rebuilt turns use the summary reconstructed from durable history.
-          indexTokenCountMap: this.eventActorContinuation === 'warm' ? {} : indexTokenCountMap,
-          initialSummary: continuationSummary,
-          ...(continuationCompactionSemanticIndex == null
-            ? {}
-            : { compactionSemanticIndex: continuationCompactionSemanticIndex }),
-          initialSessions,
-          calibrationRatio,
-          fadingTier,
-          fadingTiers,
-          runId: this.responseMessageId,
-          signal: abortController.signal,
-          /** The phase wrapper stays outermost: it claims and offsets the
-           *  parent slot before the text step reaches the normal handlers. */
-          customHandlers: reasoningLabel?.handlers(activityHandlers) ?? activityHandlers,
-          requestBody: config.configurable.requestBody,
-          codeApprovalMode,
-          user: createSafeUser(this.options.req?.user),
-          traceContext: buildTraceContext(this.options),
-          tenantId: resolveRequestTenantId(this.options.req ?? {}),
-          summarizationConfig: appConfig?.summarization,
-          summarizeOnly: this.isCompactionTurn(),
-          appConfig,
-          tokenCounter,
-          /** Bills subagent child-run model calls — foreground usage joins
-           *  the parent batch, while detached usage is recorded per call and
-           *  persisted with its child result because it may outlive this turn.
-           *  The sink also streams each as an `on_token_usage` event so the
-           *  gauge's session cost/totals include billed subagent usage (the
-           *  `subagent` tag keeps it out of the live context meter). */
-          subagentUsageSink: createSubagentUsageSink(
-            this.collectedUsage,
-            this.buildSubagentUsageEmitter(appConfig),
-            this.buildDetachedSubagentUsageRecorder(balanceConfig, transactionsConfig),
-          ),
-          subagentTasks: this.options.subagentTasks,
-          runFiles: this.options.runFiles,
+        /** The host first-model boundary both persists deferred user input and admits
+         *  private-text sidecars. Pi performs the same ordered boundary explicitly after
+         *  its final host-side input check and before any model-side memory work. */
+        await requirePrivateTextPersistence(
+          request,
+          () => (persistence?.isPending() === true ? persistence.start() : undefined),
+          this.privateTextStart,
+        );
+        if (persistence?.isPending() === true) {
+          persistence.start();
+        }
+        await requirePrivateTextAdmission(request, abortController.signal);
+        startMemoryRun();
+
+        const piHandlers = reasoningLabel?.handlers(activityHandlers) ?? activityHandlers;
+        const baseStepIndex = this.contentParts.length;
+        let nextStepIndex = baseStepIndex;
+        const piMetadata = {
+          thread_id: this.conversationId,
+          user_id: this.user ?? request?.user?.id,
+          run_id: this.responseMessageId,
+          agent_id: this.options.agent.id,
+          agentId: this.options.agent.id,
+          last_agent_id: this.options.agent.id,
+          langgraph_node: `agent=${this.options.agent.id}`,
+          hide_sequential_outputs: false,
         };
 
-        const execution = await agentRuntimeDispatcher.executeTurn({
-          engine: 'legacy',
+        this.options.startupTelemetry?.mark('pi_session_started');
+        const createPiStepIdentity = () => {
+          const sequence = nextStepIndex++;
+          return {
+            id: `pi-${this.responseMessageId}-${nanoid()}`,
+            index: sequence,
+            messageId: this.responseMessageId,
+            runId: this.responseMessageId,
+            agentId: this.options.agent.id,
+          };
+        };
+        const handlePiHostEvent = async (event) => {
+          const handler = piHandlers?.[event.event];
+          if (handler == null || typeof handler.handle !== 'function') {
+            throw new AgentRuntimeUnavailableError();
+          }
+          await handler.handle(event.event, event.data, piMetadata);
+        };
+        const piToolHandler = piHandlers?.[GraphEvents.ON_TOOL_EXECUTE];
+        const executePiHostToolBatch =
+          typeof piToolHandler?.handle === 'function'
+            ? createPiHostToolBatchExecutor({
+                handler: piToolHandler,
+                userId: this.user ?? request?.user?.id,
+                agentId: this.options.agent.id,
+                request,
+                threadId: this.conversationId,
+                runId: this.responseMessageId,
+                metadata: piMetadata,
+                authorizedToolNames: piToolDefinitions.map((definition) => definition.name),
+                authorize: (signal) =>
+                  GenerationJobManager.assertPiProviderOwner(
+                    this.conversationId,
+                    this.jobCreatedAt,
+                    signal,
+                  ),
+                ...(piCodeSessionBridge == null ? {} : { codeSessionBridge: piCodeSessionBridge }),
+                onError: (error) =>
+                  logger.error(
+                    '[AgentClient] Pi host tool execution failed',
+                    getSafeErrorMetadata(error),
+                  ),
+              })
+            : undefined;
+        const executePiHostToolCall =
+          executePiHostToolBatch == null
+            ? undefined
+            : async (call, signal) => {
+                const admitted = await GenerationJobManager.admitPiToolInvocation(
+                  this.conversationId,
+                  this.jobCreatedAt,
+                  call.id,
+                );
+                if (!admitted) {
+                  const error = new Error(
+                    'This run no longer owns the permission to execute tools.',
+                  );
+                  error.code = 'PROVIDER_OWNER_FENCED';
+                  throw error;
+                }
+                return executePiHostToolBatch(call, signal);
+              };
+        const piToolExecutionGate = createPiToolApprovalGate({
+          policy: exemptAskUserQuestionFromApproval(
+            effectiveToolApprovalPolicy,
+            ASK_USER_QUESTION_TOOL_NAME,
+          ),
+          allowedTools: runToolApprovalAllows,
+          logger,
+          pluginHookSource: getPluginHookSource(),
+          resolvedHooks: resolvedToolApprovalHooks,
+          hookContext: {
+            userId: request?.user?.id,
+            conversationId: this.conversationId,
+            tenantId: resolveRequestTenantId(request ?? {}),
+            appConfig,
+          },
+          runId: this.responseMessageId,
+          threadId: this.conversationId,
+          agentId: this.options.agent.id,
+          mcpToolSchemas: piMcpToolSchemas,
+          actionToolSchemas: piActionToolSchemas,
+          model:
+            this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
+        });
+        const outcome = await agentRuntimeDispatcher.executeTurn({
+          engine: 'pi',
           selection: runtimeResolution.selection,
-          createRunOptions,
-          checkpointPrunePromise,
-          onRunBuilt: () => {
-            this.options.startupTelemetry?.mark('run_created');
-          },
-          onRunCreated: async (createdRun) => {
-            run = createdRun;
-            this.run = run;
-            this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-            if (this._resolveRun) {
-              this._resolveRun(run);
-              this._resolveRun = null;
-            }
-
-            if (streamId && run.Graph) {
-              GenerationJobManager.setGraph(streamId, run.Graph, this.jobCreatedAt);
-            }
-
-            if (userMCPAuthMap != null) {
-              config.configurable.userMCPAuthMap = userMCPAuthMap;
-            }
-
-            /** @deprecated Agent Chain */
-            config.configurable.last_agent_id = agents[agents.length - 1].id;
-          },
-          beforeProcess: async () => {
-            this.options.startupTelemetry?.mark('stream_processing_started');
-            /** Flag durable BEFORE the run can claim a label: gap reconciliation
-             *  is gated on it, and ordering it here (one settled-on-failure
-             *  await) keeps the claim-time reservation emit immediate — see
-             *  `emitLabelEvent` in buildActivityLabelWiring. */
-            if (this.activityLabelsMarkedPromise != null) {
-              await this.activityLabelsMarkedPromise;
-            }
-            /** The inherited tier must be on the job before any Stop can read it. */
-            await this.publishRunContextMeta?.();
-          },
-          prepareProcessInput: async (createdRun) => {
-            const invocationMessages = await prepareRetainedAnswerInvocationMessages(
-              messages,
-              this.eventActorContinuation === 'warm',
-              () => createdRun.graphRunnable.getState(config),
-            );
-            return { messages: invocationMessages };
-          },
-          afterProcess: () => reasoningLabel?.complete(),
-          config,
-          processOptions: {
-            callbacks: {
-              [Callback.TOOL_ERROR]: logToolError,
+          input: {
+            messages: piMessages,
+            createModelBinding: piModelBindingFactory,
+            toolDefinitions: piToolDefinitions,
+            mcpToolSchemas: piMcpToolSchemas,
+            actionToolSchemas: piActionToolSchemas,
+            executeHostToolCall: executePiHostToolCall,
+            ...(piCodeSessionBridge == null
+              ? {}
+              : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
+            toolExecutionGate: piToolExecutionGate,
+            askUserQuestionEnabled,
+            createToolStepIdentity: createPiStepIdentity,
+            createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
+            signal: abortController.signal,
+            onModelProviderError: terminalRunError.modelCallback.handleLLMError,
+            onTurnEnd: this.buildPiSteerTurnEndHandler(streamId, abortController.signal),
+            onSessionCreated: () => {
+              this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
             },
+            usageAttribution: {
+              provider: this.options.agent.provider,
+              agentId: this.options.agent.id,
+              runId: this.responseMessageId,
+            },
+            contextUsage: {
+              tokenCounter,
+              runId: this.responseMessageId,
+              agentId: this.options.agent.id,
+              maxContextTokens: effectiveMaxContextTokens,
+              reserveRatio: summarizationConfig?.reserveRatio,
+              calibrationRatio,
+              summaryTokens: continuationSummary?.tokenCount,
+            },
+            createStepIdentity: createPiStepIdentity,
+            handleHostEvent: handlePiHostEvent,
           },
         });
-        if (execution.engine !== 'legacy') {
+        this.options.startupTelemetry?.mark('pi_session_settled');
+        if (outcome.status === 'paused') {
+          await this.handlePiPauseInterrupt(
+            outcome.signal,
+            streamId,
+            piMcpToolSchemas,
+            piActionToolSchemas,
+          );
+          if (!this.pendingApproval) {
+            throw Object.assign(new Error('Generation was replaced before Pi approval pause'), {
+              code: 'RUN_REPLACED',
+            });
+          }
+          /** The initial-turn path commits the durable pause before
+           * its pending-action event is exposed to the existing client UI. Resume
+           * re-pauses expose only after the route persists the new pause projection. */
+          await this.exposePendingApproval();
+        } else if (outcome.status === 'unsupported') {
           throw new AgentRuntimeUnavailableError();
         }
-        run = execution.run;
-        this.completeActivityPhase(run, activityPhase);
-
-        // HITL: if the run paused for tool approval, mark the job
-        // `requires_action` + emit the prompt and leave the turn unfinalized
-        // (the resume route continues it). No-op when the run completed.
-        await this.handleRunInterrupt(run, streamId);
-
-        let runtimeStatus = abortController.signal.aborted ? 'cancelled' : 'completed';
-        if (this.pendingApproval != null) {
-          runtimeStatus = 'paused';
+        if (outcome.status === 'completed' || outcome.status === 'paused') {
+          this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, outcome.status);
+        } else if (outcome.status === 'cancelled') {
+          this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, 'cancelled');
         }
-        this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, runtimeStatus);
-
-        config.signal = null;
+        if (outcome.status === 'cancelled' && abortController.signal.aborted !== true) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        return;
       };
 
       this.options.startupTelemetry?.mark('run_input_prepared');
@@ -5997,43 +5675,11 @@ class AgentClient extends BaseClient {
       // job-replacement race: an older run's late finally can no longer delete a newer
       // paused run's checkpoint, because there is no longer a clean-path prune to race.
 
-      run = null;
-      config = null;
       memoryPromise = null;
     }
   }
 
-  /**
-   * Resume a run that paused for human-in-the-loop review.
-   *
-   * The original run lives in a detached background task that exits when the run
-   * pauses, so resume REBUILDS the run on a fresh graph bound to the same
-   * `thread_id` (= conversationId), immutable saver scope, and durable checkpointer.
-   * LangGraph rehydrates the paused graph state from that scoped checkpoint;
-   * `run.resume(value)` re-enters the interrupted node with the user's decision.
-   * State comes from the checkpoint, so no message history is rebuilt here —
-   * `createRun` only needs the agent(s) to reconstruct the graph structure.
-   *
-   * `seedContent` is the content streamed before the pause (the assistant message +
-   * its tool call). In Redis mode the job store's append log already spans the pause,
-   * so the finalized message is complete regardless; seeding keeps the in-memory store
-   * complete too. The run drives events through the same `streamId`, so the client's
-   * open SSE receives the continuation live.
-   *
-   * Unlike `chatCompletion`, this does NOT prune the checkpoint in its `finally` — the
-   * resume controller owns checkpoint lifecycle (it must also clean up on failures that
-   * happen before this method runs, and keep the checkpoint on a re-pause).
-   *
-   * @param {object} params
-   * @param {Agents.ToolApprovalDecisionMap | { answer: string }} params.resumeValue
-   * @param {Array} [params.seedContent] - content aggregated before the pause
-   * @param {Array<import('@librechat/agents').RunStep>} [params.runSteps] - run steps emitted before the pause
-   * @param {import('@librechat/api').ActivityPhaseSnapshot} [params.activityPhaseSnapshot]
-   * @param {import('@librechat/data-schemas').ICompactionSemanticIndexProjection} [params.compactionSemanticIndex]
-   * @param {Array} [params.storedMessages] - persisted user messages restored for the resume
-   * @param {AbortController} [params.abortController]
-   * @param {Pick<import('@langchain/langgraph').Command, 'update' | 'goto'>} [params.commandOptions]
-   */
+  /** Resume Pi after a verified host approval or user-question continuation. */
   async resumePiCompletion({
     piApprovalContinuation,
     piApprovalDecision,
@@ -6373,7 +6019,7 @@ class AgentClient extends BaseClient {
         await handler.handle(event.event, event.data, piMetadata);
       };
       const piToolHandler = piHandlers?.[GraphEvents.ON_TOOL_EXECUTE];
-      const executePiHostToolCall =
+      const executePiHostToolBatch =
         typeof piToolHandler?.handle === 'function'
           ? createPiHostToolBatchExecutor({
               handler: piToolHandler,
@@ -6384,6 +6030,12 @@ class AgentClient extends BaseClient {
               runId: this.responseMessageId,
               metadata: piMetadata,
               authorizedToolNames: piToolDefinitions.map((definition) => definition.name),
+              authorize: (signal) =>
+                GenerationJobManager.assertPiProviderOwner(
+                  this.conversationId,
+                  this.jobCreatedAt,
+                  signal,
+                ),
               ...(piCodeSessionBridge == null ? {} : { codeSessionBridge: piCodeSessionBridge }),
               onError: (error) =>
                 logger.error(
@@ -6392,6 +6044,22 @@ class AgentClient extends BaseClient {
                 ),
             })
           : undefined;
+      const executePiHostToolCall =
+        executePiHostToolBatch == null
+          ? undefined
+          : async (call, signal) => {
+              const admitted = await GenerationJobManager.admitPiToolInvocation(
+                this.conversationId,
+                this.jobCreatedAt,
+                call.id,
+              );
+              if (!admitted) {
+                const error = new Error('This run no longer owns the permission to execute tools.');
+                error.code = 'PROVIDER_OWNER_FENCED';
+                throw error;
+              }
+              return executePiHostToolBatch(call, signal);
+            };
       const resolvedToolApprovalHooks = isHITLEnabled(effectiveToolApprovalPolicy)
         ? buildToolApprovalHooks({
             userId: req?.user?.id,
@@ -6439,7 +6107,7 @@ class AgentClient extends BaseClient {
             decision: piApprovalDecision,
           };
 
-      const execution = await agentRuntimeDispatcher.resumeTurn({
+      outcome = await agentRuntimeDispatcher.resumeTurn({
         engine: 'pi',
         selection: this.runtimeProgress.selection,
         input: {
@@ -6477,6 +6145,8 @@ class AgentClient extends BaseClient {
               }),
           },
           signal: abortController.signal,
+          onModelProviderError: terminalRunError.modelCallback.handleLLMError,
+          onTurnEnd: this.buildPiSteerTurnEndHandler(streamId, abortController.signal),
           onSessionCreated: () => {
             this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
           },
@@ -6490,10 +6160,6 @@ class AgentClient extends BaseClient {
           handleHostEvent: handlePiHostEvent,
         },
       });
-      if (execution.engine !== 'pi') {
-        throw new AgentRuntimeUnavailableError();
-      }
-      outcome = execution.outcome;
       this.collectedUsage.push(...outcome.usage);
       if (outcome.status === 'paused') {
         await this.handlePiPauseInterrupt(
@@ -6573,18 +6239,11 @@ class AgentClient extends BaseClient {
   }
 
   async resumeCompletion({
-    resumeValue,
-    reviewedToolApprovals,
     seedContent = [],
     runSteps = [],
     storedMessages = [],
     abortController = null,
-    commandOptions,
-    userMCPAuthMap,
-    discoveredToolNames,
-    authoredSkills,
     activityPhaseSnapshot,
-    compactionSemanticIndex,
     piApprovalContinuation,
     piApprovalDecision,
     piAskUserQuestionContinuation,
@@ -6595,712 +6254,16 @@ class AgentClient extends BaseClient {
       throw new AgentRuntimeUnavailableError();
     }
     this.runtimeProgress = createAgentRuntimeExecutionProgress(runtimeResolution.selection);
-    if (runtimeResolution.selection.engine === 'pi') {
-      return this.resumePiCompletion({
-        piApprovalContinuation,
-        piApprovalDecision,
-        piAskUserQuestionContinuation,
-        piAskUserQuestionAnswer,
-        seedContent,
-        runSteps,
-        storedMessages,
-        abortController,
-        activityPhaseSnapshot,
-      });
-    }
-    restoreAuthoredSkills(
-      this.options.eventHandlers?.[GraphEvents.ON_TOOL_EXECUTE],
-      authoredSkills,
-    );
-    /** The seeded state is on the job before the run is rebuilt, so a Stop
-     * during rebuild still persists it onto the stopped response. */
-    await this.publishRunContextMeta?.();
-    /** @type {Partial<GraphRunnableConfig>} */
-    let config;
-    /** @type {ReturnType<createRun>} */
-    let run;
-    const appConfig = this.options.req.config;
-    const terminalRunError = createTerminalRunErrorObserver({
-      maxProviderErrorChars: appConfig?.endpoints?.agents?.maxProviderErrorChars,
-      logger,
-      responseMessageId: this.responseMessageId,
-      source: '[api/server/controllers/agents/client.js #resumeCompletion]',
-      genericMessage: '[api/server/controllers/agents/client.js #resumeCompletion] Unhandled error',
-      protectionEnabled: hasModelBoundContentProtection(
-        appConfig?.filters,
-        appConfig?.messageFilter?.pii,
-      ),
-    });
-    const balanceConfig = getBalanceConfig(appConfig);
-    const transactionsConfig = getTransactionsConfig(appConfig);
-    try {
-      if (!abortController) {
-        abortController = new AbortController();
-      }
-
-      /** @type {AppConfig['endpoints']['agents']} */
-      const agentsEConfig = appConfig.endpoints?.[EModelEndpoint.agents];
-      const resolvedToolApprovalHooks = isHITLEnabled(agentsEConfig?.toolApproval)
-        ? buildToolApprovalHooks({
-            userId: this.options.req?.user?.id,
-            conversationId: this.conversationId,
-            tenantId: resolveRequestTenantId(this.options.req ?? {}),
-            appConfig,
-          })
-        : undefined;
-
-      BaseClient.prototype.setModelBoundStoredMessages.call(
-        this,
-        BaseClient.prototype.getModelBoundStoredMessages.call(this, storedMessages),
-      );
-
-      config = {
-        runName: 'AgentRun',
-        configurable: {
-          thread_id: this.conversationId,
-          ...buildToolApprovalExecutionConfig(this.responseMessageId, this.jobCreatedAt),
-          checkpoint_ns: '',
-          [LIBRECHAT_CHECKPOINT_NAMESPACE_KEY]: this.checkpointNamespace,
-          [LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY]:
-            (this.user ?? this.options.req.user?.id)
-              ? checkpointOwnerNamespacePrefix(
-                  this.user ?? this.options.req.user?.id,
-                  resolveRequestTenantId(this.options.req),
-                )
-              : undefined,
-          last_agent_index: this.agentConfigs?.size ?? 0,
-          user_id: this.user ?? this.options.req.user?.id,
-          hide_sequential_outputs: this.options.agent.hide_sequential_outputs,
-          requestBody:
-            this.options.mcpRequestBody ??
-            createMCPRuntimeRequestBody({
-              messageId: this.responseMessageId,
-              conversationId: this.conversationId,
-              parentMessageId: this.parentMessageId,
-              codeEnvironmentMode:
-                this.options.req.body.codeEnvironmentMode ??
-                this.options.req.resolvedConversation?.codeEnvironmentMode,
-              codeWorkspaces:
-                this.options.req.body.codeWorkspaces ??
-                this.options.req.resolvedConversation?.codeWorkspaces,
-            }),
-          user: createSafeUser(this.options.req.user),
-        },
-        recursionLimit: resolveRecursionLimit(agentsEConfig, this.options.agent),
-        signal: abortController.signal,
-        streamMode: 'values',
-        version: 'v2',
-      };
-
-      // Seed pre-pause content so the in-memory job store reports the complete turn
-      // (Redis aggregates across the pause via its append log; this covers in-memory).
-      if (Array.isArray(seedContent) && seedContent.length > 0) {
-        this.contentParts.push(...seedContent);
-      }
-
-      const tokenCounter = withRetainedAnswerTokenCounter(
-        await createCachedTokenCounter(this.getEncoding()),
-        this.getEncoding(),
-      );
-      this.compactionSemanticIndexSnapshot =
-        restoreCompactionSemanticIndexSnapshot(compactionSemanticIndex);
-      const agents = collectReachableAgents([
-        this.options.agent,
-        ...(this.agentConfigs?.size > 0 ? this.agentConfigs.values() : []),
-      ]);
-      const dynamicToolContexts = getDynamicToolContexts(agents);
-      const liveFiles = Array.isArray(this.options.attachments)
-        ? [...this.options.attachments]
-        : [];
-      const requestFiles = [...liveFiles];
-      const modelBoundAgentFiles = [];
-      const contextAttachmentLists =
-        this.options.agentContextAttachmentsByAgentId instanceof Map
-          ? this.options.agentContextAttachmentsByAgentId.values()
-          : Object.values(this.options.agentContextAttachmentsByAgentId ?? {});
-      for (const attachments of contextAttachmentLists) {
-        if (Array.isArray(attachments)) {
-          liveFiles.push(...attachments);
-          modelBoundAgentFiles.push(...attachments);
-        }
-      }
-      for (const agent of agents) {
-        if (Array.isArray(agent?.attachments)) {
-          liveFiles.push(...agent.attachments);
-          modelBoundAgentFiles.push(...agent.attachments);
-        }
-        if (Array.isArray(agent?.requestAttachments)) {
-          liveFiles.push(...agent.requestAttachments);
-          modelBoundAgentFiles.push(...agent.requestAttachments);
-        }
-        if (Array.isArray(agent?.agentContextAttachments)) {
-          liveFiles.push(...agent.agentContextAttachments);
-          modelBoundAgentFiles.push(...agent.agentContextAttachments);
-        }
-      }
-      const resumeContentProjection = await assertResumeRuntimeContentAllowed(
-        {
-          appConfig,
-          conversationId: this.conversationId,
-          targetMessageId: this.parentMessageId,
-          user: this.options.req.user,
-          storedMessages,
-          seedContent,
-          resumeValue,
-          liveFiles,
-          isTemporary: this.options.req.body?.isTemporary === true,
-          checkpointNamespace: this.checkpointNamespace,
-          agents,
-          files: [...modelBoundAgentFiles, ...dynamicToolContexts],
-        },
-        {
-          getAgentCheckpointer,
-          onTraversalFailure: reportLocatorTraversalFailure,
-          getMessages: db.getMessages,
-          getFiles: db.getFiles,
-        },
-      );
-      this.modelBoundCurrentFiles = [
-        ...(Array.isArray(this.modelBoundCurrentFiles) ? this.modelBoundCurrentFiles : []),
-        ...resumeContentProjection.resolvedFiles,
-      ];
-      const checkpointFileIds = collectFileIds(resumeContentProjection.checkpointFiles);
-      const resumeSharedFiles = [
-        ...resumeContentProjection.checkpointFiles.filter(isModelBoundAttachmentFile),
-        ...AgentClient.prototype.getModelBoundAttachmentsForEndpoint
-          .call(this, requestFiles)
-          .filter((file) => !file?.file_id || !checkpointFileIds.has(file.file_id)),
-      ];
-      this.turnSteerAttachmentHistory = undefined;
-      this.turnHistoricalAttachmentIds = collectHistoricalAttachmentIds(
-        resumeContentProjection.checkpointFiles,
-        requestFiles,
-      );
-      const resumeSharedFileIds = collectFileIds(resumeSharedFiles);
-      const resumeEndpointsByAgentId = new Map(
-        agents
-          .filter((agent) => agent?.id)
-          .map((agent) => [
-            agent.id,
-            {
-              endpoint: agent.endpoint,
-              endpointType: agent === this.options.agent ? this.options.endpointType : undefined,
-            },
-          ]),
-      );
-      const resumeMcpManager = getMCPManager();
-      const [resumeScopedContext, resumeConfigServers] = await Promise.all([
-        buildAgentScopedContext({
-          agentIds: agents.map((agent) => agent?.id).filter(Boolean),
-          attachmentsByAgentId: this.options.agentContextAttachmentsByAgentId,
-          sharedRunAttachmentIds: resumeSharedFileIds,
-          sharedAttachments: resumeSharedFiles,
-          historicalFileIds: this.turnHistoricalAttachmentIds,
-          req: this.options.req,
-          endpoint: this.options.agent?.endpoint ?? this.options.endpoint ?? EModelEndpoint.agents,
-          endpointType: this.options.endpointType,
-          endpointsByAgentId: resumeEndpointsByAgentId,
-          tokenCountFn: (text) => countTokens(text),
-        }),
-        resolveConfigServers(this.options.req),
-      ]);
-      const resumeScopedAttachmentMap = buildAgentScopedAttachmentMap({
-        agentIds: agents.map((agent) => agent?.id).filter(Boolean),
-        attachmentsByAgentId: this.options.agentContextAttachmentsByAgentId,
-        sharedRunAttachmentIds: resumeSharedFileIds,
-        req: this.options.req,
-        endpoint: this.options.agent?.endpoint ?? this.options.endpoint ?? EModelEndpoint.agents,
-        endpointType: this.options.endpointType,
-        endpointsByAgentId: resumeEndpointsByAgentId,
-      });
-      this.turnSharedAttachmentFiles = resumeSharedFiles;
-      this.turnAggregateOnlyAttachmentFiles = [];
-      this.turnScopedAttachmentsByAgentId = resumeScopedAttachmentMap;
-      this.turnAttachmentEndpointsByAgentId = resumeEndpointsByAgentId;
-      const resumeScopedAttachments = [...resumeScopedAttachmentMap.values()].flat();
-      AgentClient.prototype.assertTurnAttachmentLimits.call(
-        this,
-        resumeSharedFiles,
-        resumeScopedAttachments,
-      );
-      const resumeAttachmentTelemetryFiles = [...resumeSharedFiles, ...resumeScopedAttachments];
-      this.attachmentMemoryContext = {
-        req: this.options.req,
-        conversationId: this.conversationId,
-        messageId: this.responseMessageId,
-        attachments: resumeAttachmentTelemetryFiles,
-        countRepeatedExtractedText: true,
-      };
-      await Promise.all(
-        agents
-          .filter((agent) => agent?.id)
-          .map(async (agent) => {
-            agent.instructions = agent.instructions?.trim() || undefined;
-            agent.additional_instructions = agent.additional_instructions?.trim() || undefined;
-            const scopedContext = resumeScopedContext.get(agent.id);
-            await applyContextToAgent({
-              agent,
-              agentId: agent.id,
-              logger,
-              mcpManager: resumeMcpManager,
-              configServers: resumeConfigServers,
-              user: this.options.req.user,
-              sharedRunContext: scopedContext ?? '',
-              ephemeralAgent:
-                agent === this.options.agent ? this.options.req.body.ephemeralAgent : undefined,
-            });
-            assertModelBoundContent({
-              onTraversalFailure: reportLocatorTraversalFailure,
-              filters: this.options.req.config?.filters,
-              legacyPii: this.options.req.config?.messageFilter?.pii,
-              agents: [agent],
-              files: scopedContext ? [scopedContext] : [],
-            });
-          }),
-      );
-      const wrappedResumeLazyDescriptors = new WeakSet();
-      const validatedResumeAgents = new WeakSet(agents.filter((agent) => agent != null));
-      const wrapResumeLazyAttachmentValidation = (configs) => {
-        const pending = [...configs];
-        const visitedConfigs = new WeakSet();
-        for (let index = 0; index < pending.length; index++) {
-          const config = pending[index];
-          if (!config || visitedConfigs.has(config)) {
-            continue;
-          }
-          visitedConfigs.add(config);
-          pending.push(...(config.subagentAgentConfigs ?? []));
-          for (const graph of config.subagentGraphConfigs ?? []) {
-            pending.push(...graph.memberConfigs);
-          }
-          for (const descriptor of config.lazySubagentConfigs ?? []) {
-            pending.push(descriptor);
-            if (
-              wrappedResumeLazyDescriptors.has(descriptor) ||
-              typeof descriptor?.resolve !== 'function'
-            ) {
-              continue;
-            }
-            wrappedResumeLazyDescriptors.add(descriptor);
-            const resolve = descriptor.resolve;
-            descriptor.resolve = async (context) => {
-              const resolved = await resolve(context);
-              const resolvedAgents = collectReachableAgents([resolved]);
-              const unvalidatedAgents = resolvedAgents.filter(
-                (agent) => agent != null && !validatedResumeAgents.has(agent),
-              );
-              if (unvalidatedAgents.length === 0) {
-                wrapResumeLazyAttachmentValidation(resolvedAgents);
-                return resolved;
-              }
-              const liveResumeSharedFiles = this.turnSharedAttachmentFiles ?? resumeSharedFiles;
-              const liveResumeSharedFileIds = collectFileIds(liveResumeSharedFiles);
-              const lateAttachmentsByAgentId =
-                buildAgentContextAttachmentsByAgentId(unvalidatedAgents);
-              const lateEndpointsByAgentId = new Map(
-                unvalidatedAgents
-                  .filter((agent) => agent?.id)
-                  .map((agent) => [agent.id, { endpoint: agent.endpoint }]),
-              );
-              const lateScopedAttachmentMap = buildAgentScopedAttachmentMap({
-                agentIds: unvalidatedAgents.map((agent) => agent?.id).filter(Boolean),
-                attachmentsByAgentId: lateAttachmentsByAgentId,
-                sharedRunAttachmentIds: liveResumeSharedFileIds,
-                req: this.options.req,
-                endpoint: this.options.agent?.endpoint ?? this.options.endpoint,
-                endpointType: this.options.endpointType,
-                endpointsByAgentId: lateEndpointsByAgentId,
-              });
-              for (const [agentId, attachments] of lateScopedAttachmentMap) {
-                this.turnScopedAttachmentsByAgentId.set(agentId, attachments);
-              }
-              for (const [agentId, agentEndpoint] of lateEndpointsByAgentId) {
-                this.turnAttachmentEndpointsByAgentId.set(agentId, agentEndpoint);
-              }
-              const lateScopedContext = await buildAgentScopedContext({
-                agentIds: unvalidatedAgents.map((agent) => agent?.id).filter(Boolean),
-                attachmentsByAgentId: lateAttachmentsByAgentId,
-                sharedRunAttachmentIds: liveResumeSharedFileIds,
-                sharedAttachments: liveResumeSharedFiles,
-                historicalFileIds: this.turnHistoricalAttachmentIds,
-                req: this.options.req,
-                endpoint: this.options.agent?.endpoint ?? this.options.endpoint,
-                endpointType: this.options.endpointType,
-                endpointsByAgentId: lateEndpointsByAgentId,
-                tokenCountFn: (text) => countTokens(text),
-              });
-              const lateScopedAttachments = [...lateScopedAttachmentMap.values()].flat();
-              resumeScopedAttachments.push(...lateScopedAttachments);
-              resumeAttachmentTelemetryFiles.push(...lateScopedAttachments);
-              AgentClient.prototype.assertTurnAttachmentLimits.call(
-                this,
-                liveResumeSharedFiles,
-                resumeScopedAttachments,
-              );
-              for (const agent of unvalidatedAgents) {
-                agent.instructions = agent.instructions?.trim() || undefined;
-                agent.additional_instructions = agent.additional_instructions?.trim() || undefined;
-                const scopedContext = lateScopedContext.get(agent.id);
-                await applyContextToAgent({
-                  agent,
-                  agentId: agent.id,
-                  logger,
-                  mcpManager: resumeMcpManager,
-                  configServers: resumeConfigServers,
-                  user: this.options.req.user,
-                  sharedRunContext: scopedContext ?? '',
-                });
-                assertModelBoundContent({
-                  onTraversalFailure: reportLocatorTraversalFailure,
-                  filters: this.options.req.config?.filters,
-                  legacyPii: this.options.req.config?.messageFilter?.pii,
-                  agents: [agent],
-                  files: scopedContext ? [scopedContext] : [],
-                });
-                validatedResumeAgents.add(agent);
-              }
-              wrapResumeLazyAttachmentValidation(resolvedAgents);
-              return resolved;
-            };
-          }
-        }
-      };
-      wrapResumeLazyAttachmentValidation(agents);
-      const modelBoundCallback = AgentClient.prototype.createModelBoundChatModelCallback.call(this);
-      const attachmentMemoryCallback = createAgentMemoryCallback(this.attachmentMemoryContext);
-
-      // Re-prime skill files invoked in the pre-pause segment (mirrors the normal path's
-      // `primeInvokedSkills(payload)`), so an approved code/file-backed tool keeps the
-      // injected skill-file session refs instead of running without them. The pre-pause
-      // content carries the `skill` tool_calls, so it stands in for the message payload.
-      let skillSessions;
-      if (
-        typeof this.options.primeInvokedSkills === 'function' &&
-        Array.isArray(seedContent) &&
-        seedContent.length > 0
-      ) {
-        try {
-          const primed = await this.options.primeInvokedSkills([
-            { role: 'assistant', content: seedContent },
-          ]);
-          skillSessions = primed?.initialSessions;
-        } catch (err) {
-          if (isContentFilterError(err)) {
-            throw err;
-          }
-          logger.warn(
-            '[api/server/controllers/agents/client.js #resumeCompletion] Failed to re-prime skill sessions',
-            getSafeErrorMetadata(err),
-          );
-        }
-      }
-
-      // Seed code-env / skill tool sessions so an approved code/file/skill-backed tool
-      // runs with the same uploaded-file context the pre-pause run had — the rebuilt
-      // graph otherwise has no `Graph.sessions` entries (especially cross-replica).
-      const initialSessions = buildInitialToolSessions({ skillSessions, agents });
-
-      const streamId = this.options.req?._resumableStreamId;
-      const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
-      const activityPhase = this.buildActivityPhaseWiring(
-        streamId,
-        abortController.signal,
-        activityPhaseSnapshot,
-      );
-      const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal, true);
-      const offsetHandlers = createSteerIndexOffsetHandlers(
-        createContentIndexOffsetHandlers(
-          this.options.eventHandlers,
-          Array.isArray(seedContent) ? seedContent : [],
-        ),
-        this.steerOffsetState,
-      );
-      const activityHandlers =
-        activityPhase?.handlers(offsetHandlers) ??
-        (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
-      const createRunOptions = {
-        scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
-        recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
-          getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
-          {
-            streamId,
-            jobCreatedAt: this.jobCreatedAt,
-            userId: this.options.req?.user?.id,
-            tenantId: this.options.req?.user?.tenantId,
-          },
-          require('~/server/services/Schedules').recordMCPToolAuthFailure,
-        ),
-        agents,
-        conversationId: this.conversationId,
-        isTemporary: isTemporaryTurn(this.options.req),
-        modelCallbacks: [
-          modelBoundCallback,
-          attachmentMemoryCallback,
-          terminalRunError.modelCallback,
-        ],
-        // State (messages, tool calls) is rehydrated from the checkpoint by
-        // run.resume; createRun only needs the agents to rebuild the graph.
-        messages: [],
-        // The resumed run can pause AGAIN (another tool, a follow-up question), and this
-        // controller owns that lifecycle, so it must keep the HITL wiring on the rebuilt run.
-        hitlCapable: true,
-        toolApprovalStorage: db,
-        reviewedToolApprovals,
-        resolvedToolApprovalHooks,
-        toolApprovalAllows: resolveRunToolApprovalAllows(
-          agentsEConfig?.toolApproval,
-          this.options.req?.resolvedConversation,
-          this.conversationId,
-        ),
-        // Plugin SessionStart hooks match on the lifecycle source; a rebuilt run is a
-        // resume, not a fresh startup.
-        sessionStartSource: 'resume',
-        toolInputValidationErrors: this.toolInputValidationErrors,
-        // Steering stays live across a pause/resume cycle: steers queued while
-        // the resumed segment runs drain at its tool-batch boundaries.
-        steering: this.buildSteerWiring(streamId),
-        // Activity labels likewise survive pause/resume: post-resume tool
-        // batches keep claiming slots and generating group headers.
-        activityLabel,
-        activityPhase,
-        ...(this.compactionSemanticIndexSnapshot == null
-          ? {}
-          : { compactionSemanticIndex: this.compactionSemanticIndexSnapshot.entries }),
-        // Replay deferred tools discovered before the pause. With `messages: []` the
-        // discovery scan finds nothing, so these names restore the schemas to the
-        // rebuilt model binding. Undefined/empty for non-deferred turns is a no-op.
-        discoveredToolNames,
-        initialSessions,
-        ...resolveRunSeeds(this),
-        runId: this.responseMessageId,
-        signal: abortController.signal,
-        // The rebuilt graph numbers content indices from 0, but the aggregator was
-        // just seeded with the pre-pause parts at those same indices — shift every
-        // resumed step index past the seed, or the new output merges into (or, on a
-        // type mismatch, is silently dropped against) the pre-pause content. The
-        // steer wrapper composes on top: resumed indices shift by seed + any
-        // steer parts spliced in while the resumed segment streams.
-        customHandlers: reasoningLabel?.handlers(activityHandlers) ?? activityHandlers,
-        requestBody: config.configurable.requestBody,
-        codeApprovalMode: this.options.req.body.codeApprovalMode,
-        user: createSafeUser(this.options.req?.user),
-        traceContext: buildTraceContext(this.options),
-        tenantId: resolveRequestTenantId(this.options.req ?? {}),
-        summarizationConfig: appConfig?.summarization,
-        appConfig,
-        tokenCounter,
-        subagentUsageSink: createSubagentUsageSink(
-          this.collectedUsage,
-          this.buildSubagentUsageEmitter(appConfig),
-          this.buildDetachedSubagentUsageRecorder(balanceConfig, transactionsConfig),
-        ),
-        subagentTasks: this.options.subagentTasks,
-        runFiles: this.options.runFiles,
-      };
-
-      const execution = await agentRuntimeDispatcher.resumeTurn({
-        engine: 'legacy',
-        selection: runtimeResolution.selection,
-        createRunOptions,
-        onRunCreated: async (createdRun) => {
-          run = createdRun;
-          hydrateResumeRunSteps(runSteps, this.stepMap, run.Graph, seedContent);
-
-          this.run = run;
-          this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
-          if (this._resolveRun) {
-            this._resolveRun(run);
-            this._resolveRun = null;
-          }
-
-          // Do NOT cache the rebuilt graph on resume: it was created with `messages: []`, so
-          // RedisJobStore.getContentParts() (which prefers a cached graph over reconstructing
-          // from the chunk log) would return only the resumed segment and drop the pre-pause
-          // assistant/tool-call content on a same-replica reload/status poll. Skipping it makes
-          // introspection fall back to the durable chunk reconstruction, which is complete.
-          // `setContentParts` still points the in-memory store at the seeded client content.
-          if (streamId && this.contentParts) {
-            GenerationJobManager.setContentParts(streamId, this.contentParts, this.jobCreatedAt);
-          }
-
-          // Carry the user's MCP auth into the rebuilt run so an approved MCP tool executes
-          // with the same OAuth/user credentials it had before the pause.
-          if (userMCPAuthMap != null) {
-            config.configurable.userMCPAuthMap = userMCPAuthMap;
-          }
-
-          /** @deprecated Agent Chain */
-          config.configurable.last_agent_id = agents[agents.length - 1].id;
-        },
-        beforeResume: async () => {
-          /** Same flag-before-run ordering as chatCompletion's processStream. */
-          if (this.activityLabelsMarkedPromise != null) {
-            await this.activityLabelsMarkedPromise;
-          }
-          await this.publishRunContextMeta?.();
-        },
-        afterResume: () => reasoningLabel?.complete(),
-        resumeValue,
-        config,
-        resumeOptions: { callbacks: { [Callback.TOOL_ERROR]: logToolError } },
-        commandOptions,
-      });
-      if (execution.engine !== 'legacy') {
-        throw new AgentRuntimeUnavailableError();
-      }
-      run = execution.run;
-      this.completeActivityPhase(run, activityPhase);
-
-      config.signal = null;
-
-      // The model may pause AGAIN (another tool needs approval, or a follow-up
-      // question). Re-arm the same interrupt gate so the cycle can repeat.
-      await this.handleRunInterrupt(run, streamId);
-
-      let runtimeStatus = abortController.signal.aborted ? 'cancelled' : 'completed';
-      if (this.pendingApproval != null) {
-        runtimeStatus = 'paused';
-      }
-      this.runtimeProgress = settleAgentRuntimeExecution(this.runtimeProgress, runtimeStatus);
-
-      // Mirror chatCompletion: settle label fills before the filter below can
-      // shift part positions out from under an in-flight fill's claimed index.
-      await this.settleActivityLabels();
-
-      // Strip hidden intermediate sequential-agent content
-      // before resume finalize/re-pause persistence reads `this.contentParts`, so a
-      // resumed sequential chain doesn't persist/emit outputs hide_sequential_outputs
-      // is meant to hide.
-      this.eventActorSummary =
-        getLatestEventActorSummary(this.contentParts) ?? this.eventActorSummary;
-      const contentBeforeReshape = [...this.contentParts];
-      this.applyHideSequentialOutputsFilter();
-      this.rebaseActivityPhaseBounds(contentBeforeReshape);
-    } catch (err) {
-      this.runtimeProgress = settleAgentRuntimeExecution(
-        this.runtimeProgress,
-        isAgentRunCancellation(err, abortController?.signal) ? 'cancelled' : 'failed',
-      );
-      if (isAgentAttachmentLimitError(err) || isAttachmentObjectNotFoundError(err)) {
-        logger.warn(
-          '[api/server/controllers/agents/client.js #resumeCompletion] Attachment rejected',
-          {
-            conversationId: this.conversationId,
-            ...getSafeErrorMetadata(err),
-          },
-        );
-        throw err;
-      }
-      if (isContentFilterError(err)) {
-        logger.warn(
-          '[api/server/controllers/agents/client.js #resumeCompletion] Blocked by content policy',
-          {
-            source: err?.body?.source,
-            field: err?.body?.field,
-            code: err?.code,
-          },
-        );
-        throw err;
-      }
-      if (isAgentRunCancellation(err, abortController.signal)) {
-        logger.debug(
-          '[api/server/controllers/agents/client.js #resumeCompletion] Aborted by user',
-          {
-            conversationId: this.conversationId,
-            ...getSafeErrorMetadata(err),
-          },
-        );
-      } else if (isStepLimitError(err)) {
-        /** Same contract as the initial turn: incomplete, not failed. A resumed run
-         *  inherits the budget of a turn that already spent steps before pausing, so
-         *  this boundary is if anything more likely to be reached here. */
-        this.stepLimitReached = true;
-        logger.warn(
-          '[api/server/controllers/agents/client.js #resumeCompletion] Tool call limit reached; ending the resumed turn as incomplete',
-          { conversationId: this.conversationId },
-        );
-      } else {
-        terminalRunError.log(err, abortController.signal);
-        this.contentParts.push({
-          type: ContentTypes.ERROR,
-          [ContentTypes.ERROR]: terminalRunError.getUserFacingError(err, () =>
-            getUserFacingRequestError(
-              'An error occurred while resuming the request',
-              err,
-              appConfig,
-            ),
-          ),
-        });
-      }
-    } finally {
-      await this.options.runFiles?.close();
-      this.eventActorSummary =
-        getLatestEventActorSummary(this.contentParts) ?? this.eventActorSummary;
-      /** A run that never came to exist has no state of its own: keep the
-       * inherited meta so the persisted error response still seeds the next
-       * turn. A created run's neutral state may still clear it. */
-      this.contextMeta = this.run == null ? this.contextMeta : captureRunContextMeta(this);
-
-      this.finalizeSubagentContent();
-      this.stampMcpServerIdentities();
-      await this.settleActivityLabels();
-
-      if (this.pendingSubagentEmits.length > 0) {
-        await Promise.allSettled(this.pendingSubagentEmits);
-        this.pendingSubagentEmits = [];
-      }
-
-      try {
-        await this.recordCollectedUsage({
-          context: resolveRunUsageContext(abortController?.signal?.aborted === true),
-          balance: balanceConfig,
-          transactions: transactionsConfig,
-        });
-      } catch (err) {
-        logger.error(
-          '[api/server/controllers/agents/client.js #resumeCompletion] Error in cleanup phase',
-          getSafeErrorMetadata(err),
-        );
-      }
-      if (this._resolveRun) {
-        this._resolveRun(this.run ?? null);
-        this._resolveRun = null;
-      }
-      run = null;
-      config = null;
-    }
-  }
-
-  /**
-   * Resolves with the agent run once it is initialized, or `null` if
-   * initialization fails. Lets immediate-mode title generation await the run
-   * instead of throwing when fired before `chatCompletion` assigns `this.run`.
-   * Rejects promptly if the provided signal aborts before the run is ready.
-   * @param {AbortSignal} [signal]
-   * @returns {Promise<AgentRun | null>}
-   */
-  _waitForRun(signal) {
-    if (this.run) {
-      return Promise.resolve(this.run);
-    }
-    if (!this._runReady) {
-      this._runReady = new Promise((resolve) => {
-        this._resolveRun = resolve;
-      });
-    }
-    if (!signal) {
-      return this._runReady;
-    }
-    if (signal.aborted) {
-      return Promise.reject(new Error('Aborted before run initialization'));
-    }
-    return new Promise((resolve, reject) => {
-      const onAbort = () => reject(new Error('Aborted before run initialization'));
-      signal.addEventListener('abort', onAbort, { once: true });
-      this._runReady.then((run) => {
-        signal.removeEventListener('abort', onAbort);
-        resolve(run);
-      });
+    return this.resumePiCompletion({
+      piApprovalContinuation,
+      piApprovalDecision,
+      piAskUserQuestionContinuation,
+      piAskUserQuestionAnswer,
+      seedContent,
+      runSteps,
+      storedMessages,
+      abortController,
+      activityPhaseSnapshot,
     });
   }
 
@@ -7310,23 +6273,12 @@ class AgentClient extends BaseClient {
    * @param {AbortController} params.abortController
    * @param {boolean} [params.immediate] When true, title generation starts with
    *   the request and uses only the user's input (`contentParts` is empty).
-   *   Legacy waits for run initialization. Pi uses its host title adapter directly.
+   *   Pi uses its host title adapter directly.
    */
   async titleConvo({ text, abortController, immediate = false }) {
     const runtimeResolution = resolveStoredAgentRuntime(this.options.agentRuntime);
-    const isPiRuntime =
-      runtimeResolution.status === 'resolved' && runtimeResolution.selection.engine === 'pi';
-    if (!this.run && !isPiRuntime) {
-      if (!immediate) {
-        throw new Error('Run not initialized');
-      }
-      await this._waitForRun(abortController?.signal);
-      if (!this.run) {
-        logger.debug(
-          '[api/server/controllers/agents/client.js #titleConvo] Run unavailable for immediate title generation',
-        );
-        return;
-      }
+    if (runtimeResolution.status !== 'resolved') {
+      throw new AgentRuntimeUnavailableError();
     }
     const { handleLLMEnd, collected: collectedMetadata } = createMetadataAggregator();
     const { req, agent } = this.options;
@@ -7491,9 +6443,10 @@ class AgentClient extends BaseClient {
           },
         },
       };
-      const titleResult = isPiRuntime
-        ? await generateAgentConversationTitle({ ...titleOptions, runId: this.responseMessageId })
-        : await this.run.generateTitle(titleOptions);
+      const titleResult = await generateAgentConversationTitle({
+        ...titleOptions,
+        runId: this.responseMessageId,
+      });
 
       const collectedUsage = collectedMetadata.map((item) => {
         let input_tokens, output_tokens;

@@ -122,6 +122,12 @@ export interface GenerationJobMetadata {
   providerExecutionStartedId?: string;
   /** False only while that exact provider segment can still mutate user data. */
   providerDrained?: boolean;
+  /** Visible crash-recovery result; external host-tool outcomes are not replayed. */
+  providerRecoveryOutcome?: 'outcome_unknown';
+  providerRecoveryId?: string;
+  providerRecoveryFence?: number;
+  providerOwnerLostAt?: number;
+  providerRecoveryErrorCode?: 'PI_PROVIDER_OWNER_LOST';
   /** Terminal close has atomically stopped new steer acceptance, even if the
    * final status CAS has not yet run. */
   steersClosed?: boolean;

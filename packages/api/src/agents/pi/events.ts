@@ -28,6 +28,8 @@ export interface PiContentEventTranslatorOptions {
   supportedToolNames?: readonly string[];
   /** Host-owned billing attribution; Pi's provider id is deliberately not authoritative. */
   usageAttribution?: { provider?: string; agentId?: string; runId?: string };
+  /** Tags terminal provider errors for the host's safe failure observer. */
+  onModelProviderError?(error: unknown): void;
   now?: () => number;
 }
 
@@ -66,6 +68,35 @@ export class PiRuntimeResponseError extends Error {
     super('The Pi response could not be represented by the current agent runtime.');
     this.name = 'PiRuntimeResponseError';
   }
+}
+
+/** A terminal Pi model response failure observed at the provider boundary. */
+export class PiProviderResponseError extends Error {
+  readonly code = 'PI_UPSTREAM_MODEL_ERROR';
+  readonly status?: number;
+  readonly statusCode?: number;
+
+  constructor(message?: string) {
+    super(message || 'The model provider returned an error response.');
+    this.name = 'PiProviderResponseError';
+    const status = parseProviderStatus(message);
+    if (status != null) {
+      this.status = status;
+      this.statusCode = status;
+    }
+  }
+}
+
+function parseProviderStatus(message?: string): number | undefined {
+  if (typeof message !== 'string') {
+    return undefined;
+  }
+  const status = /^(?:HTTP\s*)?(\d{3})\b/.exec(message)?.[1] ?? /\((\d{3})\):/.exec(message)?.[1];
+  if (status == null) {
+    return undefined;
+  }
+  const value = Number(status);
+  return value >= 400 && value <= 599 ? value : undefined;
 }
 
 interface PiContentStep {
@@ -168,10 +199,13 @@ function translateAgentEnd(
     const hasUnsupportedToolCall =
       message.stopReason === 'toolUse' &&
       (toolCalls.length === 0 || toolCalls.some(({ name }) => !supportedToolNames.has(name)));
+    if (event.willRetry !== true && message.stopReason === 'error') {
+      const providerError = new PiProviderResponseError(message.errorMessage);
+      options.onModelProviderError?.(providerError);
+      throw providerError;
+    }
     const hasUnsupportedStopReason =
-      message.stopReason === 'error' ||
-      message.stopReason === 'length' ||
-      message.stopReason === 'deferred';
+      message.stopReason === 'length' || message.stopReason === 'deferred';
     if (event.willRetry !== true && (hasUnsupportedStopReason || hasUnsupportedToolCall)) {
       throw new PiRuntimeResponseError();
     }

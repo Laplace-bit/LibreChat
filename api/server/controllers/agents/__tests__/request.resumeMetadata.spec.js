@@ -257,16 +257,12 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-  LEGACY_AGENT_RUNTIME: jest.requireActual('@librechat/api').LEGACY_AGENT_RUNTIME,
   AgentRuntimeUnavailableError: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).AgentRuntimeUnavailableError,
   selectAgentRuntimeForAgent: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).selectAgentRuntimeForAgent,
-  assertLegacyRuntimeCompatibleGraph: jest.requireActual(
-    '../../../../../packages/api/src/agents/runtime/selection',
-  ).assertLegacyRuntimeCompatibleGraph,
   assertAgentRuntimeCompatibleGraph: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).assertAgentRuntimeCompatibleGraph,
@@ -993,7 +989,7 @@ describe('ResumableAgentController resume metadata', () => {
 
     expect(
       mockGenerationJobManager.createJob.mock.calls[0][3].initialMetadata.agentRuntime,
-    ).toEqual({ engine: 'legacy' });
+    ).toEqual({ engine: 'pi', sdkVersion: '1.4.0' });
 
     expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
       conversationId,
@@ -1002,15 +998,14 @@ describe('ResumableAgentController resume metadata', () => {
       {
         startupTelemetry: mockStartupTelemetry,
         initialMetadata: {
-          agentRuntime: { engine: 'legacy' },
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
           conversationId,
           generationProtocolVersion: 1,
           endpoint: 'agents',
           iconURL: 'https://example.com/spec-icon.png',
           model: 'gpt-3.5-turbo',
-          /** The OWNING replica's seal capability, read by the steer route. */
-          preemptCapable: true,
-          steerQuotesCapable: true,
+          preemptCapable: false,
+          steerQuotesCapable: false,
           agent_id: undefined,
           isTemporary: true,
           responseMessageId: expect.stringMatching(/^[0-9a-f-]{36}$/),
@@ -1048,7 +1043,7 @@ describe('ResumableAgentController resume metadata', () => {
     expect(mockStartupTelemetry.end).toHaveBeenCalledWith('error', expect.any(Error));
   });
 
-  it('pins an allowlisted Pi canary on its generation before runtime initialization', async () => {
+  it('pins Pi on every new generation before runtime initialization, ignoring client selection', async () => {
     const conversationId = 'conversation-123';
     const initializeClient = jest.fn().mockRejectedValue(new Error('stop before Pi dispatch'));
     mockGenerationJobManager.createJob.mockResolvedValueOnce({
@@ -1066,7 +1061,7 @@ describe('ResumableAgentController resume metadata', () => {
     const req = {
       user: { id: 'user-123' },
       body: {
-        text: 'Use the canary agent.',
+        text: 'Use the Pi agent.',
         messageId: 'user-message',
         conversationId,
         agentRuntime: { engine: 'legacy' },
@@ -1076,11 +1071,7 @@ describe('ResumableAgentController resume metadata', () => {
           modelOptions: { model: 'gpt-4.1' },
         },
       },
-      config: {
-        endpoints: {
-          agents: { runtime: { piAgentIds: ['agent-pi-canary'] } },
-        },
-      },
+      config: {},
     };
     const res = createResumableResponse();
 
@@ -1108,7 +1099,7 @@ describe('ResumableAgentController resume metadata', () => {
     );
   });
 
-  it('fails closed when a legacy agent graph contains a Pi-pinned connected agent', async () => {
+  it('fails closed when a Pi generation loads a connected-agent graph', async () => {
     const sendMessage = jest.fn().mockResolvedValue(undefined);
     const initializeClient = jest.fn().mockResolvedValue({
       client: {
@@ -1129,11 +1120,7 @@ describe('ResumableAgentController resume metadata', () => {
           modelOptions: { model: 'gpt-4.1' },
         },
       },
-      config: {
-        endpoints: {
-          agents: { runtime: { piAgentIds: ['agent-pi-connected'] } },
-        },
-      },
+      config: {},
     };
     const res = createResumableResponse();
 
@@ -1145,7 +1132,7 @@ describe('ResumableAgentController resume metadata', () => {
     expect(mockGenerationJobManager.createJob).toHaveBeenCalledTimes(1);
     expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
       'conversation-123',
-      expect.stringContaining('The selected agent runtime is not available on this server.'),
+      expect.stringContaining('The Pi agent runtime is not available on this server.'),
       1000,
       expect.any(Object),
     );
@@ -4386,12 +4373,26 @@ describe('ResumableAgentController resume metadata', () => {
     });
 
     it('points a failed turn at the trace of the run that failed', async () => {
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1000,
+        metadata: {
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+          checkpointNamespace: '1000',
+          providerExecutionId: 'provider-segment-1',
+          providerDrained: true,
+        },
+        readyPromise: Promise.resolve(),
+        abortController: new AbortController(),
+        emitter: { on: jest.fn() },
+      });
       const traceFields = {
         langfuseSampled: true,
         langfuseDestinationIds: ['destination-1'],
         langfuseRunId: 'server-response-uuid',
       };
       mockGetFailedTurnTraceFields.mockResolvedValue(traceFields);
+      const req = createFailedRequest();
+      req.body.endpointOption.agent_id = 'agent-123';
       const serverUserMessage = {
         messageId: 'server-user',
         parentMessageId: 'prior-response',
@@ -4401,12 +4402,13 @@ describe('ResumableAgentController resume metadata', () => {
         isCreatedByUser: true,
       };
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
+        agentConfigs: new Map(),
         sendMessage: jest.fn(async (_text, options) => {
           options.onStart(serverUserMessage, 'server-response-uuid');
           client.run = {};
           client.runtimeProgress = {
-            selection: { engine: 'legacy' },
+            selection: { engine: 'pi', sdkVersion: '1.4.0' },
             started: true,
           };
           throw new Error('failed inside the run');
@@ -4414,7 +4416,7 @@ describe('ResumableAgentController resume metadata', () => {
       };
 
       await AgentController(
-        createFailedRequest(),
+        req,
         createResumableResponse(),
         jest.fn(),
         jest.fn().mockResolvedValue({ client }),
@@ -4480,8 +4482,19 @@ describe('ResumableAgentController resume metadata', () => {
       ],
     ])('uses runtime progress for a failure %s', async (_label, runtimeProgress, runCreated) => {
       mockGetFailedTurnTraceFields.mockResolvedValue({});
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1000,
+        metadata: { agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } },
+        readyPromise: Promise.resolve(),
+        abortController: new AbortController(),
+        emitter: { on: jest.fn() },
+      });
+      const req = createFailedRequest();
+      req.body.endpointOption.endpoint = 'agents';
+      req.body.endpointOption.agent_id = 'agent-123';
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
+        agentConfigs: new Map(),
         sendMessage: jest.fn(async (_text, options) => {
           options.onStart(
             { messageId: 'server-user', conversationId, isCreatedByUser: true, text: 'Hi' },
@@ -4493,7 +4506,7 @@ describe('ResumableAgentController resume metadata', () => {
       };
 
       await AgentController(
-        createFailedRequest(),
+        req,
         createResumableResponse(),
         jest.fn(),
         jest.fn().mockResolvedValue({ client }),

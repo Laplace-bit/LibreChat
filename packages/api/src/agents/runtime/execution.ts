@@ -3,9 +3,8 @@ import type { AgentRuntimeSelection } from './selection';
 export type AgentRuntimeExecutionStatus = 'completed' | 'paused' | 'cancelled' | 'failed';
 
 /**
- * Host-owned progress for one selected engine. `started` records a host-observed
- * milestone: Legacy has a created AgentRun, or Pi has a created host session. It is
- * monotonic for this client and remains true if later execution or pause persistence fails.
+ * Host-owned progress for Pi. `started` records that Pi created its isolated host session.
+ * It is monotonic for this client and remains true if later execution or pause persistence fails.
  */
 export interface AgentRuntimeExecutionProgress {
   readonly selection: AgentRuntimeSelection;

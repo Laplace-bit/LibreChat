@@ -1,7 +1,11 @@
 import { randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import type { Redis, Cluster } from 'ioredis';
-import type { IEventTransport, PreemptMessage } from '~/stream/interfaces/IJobStore';
+import type {
+  IEventTransport,
+  PreemptMessage,
+  ProviderOwnerContext,
+} from '~/stream/interfaces/IJobStore';
 import type { ChunkPublicationOptions } from '~/stream/internal/chunkPublication';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
 import {
@@ -153,6 +157,7 @@ interface PreemptRegistration {
  *     generationEpochGraceTtl,
  *     requireActiveJob ("0" | "1"),
  *     sequenceCount,
+ *     providerOwnerId | "", providerExecutionId | "", providerFence | "",
  *     ...chunkSuffixes (optional, one per event for a coalesced publication)
  *   ]
  *   RETURNS: the 0-indexed first seq assigned to this frame, or -1 when the generation
@@ -183,6 +188,37 @@ const PUBLISH_SEQ_LUA =
   'local currentStatus = redis.call("HGET", KEYS[2], "status") ' +
   'if currentStatus ~= "running" and currentStatus ~= "requires_action" then return -1 end ' +
   'end ' +
+  'local ownerId = ARGV[10] ' +
+  'if ownerId ~= "" then ' +
+  'if redis.call("HGET", KEYS[2], "providerOwnerId") ~= ownerId ' +
+  'or redis.call("HGET", KEYS[2], "providerExecutionId") ~= ARGV[11] ' +
+  'or redis.call("HGET", KEYS[2], "providerOwnerFence") ~= ARGV[12] ' +
+  'or redis.call("HGET", KEYS[2], "providerDrained") ~= "0" then return -1 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[2], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return -1 end ' +
+  'else local identity = redis.call("HGET", KEYS[2], "agentRuntime") ' +
+  'if identity and redis.call("HGET", KEYS[2], "providerDrained") == "0" then ' +
+  'local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then ' +
+  'local recoveryId = ARGV[13] ' +
+  'if redis.call("HGET", KEYS[2], "providerRecoveryOutcome") == "outcome_unknown" then ' +
+  'if recoveryId == "" or redis.call("HGET", KEYS[2], "providerRecoveryId") ~= recoveryId then return -1 end ' +
+  'elseif redis.call("HGET", KEYS[2], "status") ~= "aborted" then return -1 end end end end ' +
+  'local recoveryId = ARGV[13] ' +
+  'if recoveryId ~= "" then ' +
+  'if ownerId ~= "" or redis.call("HGET", KEYS[2], "providerRecoveryOutcome") ~= "outcome_unknown" ' +
+  'or redis.call("HGET", KEYS[2], "providerRecoveryId") ~= recoveryId then return -1 end ' +
+  'if redis.call("HGET", KEYS[2], "providerRecoveryPublishedId") == recoveryId then ' +
+  'local terminalPublicationId = ARGV[14] ' +
+  'if terminalPublicationId ~= "" then ' +
+  'if redis.call("HGET", KEYS[2], "terminalPublicationId") ~= terminalPublicationId then return -1 end ' +
+  'redis.call("HSET", KEYS[2], "terminalPublicationPublishedId", terminalPublicationId) end ' +
+  'return -2 end end ' +
+  'local terminalPublicationId = ARGV[14] ' +
+  'if terminalPublicationId ~= "" then ' +
+  'if redis.call("HGET", KEYS[2], "terminalPublicationId") ~= terminalPublicationId then return -1 end ' +
+  'if redis.call("HGET", KEYS[2], "terminalPublicationPublishedId") == terminalPublicationId then return -2 end end ' +
   'local count = tonumber(ARGV[9]) ' +
   'local val = redis.call("INCRBY", KEYS[1], count) ' +
   'local ttl = tonumber(ARGV[4]) ' +
@@ -193,13 +229,15 @@ const PUBLISH_SEQ_LUA =
   'redis.call("EXPIRE", KEYS[1], ttl) ' +
   'end ' +
   'local seq = val - count ' +
-  'if #ARGV > 9 then ' +
+  'if #ARGV > 14 then ' +
   'for i = 1, count do ' +
-  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq + i - 1) .. ARGV[9 + i]) ' +
+  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq + i - 1) .. ARGV[14 + i]) ' +
   'end ' +
   'else ' +
   'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq) .. ARGV[3]) ' +
   'end ' +
+  'if recoveryId ~= "" then redis.call("HSET", KEYS[2], "providerRecoveryPublishedId", recoveryId) end ' +
+  'if terminalPublicationId ~= "" then redis.call("HSET", KEYS[2], "terminalPublicationPublishedId", terminalPublicationId) end ' +
   'return seq';
 
 /** A normal generation guard correctly rejects events from an old epoch once
@@ -475,6 +513,9 @@ export class RedisEventTransport implements IEventTransport {
     expectedGenerationId?: number,
     allowRetainedEpoch = false,
     requireActiveJob = false,
+    providerOwner?: ProviderOwnerContext,
+    providerRecoveryId?: string,
+    terminalPublicationId?: string,
   ): Promise<number> {
     const [prefix, suffix] = RedisEventTransport.buildPayloadParts(message);
     return this.evalPublishSequenced(
@@ -485,6 +526,9 @@ export class RedisEventTransport implements IEventTransport {
       expectedGenerationId,
       allowRetainedEpoch,
       requireActiveJob,
+      providerOwner,
+      providerRecoveryId,
+      terminalPublicationId,
     );
   }
 
@@ -496,6 +540,9 @@ export class RedisEventTransport implements IEventTransport {
     expectedGenerationId?: number,
     allowRetainedEpoch = false,
     requireActiveJob = false,
+    providerOwner?: ProviderOwnerContext,
+    providerRecoveryId?: string,
+    terminalPublicationId?: string,
     chunkSuffixes: string[] = [],
   ): Promise<number> {
     const seq = await this.publisher.eval(
@@ -513,6 +560,11 @@ export class RedisEventTransport implements IEventTransport {
       String(GENERATION_EPOCH_GRACE_TTL_SECONDS),
       requireActiveJob ? '1' : '0',
       String(count),
+      providerOwner?.ownerId ?? '',
+      providerOwner?.providerExecutionId ?? '',
+      providerOwner != null ? String(providerOwner.fence) : '',
+      providerRecoveryId ?? '',
+      terminalPublicationId ?? '',
       ...chunkSuffixes,
     );
     return seq as number;
@@ -524,7 +576,7 @@ export class RedisEventTransport implements IEventTransport {
     generationId?: number,
     options?: ChunkPublicationOptions,
   ): Promise<number | false | void> {
-    if (options?.coalesce === true && this.coalesceWindowMs > 0) {
+    if (options?.providerOwner == null && options?.coalesce === true && this.coalesceWindowMs > 0) {
       return this.enqueueCoalescedChunk(streamId, event, generationId);
     }
     /** A sequenced non-coalescable publication is an ordering barrier: pending
@@ -544,6 +596,7 @@ export class RedisEventTransport implements IEventTransport {
       generationId,
       false,
       generationId != null,
+      options?.providerOwner,
     )
       .then((sequence) => (sequence === -1 ? false : sequence))
       .catch((err) => {
@@ -633,6 +686,9 @@ export class RedisEventTransport implements IEventTransport {
       generationId,
       false,
       generationId != null,
+      undefined,
+      undefined,
+      undefined,
       events,
     ).then(
       (baseSeq) => {
@@ -1483,15 +1539,29 @@ export class RedisEventTransport implements IEventTransport {
    * Performance: sequence allocation and publish share one round trip. This runs per streamed
    * delta, so the saved round trip is multiplied by the token count of every response.
    */
-  emitChunk(streamId: string, event: unknown, generationId?: number): Promise<void> {
-    return this.publishChunkWithReceipt(streamId, event, generationId).then(() => undefined);
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+  ): Promise<void> {
+    return this.publishChunkWithReceipt(streamId, event, generationId, { providerOwner }).then(
+      () => undefined,
+    );
   }
 
   /**
    * Publish a done event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitDone(streamId: string, event: unknown, generationId?: number): Promise<void> {
+  async emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+    providerRecoveryId?: string,
+    terminalPublicationId?: string,
+  ): Promise<void> {
     try {
       /** Terminal frames must carry a later sequence than every pending delta,
        * or subscribers would close on DONE and drop the coalesced tail. */
@@ -1505,6 +1575,10 @@ export class RedisEventTransport implements IEventTransport {
         },
         generationId,
         true,
+        false,
+        providerOwner,
+        providerRecoveryId,
+        terminalPublicationId,
       );
       if (sequence === -1) {
         throw new GenerationPublicationFencedError('done', streamId, generationId);
@@ -1564,7 +1638,12 @@ export class RedisEventTransport implements IEventTransport {
    * Publish an error event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitError(streamId: string, error: string, generationId?: number): Promise<void> {
+  async emitError(
+    streamId: string,
+    error: string,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+  ): Promise<void> {
     try {
       await this.flushCoalescedChunks(streamId);
       const sequence = await this.publishWithSequence(
@@ -1576,6 +1655,8 @@ export class RedisEventTransport implements IEventTransport {
         },
         generationId,
         true,
+        false,
+        providerOwner,
       );
       if (sequence === -1) {
         throw new GenerationPublicationFencedError('error', streamId, generationId);

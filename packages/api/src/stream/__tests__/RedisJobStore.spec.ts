@@ -44,6 +44,41 @@ function jobHashFromCreationCall(call: unknown[]): Record<string, string> {
 }
 
 describe('RedisJobStore', () => {
+  test('keeps terminal persistence indexed until its published outbox is ACKed', async () => {
+    const evalScript = jest.fn().mockResolvedValue(1);
+    const srem = jest.fn().mockResolvedValue(1);
+    const redis = {
+      isCluster: true,
+      eval: evalScript,
+      hgetall: jest.fn().mockResolvedValue({}),
+      srem,
+    } as unknown as Cluster;
+    const store = new RedisJobStore(redis);
+
+    await expect(
+      store.finalizeTerminalPersistence(
+        'stream-terminal-outbox',
+        123456,
+        '{"final":true}',
+        undefined,
+        'terminal:123456',
+      ),
+    ).resolves.toBe(true);
+    expect(evalScript.mock.calls[0]?.[0]).toContain('"terminalPublicationId", ARGV[6]');
+    const finalizeCall = evalScript.mock.calls[0];
+    expect(finalizeCall?.[finalizeCall.length - 1]).toBe('terminal:123456');
+    expect(srem).not.toHaveBeenCalled();
+
+    await expect(
+      store.acknowledgeTerminalPublication('stream-terminal-outbox', 123456, 'terminal:123456'),
+    ).resolves.toBe(true);
+    expect(evalScript.mock.calls[1]?.[0]).toContain('"terminalPublicationPublishedId") ~= ARGV[2]');
+    expect(srem).toHaveBeenCalledWith(
+      'stream:terminal_persistence:v1',
+      '["stream-terminal-outbox",123456]',
+    );
+  });
+
   test('marks only the exact provider segment drained', async () => {
     const evalDrain = jest.fn().mockResolvedValue(1);
     const redis = {
@@ -175,6 +210,7 @@ describe('RedisJobStore', () => {
     const redis = {
       isCluster: true,
       eval: evalTransition,
+      sadd: jest.fn().mockResolvedValue(1),
       hgetall: jest.fn().mockResolvedValue({
         streamId: 'stream-terminal-barrier',
         userId: 'user-1',
@@ -1022,7 +1058,7 @@ describe('RedisJobStore', () => {
     expect(appendCall[0]).toContain('retainedEpoch ~= currentCreatedAt');
     expect(appendCall[0]).toContain('redis.call("EXPIRE", KEYS[8], epochTarget)');
     expect(appendCall.slice(1)).toEqual([
-      8,
+      9,
       'stream:{stream-chunk-guarded}:chunks',
       'stream:{stream-chunk-guarded}:job',
       'stream:{stream-chunk-guarded}:steer-receipts',
@@ -1031,6 +1067,7 @@ describe('RedisJobStore', () => {
       'stream:{stream-chunk-guarded}:steers',
       'stream:{stream-chunk-guarded}:parked',
       'stream:{stream-chunk-guarded}:generation-epoch',
+      'stream:{stream-chunk-guarded}:pi-tool-admissions:100',
       JSON.stringify(event),
       '1500',
       '100',
@@ -1039,6 +1076,10 @@ describe('RedisJobStore', () => {
       expect.any(String),
       '300',
       '300',
+      '',
+      '',
+      '',
+      '1500000',
     ]);
   });
 
@@ -1069,6 +1110,9 @@ describe('RedisJobStore', () => {
       JSON.stringify(runSteps),
       '1500',
       '100',
+      '',
+      '',
+      '',
     ]);
   });
 

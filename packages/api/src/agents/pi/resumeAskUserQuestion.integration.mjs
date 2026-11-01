@@ -1,15 +1,14 @@
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import test from 'node:test';
-
-import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
+import { ApprovalEvents } from 'librechat-data-provider';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
 import { HumanMessage, SystemMessage } from '@librechat/agents/langchain/messages';
-import { ApprovalEvents } from 'librechat-data-provider';
 
 const require = createRequire(import.meta.url);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
@@ -135,7 +134,7 @@ async function clearRedisPrefix(redis, keyPrefix) {
   }
 }
 
-async function waitFor(predicate, timeoutMs = 15000) {
+async function waitFor(predicate, timeoutMs = 15000, timeoutDetails) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await predicate()) {
@@ -143,7 +142,10 @@ async function waitFor(predicate, timeoutMs = 15000) {
     }
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
   }
-  throw new Error('Timed out waiting for the Pi ask-user continuation to finish');
+  const details = typeof timeoutDetails === 'function' ? await timeoutDetails() : timeoutDetails;
+  throw new Error(
+    `Timed out waiting for the Pi ask-user continuation to finish${details ? `: ${details}` : ''}`,
+  );
 }
 
 async function createFakeModelBinding(baseUrl, onDispose) {
@@ -492,7 +494,9 @@ test('Pi ask-user pauses over SSE and resumes through POST /api/agents/chat/resu
     instructions: 'Ask for missing plant and time range details before answering.',
     model_parameters: { model: 'ask-user-echo' },
     tools: [{ name: ASK_USER_QUESTION }],
-    toolDefinitions: [{ name: ASK_USER_QUESTION, description: 'Ask the user for missing details.' }],
+    toolDefinitions: [
+      { name: ASK_USER_QUESTION, description: 'Ask the user for missing details.' },
+    ],
     edges: [],
   };
   const content = createContentAggregator();
@@ -631,7 +635,10 @@ test('Pi ask-user pauses over SSE and resumes through POST /api/agents/chat/resu
       ),
       'Pi emits the in-progress host tool step used to bind the continuation',
     );
-    assert.deepEqual(content.contentParts.map((part) => part.type), ['tool_call']);
+    assert.deepEqual(
+      content.contentParts.map((part) => part.type),
+      ['tool_call'],
+    );
 
     await container.saveRunSteps(
       streamId,
@@ -792,7 +799,28 @@ test('Pi ask-user pauses over SSE and resumes through POST /api/agents/chat/resu
     );
 
     await waitFor(
-      async () => (await librechatApi.GenerationJobManager.getJob(streamId))?.status === 'complete',
+      async () => {
+        const currentJob = await librechatApi.GenerationJobManager.getJob(streamId);
+        return (
+          currentJob?.status === 'complete' &&
+          currentJob.terminalPersistencePending !== true &&
+          savedMessages.length === 2
+        );
+      },
+      15000,
+      async () => {
+        const currentJob = await librechatApi.GenerationJobManager.getJob(streamId);
+        return JSON.stringify({
+          status: currentJob?.status,
+          lastError: currentJob?.metadata?.lastError,
+          capturedErrors,
+          providerRequestCount: provider.requestBodies.length,
+          savedMessages: savedMessages.map((message) => ({
+            unfinished: message.unfinished,
+            content: message.content,
+          })),
+        });
+      },
     );
 
     assert.equal(initializeClientCalls, 1);

@@ -8,8 +8,11 @@ import {
   type ToolExecuteResult,
 } from '@librechat/agents';
 import type { PiHostToolCall } from './toolExecution';
+import { AgentRuntimeUnavailableError, PINNED_PI_AGENT_RUNTIME } from '../runtime/selection';
+import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
+import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
+import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
 import { createPiMcpToolSchema, isPiMcpToolName } from './mcpSchema';
-import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
 import { createPiCodeSessionBridge } from './codeSession';
 
@@ -103,6 +106,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       authorizedToolNames: [rawName],
     });
 
@@ -144,6 +148,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
     });
 
     await expect(execute(call)).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
@@ -172,6 +177,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: suppliedMetadata,
+      authorize: async () => true,
     });
 
     await expect(execute(call)).resolves.toBe(result);
@@ -256,6 +262,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       codeSessionBridge: bridge,
     });
 
@@ -317,6 +324,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
     });
 
     await expect(
@@ -339,13 +347,14 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       onError,
     });
 
     await expect(execute(hostCall())).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0]?.[0].message).toBe(
-      'The selected agent runtime is not available on this server.',
+      'The Pi agent runtime is not available on this server.',
     );
   });
 
@@ -364,12 +373,13 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       onError,
     });
 
     await expect(execute(hostCall())).rejects.toMatchObject({
       name: 'AgentRuntimeUnavailableError',
-      message: 'The selected agent runtime is not available on this server.',
+      message: 'The Pi agent runtime is not available on this server.',
     });
     expect(onError).toHaveBeenCalledTimes(1);
   });
@@ -387,12 +397,13 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       onError,
     });
 
     await expect(execute(hostCall())).rejects.toMatchObject({
       name: 'AgentRuntimeUnavailableError',
-      message: 'The selected agent runtime is not available on this server.',
+      message: 'The Pi agent runtime is not available on this server.',
     });
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0]?.[0].message).not.toContain('private query text');
@@ -409,6 +420,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
     });
 
     await expect(execute(hostCall())).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
@@ -428,10 +440,12 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       onError,
     });
 
     const execution = execute(hostCall(), controller.signal);
+    await Promise.resolve();
     expect(handle).toHaveBeenCalledTimes(1);
     const listener = addListener.mock.calls.find(([type]) => type === 'abort')?.[1];
     expect(listener).toBeDefined();
@@ -458,6 +472,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
     });
 
     await expect(execute(hostCall(), controller.signal)).rejects.toMatchObject({
@@ -465,6 +480,114 @@ describe('createPiHostToolBatchExecutor', () => {
       message: 'Tool execution was aborted.',
     });
     expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('rechecks cancellation after an asynchronous provider-owner assertion', async () => {
+    const controller = new AbortController();
+    let authorizeCall: ((authorized: boolean) => void) | undefined;
+    const { handler, handle } = createHandler(() => undefined);
+    const execute = createPiHostToolBatchExecutor({
+      handler,
+      userId: 'user-1',
+      agentId: 'agent-1',
+      request: serverRequest,
+      threadId: 'thread-1',
+      runId: 'run-1',
+      metadata: {},
+      authorize: () =>
+        new Promise<boolean>((resolve) => {
+          authorizeCall = resolve;
+        }),
+    });
+
+    const pending = execute(hostCall(), controller.signal);
+    await Promise.resolve();
+    expect(authorizeCall).toBeDefined();
+    controller.abort();
+    authorizeCall?.(true);
+
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    expect(handle).not.toHaveBeenCalled();
+  });
+
+  it('denies a delayed host call admitted before its owner is reaped', async () => {
+    let now = 1_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const jobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass();
+    manager.configure({
+      jobStore,
+      eventTransport: new InMemoryEventTransport(),
+      isRedis: false,
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    let generationCreatedAt: number | undefined;
+    let generationProviderExecutionId: string | undefined;
+
+    try {
+      const job = await manager.createJob('pi-owner-reaped-before-dispatch', 'user-1', undefined, {
+        initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+      });
+      const providerExecutionId = job.metadata.providerExecutionId!;
+      generationCreatedAt = job.createdAt;
+      generationProviderExecutionId = providerExecutionId;
+      await expect(
+        manager.beginProviderExecution(job.streamId, job.createdAt, providerExecutionId),
+      ).resolves.toBe(true);
+      const storedOwner = await jobStore.getJob(job.streamId);
+      if (
+        storedOwner?.providerOwnerId == null ||
+        storedOwner.providerOwnerFence == null ||
+        storedOwner.providerLeaseExpiresAt == null
+      ) {
+        throw new Error('Expected a persisted Pi provider owner.');
+      }
+      const owner = {
+        streamId: job.streamId,
+        createdAt: job.createdAt,
+        providerExecutionId,
+        ownerId: storedOwner.providerOwnerId,
+        fence: storedOwner.providerOwnerFence,
+      };
+
+      // The caller commits its one-use receipt, then is suspended before crossing
+      // into ON_TOOL_EXECUTE. Another replica's lease reaper wins during that gap.
+      await expect(
+        manager.admitPiToolInvocation(job.streamId, job.createdAt, hostCall().id),
+      ).resolves.toBe(true);
+      now = storedOwner.providerLeaseExpiresAt + 1;
+      await expect(jobStore.claimExpiredPiProviderOwner(owner)).resolves.toBe(true);
+
+      const { handler, handle } = createHandler((batch) =>
+        batch.resolve([successfulResult(hostCall().id)]),
+      );
+      const execute = createPiHostToolBatchExecutor({
+        handler,
+        userId: 'user-1',
+        agentId: 'agent-1',
+        request: serverRequest,
+        threadId: job.streamId,
+        runId: 'run-1',
+        metadata: {},
+        authorize: (signal) => manager.assertPiProviderOwner(job.streamId, job.createdAt, signal),
+      });
+
+      await expect(execute(hostCall(), job.abortController.signal)).rejects.toBeInstanceOf(
+        AgentRuntimeUnavailableError,
+      );
+      expect(handle).not.toHaveBeenCalled();
+    } finally {
+      if (generationCreatedAt != null && generationProviderExecutionId != null) {
+        await manager.markProviderExecutionDrained(
+          'pi-owner-reaped-before-dispatch',
+          generationCreatedAt,
+          generationProviderExecutionId,
+        );
+      }
+      nowSpy.mockRestore();
+      await manager.destroy();
+    }
   });
 
   it('preserves only the AbortError classification from handler cancellation', async () => {
@@ -482,6 +605,7 @@ describe('createPiHostToolBatchExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
       onError,
     });
 

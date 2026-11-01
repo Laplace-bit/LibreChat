@@ -43,7 +43,6 @@ const {
   getUserFacingResumeError,
   decrementPendingRequest,
   checkAndIncrementPendingRequest,
-  isSteerPreemptSupported,
   isStopConfirmed,
   toPendingSteer,
   createMCPRuntimeRequestBody,
@@ -1046,14 +1045,14 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
   }
   const isPiAskUserQuestionResume = pendingAction.payload.type === 'ask_user_question';
   const piDecision =
-    runtimeResolution.selection.engine === 'pi' && !isPiAskUserQuestionResume
+    runtimeResolution.status === 'available' && !isPiAskUserQuestionResume
       ? resolvePiApprovalDecision({
           continuation: piApprovalContinuation,
           resolutions: Array.isArray(req.body.decisions) ? req.body.decisions : [],
         })
       : undefined;
   if (
-    runtimeResolution.selection.engine === 'pi' &&
+    runtimeResolution.status === 'available' &&
     ((isPiAskUserQuestionResume && piAskUserQuestionContinuation == null) ||
       (!isPiAskUserQuestionResume && (piApprovalContinuation == null || piDecision == null)))
   ) {
@@ -1173,7 +1172,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     resumeState = await GenerationJobManager.getResumeState(streamId, job.createdAt, {
       validateEarlyBufferRecovery: true,
     });
-    if (runtimeResolution.selection.engine === 'pi') {
+    if (runtimeResolution.status === 'available') {
       const piHostStateMatches =
         resumeState != null &&
         (isPiAskUserQuestionResume
@@ -1646,8 +1645,8 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         streamId,
         pendingAction.actionId,
         {
-          preemptCapable: isSteerPreemptSupported(),
-          steerQuotesCapable: true,
+          preemptCapable: false,
+          steerQuotesCapable: false,
           providerExecutionId,
           providerDrained: true,
           ...(resolvedAskUserQuestion && { resolvedAskUserQuestions }),

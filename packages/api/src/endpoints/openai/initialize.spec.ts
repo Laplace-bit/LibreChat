@@ -647,4 +647,95 @@ describe('initializeOpenAI – Pi provider authorization', () => {
       restoreIsolatedEnv();
     }
   });
+
+  it('transfers a canonical Azure Responses factory only to the exact initialized agent', async () => {
+    const azureEnvKeys = [
+      'AZURE_API_KEY',
+      'AZURE_OPENAI_API_KEY',
+      'AZURE_OPENAI_API_INSTANCE_NAME',
+      'AZURE_OPENAI_API_DEPLOYMENT_NAME',
+      'AZURE_OPENAI_API_VERSION',
+      'AZURE_OPENAI_BASEURL',
+      'OPENAI_ORGANIZATION',
+      'PROXY',
+      'proxy',
+    ];
+    const saved = new Map(azureEnvKeys.map((key) => [key, process.env[key]]));
+    for (const key of azureEnvKeys) delete process.env[key];
+    process.env.AZURE_API_KEY = 'az-server-admin-key';
+    const params = createParams({ AZURE_API_KEY: 'az-server-admin-key' });
+    params.endpoint = EModelEndpoint.azureOpenAI;
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: true };
+    mockGetOpenAIConfig.mockImplementationOnce(realGetOpenAIConfig);
+    (getAzureCredentials as jest.Mock).mockReturnValueOnce({
+      azureOpenAIApiKey: 'az-server-admin-key',
+      azureOpenAIApiInstanceName: 'factory-resource',
+      azureOpenAIApiDeploymentName: 'factory-gpt-4o',
+      azureOpenAIApiVersion: 'v1',
+    });
+
+    try {
+      const options = await initializeOpenAI(params);
+      const factory = getInitializeResultPiModelBindingFactory(options);
+      expect(
+        'useResponsesApi' in options.llmConfig ? options.llmConfig.useResponsesApi : undefined,
+      ).toBe(true);
+      expect(options.configOptions).toMatchObject({
+        baseURL: 'https://factory-resource.openai.azure.com/openai/v1',
+        defaultQuery: { 'api-version': 'preview' },
+      });
+      expect(factory).toEqual(expect.any(Function));
+      expect(Object.keys(options)).not.toContain('createPiModelBinding');
+      if (factory === undefined) {
+        throw new Error('Expected the authorized Azure Pi model binding factory');
+      }
+
+      const initializedAgent = { id: 'agent-azure' };
+      const unrelatedAgent = { id: 'agent-other' };
+      transferPiModelBindingFactory(options, initializedAgent);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+      expect(getAgentPiModelBindingFactory(initializedAgent)).toBe(factory);
+      expect(getAgentPiModelBindingFactory(unrelatedAgent)).toBeUndefined();
+      expect(Object.keys(initializedAgent)).toEqual(['id']);
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('keeps Azure Chat Completions on the existing provider path', async () => {
+    const saved = new Map(
+      ['AZURE_API_KEY', 'AZURE_OPENAI_BASEURL', 'OPENAI_ORGANIZATION', 'PROXY', 'proxy'].map(
+        (key) => [key, process.env[key]],
+      ),
+    );
+    for (const [key] of saved) delete process.env[key];
+    process.env.AZURE_API_KEY = 'az-server-admin-key';
+    const params = createParams({ AZURE_API_KEY: 'az-server-admin-key' });
+    params.endpoint = EModelEndpoint.azureOpenAI;
+    params.model_parameters = { model: 'gpt-4o', useResponsesApi: false };
+    (getAzureCredentials as jest.Mock).mockReturnValueOnce({
+      azureOpenAIApiKey: 'az-server-admin-key',
+      azureOpenAIApiInstanceName: 'factory-resource',
+      azureOpenAIApiDeploymentName: 'factory-gpt-4o',
+      azureOpenAIApiVersion: '2024-10-21',
+    });
+
+    try {
+      const options = await initializeOpenAI(params);
+      expect(
+        'useResponsesApi' in options.llmConfig ? options.llmConfig.useResponsesApi : undefined,
+      ).toBe(false);
+      expect(getInitializeResultPiModelBindingFactory(options)).toBeUndefined();
+    } finally {
+      (params as unknown as { _restore: () => void })._restore();
+      for (const [key, value] of saved) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
 });

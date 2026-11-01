@@ -25,6 +25,7 @@ import type {
   ParkedSteerClaim,
   ScheduleCleanupScope,
   ScheduleProviderOwner,
+  ProviderOwnerContext,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
@@ -38,6 +39,7 @@ import {
   PAUSE_PERSISTENCE_TIMEOUT_ERROR,
   PAUSE_PERSISTENCE_TIMEOUT_MS,
   PROVIDER_DRAIN_TIMEOUT_MS,
+  PI_PROVIDER_OWNER_LOST_ERROR,
   isPendingActionStale,
   toWireRunSteps,
 } from '~/stream/interfaces/IJobStore';
@@ -66,6 +68,11 @@ const TERMINAL_PERSISTENCE_RETENTION_MS = 5 * 60 * 1000;
  *  it is reaped even if unacknowledged (a permanently-failing hook cannot leak forever).
  *  Mirrors the Redis store's 24h host-action TTL. */
 const HOST_ACTION_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+function isPiAgentGeneration(job: Pick<SerializableJobData, 'agentRuntime'>): boolean {
+  const runtime = resolveStoredAgentRuntime(job.agentRuntime);
+  return runtime.status === 'resolved';
+}
 
 function assertCreateIdempotencyArguments(
   claimKey?: string,
@@ -204,6 +211,9 @@ export class InMemoryJobStore implements IJobStoreV2 {
     { value: IdempotencyClaimValue; expiresAt: number }
   >();
 
+  /** One admission per generation/tool-call id; entries die with that generation. */
+  private piToolAdmissions = new Map<string, Set<string>>();
+
   /** Time to keep completed jobs before cleanup (0 = immediate) */
   private ttlAfterComplete = 0;
 
@@ -341,7 +351,11 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (runtime.status === 'unsupported') {
       throw new Error('Invalid generation runtime identity');
     }
-    safeInitialMetadata.agentRuntime = runtime.selection;
+    if (runtime.status === 'resolved') {
+      safeInitialMetadata.agentRuntime = runtime.selection;
+    } else {
+      delete safeInitialMetadata.agentRuntime;
+    }
     const assertOwnerCompatible = (): void => {
       const existingJob = this.jobs.get(streamId);
       if (
@@ -586,7 +600,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       syncSent: false,
     };
     Object.defineProperty(job, 'agentRuntime', {
-      value: runtime.selection,
+      value: runtime.status === 'resolved' ? runtime.selection : undefined,
       enumerable: true,
       configurable: false,
       writable: false,
@@ -630,6 +644,9 @@ export class InMemoryJobStore implements IJobStoreV2 {
 
     if (previousJob != null) {
       this.parkQueuedSteers(streamId, previousJob, now);
+    }
+    if (previousJob != null) {
+      this.piToolAdmissions.delete(streamId + ':' + previousJob.createdAt);
     }
     this.jobs.set(streamId, job);
     this.retainGenerationEpoch(streamId, job.createdAt, now);
@@ -741,10 +758,26 @@ export class InMemoryJobStore implements IJobStoreV2 {
     streamId: string,
     updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     assertRuntimeIdentityImmutable(updates);
     const job = this.jobs.get(streamId);
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
+      return;
+    }
+    if (
+      providerOwner != null &&
+      (!this.isCurrentPiProviderOwner(job, providerOwner) ||
+        (job.providerLeaseExpiresAt ?? 0) <= Date.now())
+    ) {
+      return;
+    }
+    if (
+      providerOwner == null &&
+      isPiAgentGeneration(job) &&
+      job.providerDrained === false &&
+      updates.status !== 'aborted'
+    ) {
       return;
     }
     if (
@@ -793,12 +826,29 @@ export class InMemoryJobStore implements IJobStoreV2 {
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
-    if (job?.createdAt !== expectedCreatedAt || job.providerExecutionId !== providerExecutionId) {
+    if (
+      job?.createdAt !== expectedCreatedAt ||
+      job.providerExecutionId !== providerExecutionId ||
+      job.providerRecoveryOutcome === 'outcome_unknown'
+    ) {
+      return false;
+    }
+    if (
+      providerOwner != null &&
+      (!this.isCurrentPiProviderOwner(job, providerOwner) ||
+        (job.providerLeaseExpiresAt ?? 0) <= Date.now())
+    ) {
+      return false;
+    }
+    if (providerOwner == null && isPiAgentGeneration(job) && job.providerDrained === false) {
       return false;
     }
     job.providerDrained = true;
+    delete job.providerOwnerId;
+    delete job.providerLeaseExpiresAt;
     return true;
   }
 
@@ -821,17 +871,213 @@ export class InMemoryJobStore implements IJobStoreV2 {
     return true;
   }
 
+  async acquirePiProviderOwner(
+    streamId: string,
+    expectedCreatedAt: number,
+    providerExecutionId: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<ProviderOwnerContext | false> {
+    const job = this.jobs.get(streamId);
+    if (
+      !job ||
+      job.createdAt !== expectedCreatedAt ||
+      job.providerExecutionId !== providerExecutionId ||
+      job.status !== 'running' ||
+      job.providerDrained !== true ||
+      !isPiAgentGeneration(job) ||
+      ownerId.length === 0 ||
+      ownerId.length > 128 ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs < 1000
+    ) {
+      return false;
+    }
+    const fence = (job.providerOwnerFence ?? 0) + 1;
+    if (!Number.isSafeInteger(fence)) return false;
+    job.providerOwnerId = ownerId;
+    job.providerOwnerFence = fence;
+    job.providerLeaseExpiresAt = Date.now() + leaseMs;
+    job.providerDrained = false;
+    job.providerExecutionStartedId = providerExecutionId;
+    return Object.freeze({
+      streamId,
+      createdAt: expectedCreatedAt,
+      providerExecutionId,
+      ownerId,
+      fence,
+    });
+  }
+
+  async renewPiProviderOwner(owner: ProviderOwnerContext, leaseMs: number): Promise<boolean> {
+    const job = this.jobs.get(owner.streamId);
+    if (
+      !this.isCurrentPiProviderOwner(job, owner) ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs < 1000
+    ) {
+      return false;
+    }
+    if ((job.providerLeaseExpiresAt ?? 0) <= Date.now()) return false;
+    job.providerLeaseExpiresAt = Date.now() + leaseMs;
+    if (job.status === 'running') {
+      job.lastActiveAt = Date.now();
+      this.lastActivity.set(owner.streamId, job.lastActiveAt);
+    }
+    return true;
+  }
+
+  async assertPiProviderOwner(owner: ProviderOwnerContext): Promise<boolean> {
+    const job = this.jobs.get(owner.streamId);
+    return (
+      this.isCurrentPiProviderOwner(job, owner) &&
+      (job.status === 'running' || job.status === 'requires_action') &&
+      (job.providerLeaseExpiresAt ?? 0) > Date.now()
+    );
+  }
+
+  async admitPiToolInvocation(owner: ProviderOwnerContext, invocationId: string): Promise<boolean> {
+    if (invocationId.length === 0 || invocationId.length > 256) return false;
+    const job = this.jobs.get(owner.streamId);
+    if (
+      !this.isCurrentPiProviderOwner(job, owner) ||
+      job.status !== 'running' ||
+      (job.providerLeaseExpiresAt ?? 0) <= Date.now()
+    ) {
+      return false;
+    }
+    const key = owner.streamId + ':' + owner.createdAt;
+    let receipts = this.piToolAdmissions.get(key);
+    if (!receipts) {
+      receipts = new Set();
+      this.piToolAdmissions.set(key, receipts);
+    }
+    if (receipts.has(invocationId)) return false;
+    receipts.add(invocationId);
+    return true;
+  }
+
+  async claimExpiredPiProviderOwner(owner: ProviderOwnerContext): Promise<boolean> {
+    const job = this.jobs.get(owner.streamId);
+    if (
+      !this.isCurrentPiProviderOwner(job, owner) ||
+      (job.status !== 'running' &&
+        job.status !== 'requires_action' &&
+        (!(job.status === 'complete' || job.status === 'error' || job.status === 'aborted') ||
+          job.terminalPersistencePending !== true)) ||
+      (job.providerLeaseExpiresAt ?? Number.POSITIVE_INFINITY) > Date.now()
+    ) {
+      return false;
+    }
+    const from = job.status;
+    const now = Date.now();
+    const transition = await this.transitionStatusAndDrainSteers(owner.streamId, {
+      from,
+      to: 'error',
+      expectCreatedAt: owner.createdAt,
+      expectExpiredProviderOwner: owner,
+      patch: {
+        completedAt: now,
+        error: PI_PROVIDER_OWNER_LOST_ERROR,
+        terminalPersistencePending: true,
+        terminalPersistenceStartedAt: now,
+        providerRecoveryOutcome: 'outcome_unknown',
+        providerRecoveryId: 'pi-owner-lost:' + owner.createdAt + ':' + owner.fence,
+        providerRecoveryFence: owner.fence,
+        providerRecoveryErrorCode: 'PI_PROVIDER_OWNER_LOST',
+      },
+      clear: [
+        'pendingAction',
+        'pendingActionId',
+        'piResumeContinuation',
+        'providerOwnerId',
+        'providerLeaseExpiresAt',
+      ],
+    });
+    return transition != null;
+  }
+
+  async getTerminalPersistencePendingJobs(): Promise<SerializableJobData[]> {
+    return [...this.jobs.values()].filter(
+      (job) =>
+        job.terminalPersistencePending === true ||
+        (job.terminalPublicationId != null &&
+          job.terminalPublicationPublishedId !== job.terminalPublicationId) ||
+        (job.providerRecoveryOutcome === 'outcome_unknown' &&
+          job.providerRecoveryId != null &&
+          job.providerRecoveryPublishedId !== job.providerRecoveryId),
+    );
+  }
+
+  async acknowledgePiProviderRecoveryPublication(
+    streamId: string,
+    expectedCreatedAt: number,
+    recoveryId: string,
+  ): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (
+      job?.createdAt !== expectedCreatedAt ||
+      job.providerRecoveryOutcome !== 'outcome_unknown' ||
+      job.providerRecoveryId !== recoveryId
+    ) {
+      return false;
+    }
+    job.providerRecoveryPublishedId = recoveryId;
+    return true;
+  }
+
+  private isCurrentPiProviderOwner(
+    job: SerializableJobData | undefined,
+    owner: ProviderOwnerContext,
+  ): job is SerializableJobData {
+    return (
+      job != null &&
+      job.createdAt === owner.createdAt &&
+      job.providerExecutionId === owner.providerExecutionId &&
+      job.providerOwnerId === owner.ownerId &&
+      job.providerOwnerFence === owner.fence &&
+      job.providerDrained === false &&
+      job.providerRecoveryOutcome !== 'outcome_unknown'
+    );
+  }
+
   async finalizeTerminalPersistence(
     streamId: string,
     expectedCreatedAt: number,
     finalEvent: string,
+    providerOwner?: ProviderOwnerContext,
+    terminalPublicationId?: string,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
     if (!job || job.createdAt !== expectedCreatedAt || job.terminalPersistencePending !== true) {
       return false;
     }
+    if (
+      providerOwner != null &&
+      (!this.isCurrentPiProviderOwner(job, providerOwner) ||
+        (job.providerLeaseExpiresAt ?? 0) <= Date.now())
+    ) {
+      return false;
+    }
     job.terminalPersistencePending = false;
     job.finalEvent = finalEvent;
+    if (terminalPublicationId != null) {
+      job.terminalPublicationId = terminalPublicationId;
+      delete job.terminalPublicationPublishedId;
+    }
+    return true;
+  }
+
+  async acknowledgeTerminalPublication(
+    streamId: string,
+    expectedCreatedAt: number,
+    publicationId: string,
+  ): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (job?.createdAt !== expectedCreatedAt || job.terminalPublicationId !== publicationId) {
+      return false;
+    }
+    job.terminalPublicationPublishedId = publicationId;
     return true;
   }
 
@@ -856,6 +1102,37 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (args.notAfterMs != null && Date.now() >= args.notAfterMs) {
       throw new JobStatusTransitionDeadlineError(args.notAfterMs);
     }
+    if (
+      args.expectProviderOwner != null &&
+      (!this.isCurrentPiProviderOwner(job, args.expectProviderOwner) ||
+        (job.providerLeaseExpiresAt ?? 0) <= Date.now())
+    ) {
+      return false;
+    }
+    if (
+      args.expectExpiredProviderOwner != null &&
+      (!this.isCurrentPiProviderOwner(job, args.expectExpiredProviderOwner) ||
+        (job.providerLeaseExpiresAt ?? Number.POSITIVE_INFINITY) > Date.now())
+    ) {
+      return false;
+    }
+    if (
+      (args.to === 'complete' || args.to === 'error') &&
+      isPiAgentGeneration(job) &&
+      job.providerDrained === false &&
+      args.expectProviderOwner == null &&
+      args.expectExpiredProviderOwner == null
+    ) {
+      return false;
+    }
+    if (
+      args.to === 'requires_action' &&
+      isPiAgentGeneration(job) &&
+      job.providerDrained === false &&
+      args.expectProviderOwner == null
+    ) {
+      return false;
+    }
     if (['complete', 'error', 'aborted'].includes(args.to)) {
       if (!this.isParkedRecoveryCompatible(streamId, job)) {
         return false;
@@ -863,6 +1140,20 @@ export class InMemoryJobStore implements IJobStoreV2 {
       this.parkQueuedSteers(streamId, job, Date.now());
     }
     job.status = args.to;
+    if (
+      ['complete', 'error', 'aborted'].includes(args.to) &&
+      args.to !== 'aborted' &&
+      (args.expectProviderOwner == null || args.expectExpiredProviderOwner != null) &&
+      job.providerOwnerId != null
+    ) {
+      job.providerOwnerFence =
+        Math.max(job.providerOwnerFence ?? 0, args.expectExpiredProviderOwner?.fence ?? 0) + 1;
+      delete job.providerOwnerId;
+      delete job.providerLeaseExpiresAt;
+    }
+    if (args.expectExpiredProviderOwner != null) {
+      job.providerOwnerLostAt = Date.now();
+    }
     const patch = retainScheduleMCPFailure(job, args.patch ?? {});
     const receipt = retainedScheduleReceipt(job, args.patch ?? {}, args.clear ?? []);
     Object.assign(job, patch);
@@ -1093,9 +1384,16 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
       return false;
     }
+    if (
+      job.terminalPublicationId != null &&
+      job.terminalPublicationPublishedId !== job.terminalPublicationId
+    ) {
+      return false;
+    }
 
     this.retainGenerationEpoch(streamId, job.createdAt);
     this.jobs.delete(streamId);
+    this.piToolAdmissions.delete(streamId + ':' + job.createdAt);
     this.contentState.delete(streamId);
     this.lastActivity.delete(streamId);
     this.steerQueues.delete(streamId);
@@ -1303,17 +1601,21 @@ export class InMemoryJobStore implements IJobStoreV2 {
         job.terminalHostActionPending === true &&
         now - (job.terminalHostActionRefreshedAt ?? job.completedAt ?? 0) <=
           HOST_ACTION_RETENTION_MS;
+      const terminalPublicationHeld =
+        job.terminalPublicationId != null &&
+        job.terminalPublicationPublishedId !== job.terminalPublicationId;
       if (
         isFinished &&
         job.completedAt &&
         job.preserveForScheduleReconcile !== true &&
-        !hostActionHeld
+        !hostActionHeld &&
+        !terminalPublicationHeld
       ) {
         // A pending final event is a persistence barrier, not an ordinary
         // completed row. Give its owner/recovery path a bounded window even
         // when normal terminal retention is configured to zero.
         const terminalTtl =
-          job.terminalPersistencePending === true
+          job.terminalPersistencePending === true || terminalPublicationHeld
             ? Math.max(this.ttlAfterComplete, TERMINAL_PERSISTENCE_RETENTION_MS)
             : this.ttlAfterComplete;
         if (terminalTtl === 0 || now - job.completedAt > terminalTtl) {
@@ -1790,12 +2092,24 @@ export class InMemoryJobStore implements IJobStoreV2 {
     _event: unknown,
     expectedCreatedAt?: number,
     deliveredSteer?: SteerQueueItem,
+    _options?: { coalesce?: boolean },
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
       return false;
     }
     if (job.status !== 'running' && job.status !== 'requires_action') {
+      return false;
+    }
+    if (providerOwner != null) {
+      if (
+        !this.isCurrentPiProviderOwner(job, providerOwner) ||
+        (job.providerLeaseExpiresAt ?? 0) <= Date.now()
+      ) {
+        return false;
+      }
+    } else if (isPiAgentGeneration(job) && job.providerDrained === false) {
       return false;
     }
     if (deliveredSteer != null) {

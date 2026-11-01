@@ -34,6 +34,7 @@ import type {
   PreemptMessage,
   SteerQueueItem,
   DetachedAgentEventActionStoreMode,
+  ProviderOwnerContext,
 } from './interfaces/IJobStore';
 import type {
   EarlyBufferOverflowState,
@@ -55,6 +56,9 @@ import {
   isPendingActionExpired,
   PAUSE_PERSISTENCE_TIMEOUT_ERROR,
   PROVIDER_DRAIN_TIMEOUT_MS,
+  PI_PROVIDER_HEARTBEAT_MS,
+  PI_PROVIDER_LEASE_MS,
+  PI_PROVIDER_OWNER_LOST_ERROR,
   STEER_QUEUE_MAX_DEPTH,
 } from './interfaces/IJobStore';
 import {
@@ -103,7 +107,7 @@ import { sanitizeJobMetadata } from './metadata';
 import {
   assertRuntimeIdentityImmutable,
   freezeStoredAgentRuntimeIdentity,
-  LEGACY_AGENT_RUNTIME,
+  resolveStoredAgentRuntime,
 } from '~/agents/runtime/selection';
 
 /** Terminal error surfaced to a client still attached when its approval window lapses. */
@@ -165,6 +169,10 @@ export const GENERATION_RECOVERY_FAILED_ERROR = 'generation_recovery_failed';
  * owner leaves the durable pending bit behind; the next read or subscriber
  * promotes it to conservative reconciliation after this window. */
 const TERMINAL_PERSISTENCE_TIMEOUT_MS = 30_000;
+const terminalPublicationIdentity = (createdAt: number): string => `terminal:${createdAt}`;
+const isTerminalPublicationPending = (job: SerializableJobData | null | undefined): boolean =>
+  job?.terminalPublicationId != null &&
+  job.terminalPublicationPublishedId !== job.terminalPublicationId;
 /** Hard bounds for a runtime's local early-event replay buffer. The buffer
  * bridges emission to first attachment, but a generation streaming with no
  * attached subscriber would otherwise grow it for its entire duration. On
@@ -348,13 +356,33 @@ function classifyLostAbortRace(
 }
 
 function buildTerminalPersistenceReconcile(
-  job: Pick<SerializableJobData, 'createdAt' | 'conversationId' | 'status'>,
+  job: Pick<
+    SerializableJobData,
+    | 'createdAt'
+    | 'conversationId'
+    | 'status'
+    | 'error'
+    | 'providerRecoveryOutcome'
+    | 'providerRecoveryId'
+    | 'providerRecoveryFence'
+    | 'providerOwnerLostAt'
+    | 'providerRecoveryErrorCode'
+  >,
 ): t.FinalEvent {
   const aborted = job.status === 'aborted';
+  const providerOwnerLost = job.providerRecoveryOutcome === 'outcome_unknown';
+  let reconcileReason: t.FinalEvent['reconcileReason'];
+  if (providerOwnerLost) {
+    reconcileReason = 'provider_owner_lost';
+  } else if (aborted) {
+    reconcileReason = 'abort_persistence_failed';
+  } else {
+    reconcileReason = 'terminal_payload_missing';
+  }
   return {
     final: true,
     reconcile: true,
-    reconcileReason: aborted ? 'abort_persistence_failed' : 'terminal_payload_missing',
+    reconcileReason,
     /** A completion whose outcome-defining write is unknown must not trigger
      * completed-run follow-up draining. Surface it conservatively as an error;
      * the persisted history refetch remains authoritative if the write won
@@ -362,6 +390,14 @@ function buildTerminalPersistenceReconcile(
     terminalStatus: aborted ? 'aborted' : 'error',
     generationCreatedAt: job.createdAt,
     conversation: { conversationId: job.conversationId },
+    ...(providerOwnerLost && {
+      error: { message: job.error ?? PI_PROVIDER_OWNER_LOST_ERROR },
+      providerRecoveryOutcome: 'outcome_unknown' as const,
+      providerRecoveryId: job.providerRecoveryId,
+      providerRecoveryFence: job.providerRecoveryFence,
+      providerOwnerLostAt: job.providerOwnerLostAt,
+      providerRecoveryErrorCode: job.providerRecoveryErrorCode,
+    }),
   };
 }
 
@@ -721,6 +757,8 @@ export interface TerminalJobClaim {
   /** The winner must durably publish either its normal FINAL or a
    * reconciliation payload before cleanup may remove the job. */
   readonly persistencePending?: true;
+  /** Exact Pi provider capability retained only while this terminal owner drains. */
+  readonly providerOwnerContext?: ProviderOwnerContext;
   /** Exact queued + claimed steers atomically parked by the winning CAS. */
   readonly drainedSteers: readonly SteerQueueItem[];
 }
@@ -748,6 +786,12 @@ export interface TerminalJobClaim {
 interface RuntimeJobState {
   createdAt: number;
   abortController: AbortController;
+  /** Redis-backed Pi lease for the provider segment currently owned here. */
+  providerOwnerContext?: ProviderOwnerContext;
+  providerOwnerHeartbeat?: NodeJS.Timeout;
+  /** Identity for one heartbeat segment; late renewals from a stopped segment are ignored. */
+  providerOwnerHeartbeatToken?: object;
+  providerOwnerLost?: boolean;
   /** Removes this generation's cross-replica abort listener without touching a replacement. */
   abortUnsubscribe?: () => void;
   /** A durable successor has stopped this provider but has not yet activated
@@ -898,6 +942,9 @@ type DeferredDelivery =
  * ```
  */
 class GenerationJobManagerClass {
+  /** Random per manager/process identity; the monotonic job fence disambiguates restarts. */
+  private readonly providerOwnerId = randomUUID();
+
   private admissionGuard?: (userId: string) => Promise<boolean>;
 
   /** Job metadata + content state storage - swappable for Redis, etc. */
@@ -1071,6 +1118,7 @@ class GenerationJobManagerClass {
         runtime.startupTelemetry?.end('aborted');
         runtime.startupTelemetry = undefined;
         this.stopSubscriberLease(runtime);
+        this.stopPiProviderHeartbeat(runtime);
         this.releaseAbortSubscription(runtime, true);
         runtime.abortController.abort();
       }
@@ -1223,6 +1271,10 @@ class GenerationJobManagerClass {
 
   private createApprovalLifecycle(store: IJobStoreV2): ApprovalLifecycle {
     return new ApprovalLifecycle(store, {
+      getProviderOwner: (streamId, createdAt) => {
+        const runtime = this.runtimeState.get(streamId);
+        return runtime?.createdAt === createdAt ? runtime.providerOwnerContext : undefined;
+      },
       onPaused: (streamId, createdAt) => this.releaseJobOwnership(streamId, createdAt),
       onResumed: (streamId, createdAt) => this.acquireResumedJobOwnership(streamId, createdAt),
       onExpired: (streamId, createdAt) => this.releaseJobOwnership(streamId, createdAt),
@@ -1412,15 +1464,35 @@ class GenerationJobManagerClass {
   private async recoverStaleTerminalPersistence(
     jobData: SerializableJobData,
   ): Promise<SerializableJobData | null> {
+    const recoveryId =
+      jobData.providerRecoveryOutcome === 'outcome_unknown'
+        ? jobData.providerRecoveryId
+        : undefined;
+    const recoveryPublicationPending =
+      recoveryId != null && jobData.providerRecoveryPublishedId !== recoveryId;
+    const terminalPublicationId =
+      jobData.terminalPublicationId ??
+      (jobData.terminalPersistencePending === true
+        ? terminalPublicationIdentity(jobData.createdAt)
+        : undefined);
+    const terminalPublicationPending =
+      terminalPublicationId != null &&
+      jobData.terminalPublicationPublishedId !== terminalPublicationId;
     if (
-      jobData.terminalPersistencePending !== true ||
+      (jobData.terminalPersistencePending !== true &&
+        !recoveryPublicationPending &&
+        !terminalPublicationPending) ||
       !['complete', 'error', 'aborted'].includes(jobData.status)
     ) {
       return jobData;
     }
     const startedAt =
       jobData.terminalPersistenceStartedAt ?? jobData.completedAt ?? jobData.createdAt;
-    if (Date.now() - startedAt < TERMINAL_PERSISTENCE_TIMEOUT_MS) {
+    if (
+      jobData.terminalPersistencePending === true &&
+      jobData.providerRecoveryOutcome !== 'outcome_unknown' &&
+      Date.now() - startedAt < TERMINAL_PERSISTENCE_TIMEOUT_MS
+    ) {
       return jobData;
     }
     const observedRuntime = this.runtimeState.get(jobData.streamId);
@@ -1440,27 +1512,82 @@ class GenerationJobManagerClass {
     };
 
     const reconcileEvent = buildTerminalPersistenceReconcile(jobData);
-    const serialized = JSON.stringify(reconcileEvent);
-    const recovered = await this.jobStore.finalizeTerminalPersistence(
-      jobData.streamId,
-      jobData.createdAt,
-      serialized,
-    );
-    if (!recovered) {
-      const currentJob = await this.jobStore.getJob(jobData.streamId);
-      const predecessorRuntime = captureMatchingRuntime();
-      if (predecessorRuntime && currentJob?.createdAt !== jobData.createdAt) {
-        await this.reconcileFencedRuntimeHandoff(jobData.streamId, predecessorRuntime, currentJob);
+    let durableJob = jobData;
+    if (jobData.terminalPersistencePending === true) {
+      const serialized = JSON.stringify(reconcileEvent);
+      const finalized = await this.jobStore.finalizeTerminalPersistence(
+        jobData.streamId,
+        jobData.createdAt,
+        serialized,
+        undefined,
+        terminalPublicationId,
+      );
+      if (finalized) {
+        durableJob = {
+          ...jobData,
+          terminalPersistencePending: false,
+          finalEvent: serialized,
+          terminalPublicationId,
+        };
+      } else {
+        const currentJob = await this.jobStore.getJob(jobData.streamId);
+        const predecessorRuntime = captureMatchingRuntime();
+        if (predecessorRuntime && currentJob?.createdAt !== jobData.createdAt) {
+          await this.reconcileFencedRuntimeHandoff(
+            jobData.streamId,
+            predecessorRuntime,
+            currentJob,
+          );
+        }
+        if (
+          currentJob?.createdAt !== jobData.createdAt ||
+          currentJob.terminalPersistencePending === true ||
+          (currentJob.providerRecoveryOutcome === 'outcome_unknown' &&
+            currentJob.providerRecoveryId != null &&
+            currentJob.providerRecoveryPublishedId === currentJob.providerRecoveryId &&
+            !isTerminalPublicationPending(currentJob))
+        ) {
+          return currentJob;
+        }
+        durableJob = currentJob;
       }
-      return currentJob;
     }
 
-    const recoveredRuntime = captureMatchingRuntime();
-    if (recoveredRuntime) {
-      recoveredRuntime.finalEvent = reconcileEvent;
+    let publicationEvent = reconcileEvent;
+    if (durableJob.finalEvent != null) {
+      try {
+        publicationEvent = projectTerminalEvent(
+          JSON.parse(durableJob.finalEvent) as t.ServerSentEvent,
+        ) as t.FinalEvent;
+      } catch {
+        // A corrupt cached final must not block the conservative recovery frame.
+      }
     }
+    const recoveredRuntime = captureMatchingRuntime();
+    if (recoveredRuntime) recoveredRuntime.finalEvent = publicationEvent;
     try {
-      await this.eventTransport.emitDone(jobData.streamId, reconcileEvent, jobData.createdAt);
+      await this.eventTransport.emitDone(
+        jobData.streamId,
+        publicationEvent,
+        jobData.createdAt,
+        undefined,
+        recoveryId,
+        terminalPublicationPending ? terminalPublicationId : undefined,
+      );
+      if (recoveryPublicationPending && recoveryId != null) {
+        await this.jobStore.acknowledgePiProviderRecoveryPublication?.(
+          jobData.streamId,
+          jobData.createdAt,
+          recoveryId,
+        );
+      }
+      if (terminalPublicationPending && terminalPublicationId != null) {
+        await this.jobStore.acknowledgeTerminalPublication?.(
+          jobData.streamId,
+          jobData.createdAt,
+          terminalPublicationId,
+        );
+      }
     } catch (err) {
       if (err instanceof GenerationPublicationFencedError) {
         const currentJob = await this.jobStore.getJob(jobData.streamId);
@@ -1482,9 +1609,15 @@ class GenerationJobManagerClass {
       );
     }
     return {
-      ...jobData,
+      ...durableJob,
       terminalPersistencePending: false,
-      finalEvent: serialized,
+      finalEvent: JSON.stringify(publicationEvent),
+      ...(terminalPublicationId != null && {
+        terminalPublicationId,
+        ...(terminalPublicationPending && {
+          terminalPublicationPublishedId: terminalPublicationId,
+        }),
+      }),
     };
   }
 
@@ -2593,13 +2726,7 @@ class GenerationJobManagerClass {
     const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
     const creationAttemptId = randomUUID();
     const initialMetadataInput = options.initialMetadata ?? {};
-    const sanitizedMetadata = sanitizeJobMetadata({
-      ...initialMetadataInput,
-      agentRuntime:
-        initialMetadataInput.agentRuntime === undefined
-          ? LEGACY_AGENT_RUNTIME
-          : initialMetadataInput.agentRuntime,
-    });
+    const sanitizedMetadata = sanitizeJobMetadata(initialMetadataInput);
     /** Translate the transient capability assertion into its execution-bound
      * marker: valid only while `providerExecutionId` still names this owner,
      * so a legacy replica winning a later HITL resume (which rewrites the
@@ -3191,6 +3318,11 @@ class GenerationJobManagerClass {
         providerExecutionId: jobData.providerExecutionId,
         providerExecutionStartedId: jobData.providerExecutionStartedId,
         providerDrained: jobData.providerDrained,
+        providerRecoveryOutcome: jobData.providerRecoveryOutcome,
+        providerRecoveryId: jobData.providerRecoveryId,
+        providerRecoveryFence: jobData.providerRecoveryFence,
+        providerOwnerLostAt: jobData.providerOwnerLostAt,
+        providerRecoveryErrorCode: jobData.providerRecoveryErrorCode,
         steersClosed: jobData.steersClosed,
         idempotencyClientRequestId: jobData.idempotencyClientRequestId,
         agentEventLegacyTurnToken: jobData.agentEventLegacyTurnToken,
@@ -3365,7 +3497,10 @@ class GenerationJobManagerClass {
     streamId: string,
   ): Promise<Pick<t.GenerationJob, 'createdAt' | 'status' | 'metadata'> | undefined> {
     let job = await this.jobStore.getJob(streamId);
-    if (job?.terminalPersistencePending === true) {
+    if (
+      job != null &&
+      (job.terminalPersistencePending === true || isTerminalPublicationPending(job))
+    ) {
       await this.recoverStaleTerminalPersistence(job);
       job = await this.jobStore.getJob(streamId);
     }
@@ -4054,13 +4189,32 @@ class GenerationJobManagerClass {
     streamId: string,
     job: Pick<SerializableJobData, 'createdAt' | 'agentEventDeliveryKey'>,
   ): Promise<void> {
-    if (job.agentEventDeliveryKey == null) {
+    const currentJob = await this.jobStore.getJob(streamId);
+    const runtimeResolution = resolveStoredAgentRuntime(currentJob?.agentRuntime);
+    if (job.agentEventDeliveryKey == null && runtimeResolution.status !== 'resolved') {
       return;
     }
     const buffered = this.runStepBuffers?.get(streamId);
     if (buffered?.createdAt === job.createdAt && this.jobStore.saveRunSteps != null) {
+      const runtime = this.runtimeState.get(streamId);
+      let owner: ProviderOwnerContext | undefined;
+      if (runtime?.createdAt === job.createdAt) {
+        owner = runtime.providerOwnerContext;
+      } else if (
+        currentJob?.providerOwnerId != null &&
+        currentJob.providerExecutionId != null &&
+        Number.isSafeInteger(currentJob.providerOwnerFence)
+      ) {
+        owner = {
+          streamId,
+          createdAt: currentJob.createdAt,
+          providerExecutionId: currentJob.providerExecutionId,
+          ownerId: currentJob.providerOwnerId,
+          fence: currentJob.providerOwnerFence!,
+        };
+      }
       await this.queueJobWrite(this.runStepWriteQueues, streamId, () =>
-        this.jobStore.saveRunSteps!(streamId, [...buffered.steps], job.createdAt),
+        this.jobStore.saveRunSteps!(streamId, [...buffered.steps], job.createdAt, owner),
       );
     }
   }
@@ -4131,6 +4285,20 @@ class GenerationJobManagerClass {
 
     const createdAt = jobData.createdAt;
     const runtime = observedRuntime?.createdAt === createdAt ? observedRuntime : undefined;
+    const providerOwnerContext = runtime?.providerOwnerContext;
+    const runtimeResolution = resolveStoredAgentRuntime(jobData.agentRuntime);
+    const isPi = runtimeResolution.status === 'resolved';
+    if (
+      isPi &&
+      jobData.providerDrained === false &&
+      (status === 'complete' || status === 'error') &&
+      (providerOwnerContext == null ||
+        providerOwnerContext.providerExecutionId !== jobData.providerExecutionId ||
+        providerOwnerContext.ownerId !== jobData.providerOwnerId ||
+        providerOwnerContext.fence !== jobData.providerOwnerFence)
+    ) {
+      return null;
+    }
     const terminalError = status === 'error' ? (error ?? 'Generation failed') : undefined;
     await this.flushCoalescedStreamBuffers(streamId);
     await this.persistAgentEventRunStepEvidence(streamId, jobData);
@@ -4139,6 +4307,10 @@ class GenerationJobManagerClass {
       from: sourceStatus,
       to: status,
       expectCreatedAt: createdAt,
+      ...(status !== 'aborted' &&
+        providerOwnerContext != null && {
+          expectProviderOwner: providerOwnerContext,
+        }),
       ...(sourceStatus === 'requires_action' && {
         ...(failedPauseBarrierId != null
           ? { expectActionId: failedPauseBarrierId }
@@ -4186,6 +4358,10 @@ class GenerationJobManagerClass {
       ...(options.persistencePending === true && {
         persistencePending: true as const,
       }),
+      ...(status !== 'aborted' &&
+        providerOwnerContext != null && {
+          providerOwnerContext,
+        }),
       drainedSteers: Object.freeze([...drainedSteers]),
     });
     this.terminalClaimRuntimes.set(claim, runtime ?? null);
@@ -4252,16 +4428,21 @@ class GenerationJobManagerClass {
     const desiredEvent = intendedEvent ?? reconcileEvent;
     let publicationEvent: t.ServerSentEvent | null = null;
     let durable = false;
+    let terminalPublicationId: string | undefined;
 
     try {
+      const candidatePublicationId = terminalPublicationIdentity(createdAt);
       const finalized = await this.jobStore.finalizeTerminalPersistence(
         streamId,
         createdAt,
         JSON.stringify(desiredEvent),
+        claim.providerOwnerContext,
+        candidatePublicationId,
       );
       if (finalized) {
         publicationEvent = desiredEvent;
         durable = true;
+        terminalPublicationId = candidatePublicationId;
       } else {
         const settledJob = await this.jobStore.getJob(streamId);
         if (
@@ -4276,6 +4457,7 @@ class GenerationJobManagerClass {
             JSON.parse(settledJob.finalEvent) as t.ServerSentEvent,
           );
           durable = true;
+          terminalPublicationId = settledJob.terminalPublicationId;
         }
       }
     } catch (settleError) {
@@ -4304,7 +4486,26 @@ class GenerationJobManagerClass {
       if (runtime?.createdEventPublication) {
         await runtime.createdEventPublication;
       }
-      await this.eventTransport.emitDone(streamId, publicationEvent, createdAt);
+      await this.eventTransport.emitDone(
+        streamId,
+        publicationEvent,
+        createdAt,
+        claim.providerOwnerContext,
+        undefined,
+        terminalPublicationId,
+      );
+      if (terminalPublicationId != null) {
+        const acknowledged = await this.jobStore.acknowledgeTerminalPublication?.(
+          streamId,
+          createdAt,
+          terminalPublicationId,
+        );
+        if (acknowledged === false) {
+          logger.warn(
+            `[GenerationJobManager] Terminal publication remains indexed for retry ${streamId}`,
+          );
+        }
+      }
     } catch (publicationError) {
       if (publicationError instanceof GenerationPublicationFencedError) {
         return {
@@ -4493,7 +4694,12 @@ class GenerationJobManagerClass {
           if (runtime?.createdEventPublication) {
             await runtime.createdEventPublication;
           }
-          await this.eventTransport.emitError(streamId, terminalError, createdAt);
+          await this.eventTransport.emitError(
+            streamId,
+            terminalError,
+            createdAt,
+            claim.providerOwnerContext,
+          );
         } catch (publishError) {
           if (!(publishError instanceof GenerationPublicationFencedError)) {
             logger.error(
@@ -4526,6 +4732,7 @@ class GenerationJobManagerClass {
           terminalJob?.providerDrained !== false &&
           terminalJob?.preserveForScheduleReconcile !== true &&
           terminalJob?.terminalHostActionPending !== true &&
+          !isTerminalPublicationPending(terminalJob) &&
           (terminalJob?.createdAt !== createdAt || terminalJob.terminalPersistencePending !== true)
         ) {
           // A same-stream replacement created after the claim makes this a safe
@@ -4635,6 +4842,7 @@ class GenerationJobManagerClass {
               status: claim.status,
             }),
           ),
+          claim.providerOwnerContext,
         );
       } catch (persistenceError) {
         logger.error(
@@ -5746,7 +5954,8 @@ class GenerationJobManagerClass {
           return;
         }
         if (
-          terminalJob?.terminalPersistencePending === true &&
+          (terminalJob?.terminalPersistencePending === true ||
+            isTerminalPublicationPending(terminalJob)) &&
           ['complete', 'error', 'aborted'].includes(terminalJob.status)
         ) {
           terminalJob = await this.recoverStaleTerminalPersistence(terminalJob);
@@ -5758,7 +5967,14 @@ class GenerationJobManagerClass {
             }
             return;
           }
-          if (terminalJob?.terminalPersistencePending === true) {
+          if (
+            terminalJob?.terminalPersistencePending === true ||
+            isTerminalPublicationPending(terminalJob)
+          ) {
+            if (isTerminalPublicationPending(terminalJob)) {
+              scheduleTerminalPersistenceCheck(1000);
+              return;
+            }
             const startedAt =
               terminalJob.terminalPersistenceStartedAt ??
               terminalJob.completedAt ??
@@ -6936,7 +7152,12 @@ class GenerationJobManagerClass {
      *  reconciliation, so the caller retries it; swallowing the error here
      *  resolved successfully and made that retry unreachable, leaving the
      *  flag absent after a transient write failure. */
-    await this.jobStore.updateJob(streamId, { activityLabels: true }, expectedCreatedAt);
+    await this.jobStore.updateJob(
+      streamId,
+      { activityLabels: true },
+      expectedCreatedAt,
+      this.providerOwnerFor(streamId, expectedCreatedAt),
+    );
   }
 
   /** Publish a durable non-streaming control event from any API replica.
@@ -7086,7 +7307,12 @@ class GenerationJobManagerClass {
     // RedisJobStore refreshing the running TTL on each appendChunk.
     this.jobStore.recordActivity?.(streamId, runtime.createdAt);
 
-    const eventTracking = this.trackEvent(streamId, event, runtime.createdAt);
+    const eventTracking = this.trackEvent(
+      streamId,
+      event,
+      runtime.createdAt,
+      runtime.providerOwnerContext,
+    );
     if (eventTracking) {
       await eventTracking;
       if (!this.isCurrentRuntime(streamId, runtime)) {
@@ -7116,6 +7342,7 @@ class GenerationJobManagerClass {
         eventType,
         eventData as Record<string, unknown>,
         runtime.createdAt,
+        runtime.providerOwnerContext,
       );
     }
 
@@ -7129,6 +7356,7 @@ class GenerationJobManagerClass {
      */
     const coalescableDelta =
       this._deltaCoalescingEnabled &&
+      runtime.providerOwnerContext == null &&
       (runtime.hasSubscriber || runtime.everHadSubscriber) &&
       !runtime.startupTelemetry &&
       options?.durable !== true &&
@@ -7160,6 +7388,7 @@ class GenerationJobManagerClass {
           runtime.createdAt,
           options?.deliveredSteer,
           coalescableDelta ? { coalesce: true } : undefined,
+          runtime.providerOwnerContext,
         );
 
         /** Before the generation-wide first-subscriber admission, publication
@@ -7167,7 +7396,11 @@ class GenerationJobManagerClass {
          * before another replica can snapshot. The admission probe runs beside
          * the append, so the first event after a remote attachment remains
          * fenced and later events recover the normal fire-and-forget path. */
-        if (options?.durable === true || admissionFenceRequired) {
+        if (
+          options?.durable === true ||
+          admissionFenceRequired ||
+          runtime.providerOwnerContext != null
+        ) {
           let appended: boolean;
           try {
             appended = await appendPromise;
@@ -7207,6 +7440,8 @@ class GenerationJobManagerClass {
         event,
         runtime.createdAt,
         options.deliveredSteer,
+        undefined,
+        runtime.providerOwnerContext,
       );
       if (settled === false) {
         throw new Error(`Steer receipt settlement was fenced out for ${streamId}`);
@@ -7252,7 +7487,7 @@ class GenerationJobManagerClass {
         streamId,
         event,
         runtime.createdAt,
-        { coalesce: true },
+        { coalesce: true, providerOwner: runtime.providerOwnerContext },
       );
       if (buffered) {
         runtime.earlyEventSequencePromises.push(
@@ -7297,6 +7532,7 @@ class GenerationJobManagerClass {
           streamId,
           event,
           runtime.createdAt,
+          { providerOwner: runtime.providerOwnerContext },
         );
         if (published === false) {
           this.retireRuntimeAfterDurableFence(streamId, runtime);
@@ -7326,6 +7562,7 @@ class GenerationJobManagerClass {
       streamId,
       event,
       runtime.createdAt,
+      { providerOwner: runtime.providerOwnerContext },
     );
     if (buffered) {
       // Store a non-rejecting sequence receipt before yielding. The absolute value
@@ -7734,24 +7971,25 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> | undefined {
     if ('created' in event) {
-      return this.trackUserMessage(streamId, event, expectedCreatedAt);
+      return this.trackUserMessage(streamId, event, expectedCreatedAt, providerOwner);
     }
     if (!('event' in event)) {
       return;
     }
     if (event.event === 'title') {
-      return this.trackTitleEvent(streamId, event, expectedCreatedAt);
+      return this.trackTitleEvent(streamId, event, expectedCreatedAt, providerOwner);
     }
     if (event.event === UsageEvents.ON_CONTEXT_USAGE) {
-      return this.trackContextUsage(streamId, event, expectedCreatedAt);
+      return this.trackContextUsage(streamId, event, expectedCreatedAt, providerOwner);
     }
     if (event.event === UsageEvents.ON_TOKEN_USAGE) {
-      return this.trackTokenUsage(streamId, event, expectedCreatedAt);
+      return this.trackTokenUsage(streamId, event, expectedCreatedAt, providerOwner);
     }
     if (isToolTimingReplayEvent(event)) {
-      return this.trackReplayEvent(streamId, event, expectedCreatedAt);
+      return this.trackReplayEvent(streamId, event, expectedCreatedAt, providerOwner);
     }
     if (
       (event.event === 'on_run_step' ||
@@ -7759,7 +7997,7 @@ class GenerationJobManagerClass {
         event.event === 'on_run_step_completed') &&
       isOAuthReplayEvent(event)
     ) {
-      return this.trackReplayEvent(streamId, event, expectedCreatedAt);
+      return this.trackReplayEvent(streamId, event, expectedCreatedAt, providerOwner);
     }
   }
 
@@ -7775,6 +8013,7 @@ class GenerationJobManagerClass {
     eventType: 'on_run_step' | 'on_run_step_completed' | 'on_run_step_closed',
     data: Record<string, unknown>,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): void {
     const candidate = eventType === 'on_run_step_completed' ? data.result : data;
     if (
@@ -7788,7 +8027,12 @@ class GenerationJobManagerClass {
     }
 
     if (eventType === 'on_run_step') {
-      this.accumulateRunStep(streamId, candidate as Agents.RunStep, expectedCreatedAt);
+      this.accumulateRunStep(
+        streamId,
+        candidate as Agents.RunStep,
+        expectedCreatedAt,
+        providerOwner,
+      );
       return;
     }
 
@@ -7835,6 +8079,7 @@ class GenerationJobManagerClass {
           }),
         },
         expectedCreatedAt,
+        providerOwner,
       );
       return;
     }
@@ -7844,6 +8089,7 @@ class GenerationJobManagerClass {
         streamId,
         { ...(candidate as Agents.RunStep), status: 'completed' },
         expectedCreatedAt,
+        providerOwner,
       );
       return;
     }
@@ -7907,6 +8153,7 @@ class GenerationJobManagerClass {
         },
       },
       expectedCreatedAt,
+      providerOwner,
     );
   }
 
@@ -7921,6 +8168,7 @@ class GenerationJobManagerClass {
     streamId: string,
     runStep: Agents.RunStep,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): void {
     // Lazy initialization keeps the per-stream allocation off non-agent paths.
     if (!this.runStepBuffers) {
@@ -7946,7 +8194,7 @@ class GenerationJobManagerClass {
     if (this.jobStore.saveRunSteps) {
       const snapshot = [...buffer];
       void this.queueJobWrite(this.runStepWriteQueues, streamId, () =>
-        this.jobStore.saveRunSteps!(streamId, snapshot, expectedCreatedAt),
+        this.jobStore.saveRunSteps!(streamId, snapshot, expectedCreatedAt, providerOwner),
       ).catch((err) => {
         logger.error(`[GenerationJobManager] Failed to save run steps:`, err);
       });
@@ -7962,6 +8210,7 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     if (!('event' in event) || event.event !== 'title') {
       return;
@@ -7973,6 +8222,7 @@ class GenerationJobManagerClass {
         titleEvent: JSON.stringify(event),
       },
       expectedCreatedAt,
+      providerOwner,
     );
   }
 
@@ -7985,6 +8235,7 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     if (!('event' in event) || event.event !== UsageEvents.ON_CONTEXT_USAGE) {
       return;
@@ -8003,6 +8254,7 @@ class GenerationJobManagerClass {
           contextUsage: JSON.stringify((event as { data?: unknown }).data ?? null),
         },
         expectedCreatedAt,
+        providerOwner,
       ),
     );
   }
@@ -8042,13 +8294,14 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     if (!isOAuthReplayEvent(event) && !isToolTimingReplayEvent(event)) {
       return;
     }
 
     await this.queueJobWrite(this.replayEventWriteQueues, streamId, () =>
-      this.persistReplayEvent(streamId, event, expectedCreatedAt),
+      this.persistReplayEvent(streamId, event, expectedCreatedAt, providerOwner),
     );
   }
 
@@ -8061,13 +8314,19 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     if (!('event' in event) || event.event !== UsageEvents.ON_TOKEN_USAGE) {
       return;
     }
 
     await this.queueJobWrite(this.tokenUsageWriteQueues, streamId, () =>
-      this.persistTokenUsage(streamId, event as { data?: unknown }, expectedCreatedAt),
+      this.persistTokenUsage(
+        streamId,
+        event as { data?: unknown },
+        expectedCreatedAt,
+        providerOwner,
+      ),
     );
   }
 
@@ -8075,6 +8334,7 @@ class GenerationJobManagerClass {
     streamId: string,
     event: { data?: unknown },
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     const jobData = await this.jobStore.getJob(streamId);
     if (!jobData || jobData.createdAt !== expectedCreatedAt || event.data == null) {
@@ -8123,13 +8383,14 @@ class GenerationJobManagerClass {
       }
     }
 
-    await this.jobStore.updateJob(streamId, update, expectedCreatedAt);
+    await this.jobStore.updateJob(streamId, update, expectedCreatedAt, providerOwner);
   }
 
   private async persistReplayEvent(
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     const jobData = await this.jobStore.getJob(streamId);
     if (!jobData || jobData.createdAt !== expectedCreatedAt) {
@@ -8169,6 +8430,7 @@ class GenerationJobManagerClass {
         replayEvents: JSON.stringify(replayEvents),
       },
       expectedCreatedAt,
+      providerOwner,
     );
   }
 
@@ -8182,6 +8444,7 @@ class GenerationJobManagerClass {
     streamId: string,
     event: t.ServerSentEvent,
     expectedCreatedAt: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     if (!('created' in event)) {
       return;
@@ -8224,7 +8487,7 @@ class GenerationJobManagerClass {
       updates.conversationId = message.conversationId;
     }
 
-    await this.jobStore.updateJob(streamId, updates, expectedCreatedAt);
+    await this.jobStore.updateJob(streamId, updates, expectedCreatedAt, providerOwner);
   }
 
   /**
@@ -8247,7 +8510,12 @@ class GenerationJobManagerClass {
         userSubmittedMessageFieldPaths: metadata.userSubmittedMessageFieldPaths,
       }),
     };
-    await this.jobStore.updateJob(streamId, updates, generationId);
+    await this.jobStore.updateJob(
+      streamId,
+      updates,
+      generationId,
+      this.providerOwnerFor(streamId, generationId),
+    );
   }
 
   /** Stages exact detached terminal evidence in the generation-owned job outbox
@@ -8261,6 +8529,7 @@ class GenerationJobManagerClass {
       streamId,
       { agentEventDetachedTerminalEvidence: evidence },
       expectedCreatedAt,
+      this.providerOwnerFor(streamId, expectedCreatedAt),
     );
     const persisted = await this.jobStore.getJob(streamId);
     const actual = persisted?.agentEventDetachedTerminalEvidence;
@@ -8327,6 +8596,15 @@ class GenerationJobManagerClass {
     expectedCreatedAt: number,
     providerExecutionId: string,
   ): Promise<boolean> {
+    const runtime = this.runtimeState.get(streamId);
+    if (
+      runtime?.createdAt === expectedCreatedAt &&
+      runtime.providerOwnerContext?.providerExecutionId === providerExecutionId
+    ) {
+      /** Invalidate the lease heartbeat before the durable drain starts. Its in-flight
+       * renewal may lose the race to this drain, but must not abort the completed segment. */
+      this.stopPiProviderHeartbeat(runtime);
+    }
     try {
       return await this.recordProviderExecutionDrain(
         streamId,
@@ -8351,6 +8629,12 @@ class GenerationJobManagerClass {
     }
 
     const observedJob = await this.jobStore.getJob(streamId);
+    const runtime = this.runtimeState.get(streamId);
+    const providerOwner =
+      runtime?.createdAt === expectedCreatedAt &&
+      runtime.providerOwnerContext?.providerExecutionId === providerExecutionId
+        ? runtime.providerOwnerContext
+        : undefined;
     if (
       observedJob?.createdAt === expectedCreatedAt &&
       observedJob.providerExecutionId === providerExecutionId
@@ -8366,10 +8650,19 @@ class GenerationJobManagerClass {
         streamId,
         expectedCreatedAt,
         providerExecutionId,
+        providerOwner,
       ) ?? Promise.resolve(false),
       this.eventTransport.recordProviderDrain?.(streamId, expectedCreatedAt, providerExecutionId) ??
         Promise.resolve(false),
     ]);
+    if (runtime?.createdAt === expectedCreatedAt && providerOwner != null) {
+      if (marked) {
+        delete runtime.providerOwnerContext;
+        runtime.providerOwnerLost = false;
+      } else {
+        runtime.providerOwnerLost = true;
+      }
+    }
     const job = await this.jobStore.getJob(streamId);
     if (
       marked &&
@@ -8393,6 +8686,7 @@ class GenerationJobManagerClass {
       job.providerDrained === true &&
       job.preserveForScheduleReconcile !== true &&
       job.terminalPersistencePending !== true &&
+      !isTerminalPublicationPending(job) &&
       job.terminalHostActionPending !== true &&
       (job.status === 'complete' || job.status === 'aborted')
     ) {
@@ -8425,6 +8719,46 @@ class GenerationJobManagerClass {
      *  Leaving the tracker open makes shutdown wait for that record instead of tearing the
      *  transport down underneath it; the deadline still bounds the wait if it never comes. */
     this.openProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+    let job: SerializableJobData | null;
+    try {
+      job = await this.jobStore.getJob(streamId);
+    } catch (error) {
+      this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+      throw error;
+    }
+    const runtimeResolution = resolveStoredAgentRuntime(job?.agentRuntime);
+    if (runtimeResolution.status === 'unsupported') {
+      this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+      return false;
+    }
+    if (runtimeResolution.status === 'resolved') {
+      const runtime = this.runtimeState.get(streamId);
+      if (
+        job?.createdAt !== expectedCreatedAt ||
+        job.providerExecutionId !== providerExecutionId ||
+        runtime?.createdAt !== expectedCreatedAt ||
+        this.jobStore.acquirePiProviderOwner == null ||
+        this.jobStore.renewPiProviderOwner == null
+      ) {
+        this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+        return false;
+      }
+      const owner = await this.jobStore.acquirePiProviderOwner(
+        streamId,
+        expectedCreatedAt,
+        providerExecutionId,
+        this.providerOwnerId,
+        PI_PROVIDER_LEASE_MS,
+      );
+      if (!owner) {
+        this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+        return false;
+      }
+      runtime.providerOwnerContext = owner;
+      runtime.providerOwnerLost = false;
+      this.startPiProviderHeartbeat(streamId, runtime, owner);
+      return true;
+    }
     const started =
       (await this.jobStore.beginProviderExecution?.(
         streamId,
@@ -8435,6 +8769,151 @@ class GenerationJobManagerClass {
       this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
     }
     return started;
+  }
+
+  private startPiProviderHeartbeat(
+    streamId: string,
+    runtime: RuntimeJobState,
+    owner: ProviderOwnerContext,
+  ): void {
+    this.stopPiProviderHeartbeat(runtime);
+    const heartbeatToken = {};
+    runtime.providerOwnerHeartbeatToken = heartbeatToken;
+    let renewalPending = false;
+    const tick = async (): Promise<void> => {
+      if (
+        renewalPending ||
+        runtime.providerOwnerHeartbeatToken !== heartbeatToken ||
+        runtime.providerOwnerContext !== owner ||
+        this.runtimeState.get(streamId) !== runtime
+      ) {
+        return;
+      }
+      renewalPending = true;
+      let renewed = false;
+      try {
+        renewed =
+          (await this.jobStore.renewPiProviderOwner?.(owner, PI_PROVIDER_LEASE_MS)) ?? false;
+      } catch (error) {
+        logger.error(
+          '[GenerationJobManager] Failed to renew Pi provider owner lease ' + streamId,
+          error,
+        );
+      } finally {
+        renewalPending = false;
+      }
+      if (
+        !renewed &&
+        runtime.providerOwnerHeartbeatToken === heartbeatToken &&
+        runtime.providerOwnerContext === owner &&
+        this.runtimeState.get(streamId) === runtime &&
+        !runtime.abortController.signal.aborted
+      ) {
+        runtime.providerOwnerLost = true;
+        runtime.abortController.abort();
+      }
+    };
+    runtime.providerOwnerHeartbeat = setInterval(() => {
+      void tick();
+    }, PI_PROVIDER_HEARTBEAT_MS);
+    runtime.providerOwnerHeartbeat.unref?.();
+  }
+
+  private stopPiProviderHeartbeat(runtime: RuntimeJobState): void {
+    runtime.providerOwnerHeartbeatToken = undefined;
+    if (runtime.providerOwnerHeartbeat != null) {
+      clearInterval(runtime.providerOwnerHeartbeat);
+      runtime.providerOwnerHeartbeat = undefined;
+    }
+  }
+
+  private providerOwnerFor(
+    streamId: string,
+    expectedCreatedAt?: number,
+  ): ProviderOwnerContext | undefined {
+    const runtime = this.runtimeState.get(streamId);
+    return runtime != null && (expectedCreatedAt == null || runtime.createdAt === expectedCreatedAt)
+      ? runtime.providerOwnerContext
+      : undefined;
+  }
+
+  private isCurrentPiProviderRuntimeOwner(
+    streamId: string,
+    expectedCreatedAt: number,
+    runtime: RuntimeJobState,
+    owner: ProviderOwnerContext,
+    signal?: AbortSignal,
+  ): boolean {
+    return (
+      signal?.aborted !== true &&
+      this.runtimeState.get(streamId) === runtime &&
+      runtime.createdAt === expectedCreatedAt &&
+      runtime.providerOwnerContext === owner &&
+      runtime.providerOwnerLost !== true &&
+      !runtime.abortController.signal.aborted
+    );
+  }
+
+  /** Durable single-use admission immediately before a Pi host tool crosses into host code. */
+  async admitPiToolInvocation(
+    streamId: string,
+    expectedCreatedAt: number,
+    invocationId: string,
+  ): Promise<boolean> {
+    if (invocationId.length === 0 || invocationId.length > 256) {
+      return false;
+    }
+    const runtime = this.runtimeState.get(streamId);
+    const owner =
+      runtime?.createdAt === expectedCreatedAt ? runtime.providerOwnerContext : undefined;
+    if (
+      runtime == null ||
+      runtime.createdAt !== expectedCreatedAt ||
+      owner == null ||
+      runtime.abortController.signal.aborted ||
+      runtime.providerOwnerLost === true ||
+      this.jobStore.admitPiToolInvocation == null
+    ) {
+      return false;
+    }
+    try {
+      return await this.jobStore.admitPiToolInvocation(owner, invocationId);
+    } catch (error) {
+      logger.error('[GenerationJobManager] Failed to admit Pi host tool ' + streamId, error);
+      return false;
+    }
+  }
+
+  /** Revalidates the exact live owner immediately before a trusted host tool handler runs. */
+  async assertPiProviderOwner(
+    streamId: string,
+    expectedCreatedAt: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const runtime = this.runtimeState.get(streamId);
+    const owner =
+      runtime?.createdAt === expectedCreatedAt ? runtime.providerOwnerContext : undefined;
+    if (
+      signal?.aborted === true ||
+      runtime == null ||
+      runtime.createdAt !== expectedCreatedAt ||
+      owner == null ||
+      runtime.providerOwnerLost === true ||
+      runtime.abortController.signal.aborted ||
+      this.jobStore.assertPiProviderOwner == null
+    ) {
+      return false;
+    }
+    try {
+      const asserted = await this.jobStore.assertPiProviderOwner(owner);
+      return (
+        asserted &&
+        this.isCurrentPiProviderRuntimeOwner(streamId, expectedCreatedAt, runtime, owner, signal)
+      );
+    } catch (error) {
+      logger.error('[GenerationJobManager] Failed to assert Pi provider owner ' + streamId, error);
+      return false;
+    }
   }
 
   private providerExecutionKey(
@@ -9111,7 +9590,12 @@ class GenerationJobManagerClass {
     }
     // Persist to Redis for cross-replica consistency
     this.jobStore
-      .updateJob(streamId, { syncSent: true }, expectedCreatedAt ?? runtime?.createdAt)
+      .updateJob(
+        streamId,
+        { syncSent: true },
+        expectedCreatedAt ?? runtime?.createdAt,
+        runtime?.providerOwnerContext,
+      )
       .catch((err) => {
         logger.error(`[GenerationJobManager] Failed to persist syncSent flag:`, err);
       });
@@ -9154,12 +9638,22 @@ class GenerationJobManagerClass {
       await matchingRuntime.createdEventPublication;
     }
     // Persist finalEvent to Redis for cross-replica consistency
-    this.jobStore
-      .updateJob(streamId, { finalEvent: JSON.stringify(event) }, generationId)
+    await this.jobStore
+      .updateJob(
+        streamId,
+        { finalEvent: JSON.stringify(event) },
+        generationId,
+        matchingRuntime?.providerOwnerContext,
+      )
       .catch((err) => {
         logger.error(`[GenerationJobManager] Failed to persist finalEvent:`, err);
       });
-    await this.eventTransport.emitDone(streamId, event, generationId);
+    await this.eventTransport.emitDone(
+      streamId,
+      event,
+      generationId,
+      matchingRuntime?.providerOwnerContext,
+    );
     if (matchingRuntime?.startupTelemetry) {
       this.recordStartupEvent(matchingRuntime, event);
     }
@@ -9182,10 +9676,17 @@ class GenerationJobManagerClass {
       await matchingRuntime.createdEventPublication;
     }
     // Persist error to job store for cross-replica consistency
-    this.jobStore.updateJob(streamId, { error }, generationId).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist error:`, err);
-    });
-    await this.eventTransport.emitError(streamId, error, generationId);
+    await this.jobStore
+      .updateJob(streamId, { error }, generationId, matchingRuntime?.providerOwnerContext)
+      .catch((err) => {
+        logger.error(`[GenerationJobManager] Failed to persist error:`, err);
+      });
+    await this.eventTransport.emitError(
+      streamId,
+      error,
+      generationId,
+      matchingRuntime?.providerOwnerContext,
+    );
     matchingRuntime?.startupTelemetry?.mark('first_response_event_queued');
   }
 
@@ -9521,6 +10022,25 @@ class GenerationJobManagerClass {
     // connection that hangs open until it gives up.
     await this.expireStaleApprovals();
 
+    await this.reapExpiredPiProviderOwners();
+    const pendingTerminalJobs = await this.jobStore
+      .getTerminalPersistencePendingJobs?.()
+      .catch((error) => {
+        logger.error(
+          '[GenerationJobManager] Failed to enumerate terminal persistence recovery',
+          error,
+        );
+        return [];
+      });
+    for (const job of pendingTerminalJobs ?? []) {
+      await this.recoverStaleTerminalPersistence(job).catch((error) => {
+        logger.error(
+          '[GenerationJobManager] Failed terminal persistence recovery for ' + job.streamId,
+          error,
+        );
+      });
+    }
+
     const count = await this.jobStore.cleanup();
     let runningJobsChanged = false;
 
@@ -9540,6 +10060,7 @@ class GenerationJobManagerClass {
           currentJob?.createdAt === observedRuntime.createdAt &&
           (currentJob.terminalHostActionPending === true ||
             currentJob.terminalPersistencePending === true ||
+            isTerminalPublicationPending(currentJob) ||
             currentJob.providerDrained === false)
         ) {
           // Persistence, provider drain and host acknowledgement still own this evidence.
@@ -9648,6 +10169,67 @@ class GenerationJobManagerClass {
 
     if (count > 0) {
       logger.debug(`[GenerationJobManager] Cleaned up ${count} expired jobs`);
+    }
+  }
+
+  /** Claims only an exact persisted Pi owner whose lease is expired by the store clock. */
+  private async reapExpiredPiProviderOwners(): Promise<void> {
+    if (this.jobStore.claimExpiredPiProviderOwner == null) {
+      return;
+    }
+    const running = await this.jobStore.getRunningJobs();
+    const paused = (await this.jobStore.getRequiresActionJobs?.()) ?? [];
+    const terminalPending = (await this.jobStore.getTerminalPersistencePendingJobs?.()) ?? [];
+    const candidates = new Map<string, SerializableJobData>();
+    for (const job of [...running, ...paused, ...terminalPending]) {
+      const runtimeResolution = resolveStoredAgentRuntime(job.agentRuntime);
+      if (
+        runtimeResolution.status !== 'resolved' ||
+        job.providerDrained !== false ||
+        job.providerOwnerId == null ||
+        job.providerExecutionId == null ||
+        !Number.isSafeInteger(job.providerOwnerFence)
+      ) {
+        continue;
+      }
+      if (
+        job.status !== 'running' &&
+        job.status !== 'requires_action' &&
+        (!(job.status === 'complete' || job.status === 'error' || job.status === 'aborted') ||
+          job.terminalPersistencePending !== true)
+      ) {
+        continue;
+      }
+      candidates.set(job.streamId + ':' + job.createdAt, job);
+    }
+    for (const job of candidates.values()) {
+      const owner: ProviderOwnerContext = {
+        streamId: job.streamId,
+        createdAt: job.createdAt,
+        providerExecutionId: job.providerExecutionId!,
+        ownerId: job.providerOwnerId!,
+        fence: job.providerOwnerFence!,
+      };
+      try {
+        const claimed = await this.jobStore.claimExpiredPiProviderOwner(owner);
+        if (claimed) {
+          const runtime = this.runtimeState.get(job.streamId);
+          if (
+            runtime?.createdAt === job.createdAt &&
+            runtime.providerOwnerContext?.ownerId === owner.ownerId &&
+            runtime.providerOwnerContext.fence === owner.fence
+          ) {
+            runtime.providerOwnerLost = true;
+            this.stopPiProviderHeartbeat(runtime);
+            runtime.abortController.abort();
+          }
+        }
+      } catch (error) {
+        logger.error(
+          '[GenerationJobManager] Failed to claim expired Pi provider owner ' + job.streamId,
+          error,
+        );
+      }
     }
   }
 
@@ -9884,6 +10466,7 @@ class GenerationJobManagerClass {
       runtime.startupTelemetry?.end('aborted');
       runtime.startupTelemetry = undefined;
       this.stopSubscriberLease(runtime);
+      this.stopPiProviderHeartbeat(runtime);
       this.releaseAbortSubscription(runtime, true);
       runtime.abortController.abort();
     }

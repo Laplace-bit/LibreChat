@@ -141,6 +141,44 @@ describe('createPiGenerationDispatcher approval continuation', () => {
     expect(onSessionCreated).toHaveBeenCalledTimes(1);
   });
 
+  it('forwards mixed text and image prompts to the executor in source order', async () => {
+    const content = [
+      { type: 'text', text: 'before' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,YQ==' } },
+      { type: 'text', text: 'after' },
+    ];
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      expect(value.operation).toEqual({
+        kind: 'ordered_prompt',
+        content: [
+          { type: 'text', text: 'before' },
+          { type: 'image', mimeType: 'image/png', data: 'YQ==' },
+          { type: 'text', text: 'after' },
+        ],
+      });
+      return { status: 'completed' as const };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage({ content })],
+          createModelBinding: async () => ({
+            model: {
+              api: 'openai-responses',
+              provider: 'librechat-openai',
+              id: 'gpt-4o-mini',
+            } as PiModelBinding['model'],
+            modelRuntime: {} as PiModelBinding['modelRuntime'],
+            dispose: jest.fn(),
+          }),
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('executes the approved host result once and continues the exact Pi tool call', async () => {
     const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
       expect(value.operation).toEqual({ kind: 'continue_tool_result', toolCallId: 'pi-call-1' });
@@ -253,5 +291,94 @@ describe('createPiGenerationDispatcher ask-user pause', () => {
       },
     });
     expect(executeHostToolCall).not.toHaveBeenCalled();
+  });
+});
+
+describe('createPiGenerationDispatcher caller tool handoff', () => {
+  const createModelBinding = async (): Promise<PiModelBinding> => ({
+    model: {
+      api: 'openai-responses',
+      provider: 'librechat-openai',
+      id: 'gpt-4o-mini',
+    } as PiModelBinding['model'],
+    modelRuntime: {} as PiModelBinding['modelRuntime'],
+    dispose: jest.fn(),
+  });
+
+  it('returns exact caller function identity and JSON arguments without host execution', async () => {
+    const executeHostToolCall = jest.fn(async () => {
+      throw new Error('caller-owned functions must never execute on the server');
+    });
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const tool = value.tools.find(({ name }) => name === 'lookup_order');
+      if (tool == null) throw new Error('caller function was not registered');
+      const result = await tool.execute('call_exact_1', { order: 'WO-42' });
+      expect(result.terminate).toBe(true);
+      const call = value.getCallerToolHandoff?.();
+      if (call == null) throw new Error('caller function did not request handoff');
+      return { status: 'caller_tool_handoff' as const, call };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage('Look up work order WO-42.')],
+          createModelBinding,
+          clientToolDefinitions: [
+            {
+              name: 'lookup_order',
+              description: 'Look up a work order.',
+              parameters: {
+                type: 'object',
+                properties: { order: { type: 'string' } },
+                required: ['order'],
+                additionalProperties: false,
+              },
+            },
+          ],
+          executeHostToolCall,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      status: 'caller_tool_handoff',
+      call: {
+        callId: 'call_exact_1',
+        name: 'lookup_order',
+        arguments: '{"order":"WO-42"}',
+      },
+    });
+    expect(executeHostToolCall).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid caller arguments before exposing a handoff', async () => {
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const tool = value.tools.find(({ name }) => name === 'lookup_order');
+      if (tool == null) throw new Error('caller function was not registered');
+      await expect(tool.execute('call-invalid', { order: 42 })).rejects.toMatchObject({
+        code: 'PI_TOOL_ARGUMENTS_INVALID',
+      });
+      return { status: 'completed' as const };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [new HumanMessage('Lookup the order.')],
+          createModelBinding,
+          clientToolDefinitions: [
+            {
+              name: 'lookup_order',
+              parameters: {
+                type: 'object',
+                properties: { order: { type: 'string' } },
+                required: ['order'],
+              },
+            },
+          ],
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
   });
 });

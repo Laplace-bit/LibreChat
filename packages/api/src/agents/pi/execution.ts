@@ -1,7 +1,9 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { PiHostEventSequencer, PiHostSessionOutcome } from './bridge';
 import type { HostPiSession, HostPiSessionOptions } from './session';
+import type { PiCallerToolCall } from './callerTools';
 import type { PiPauseController } from './pause';
+import type { PiContentPart } from './history';
 import type { PiHostEvent } from './events';
 import { createPiPauseController } from './pause';
 import { executePiHostSession } from './bridge';
@@ -10,6 +12,7 @@ import { createHostPiSession } from './session';
 export interface PiGenerationExecutorInput extends HostPiSessionOptions {
   operation:
     | { kind: 'prompt'; text: string; options?: PromptOptions }
+    | { kind: 'ordered_prompt'; content: readonly PiContentPart[] }
     | { kind: 'continue_tool_result'; toolCallId: string };
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
@@ -17,6 +20,7 @@ export interface PiGenerationExecutorInput extends HostPiSessionOptions {
   onSessionCreated?(): void;
   eventSequencer?: PiHostEventSequencer;
   pauseController?: PiPauseController;
+  getCallerToolHandoff?: () => PiCallerToolCall | undefined;
 }
 
 export interface PiGenerationExecutorDependencies {
@@ -38,6 +42,7 @@ export function createPiGenerationExecutor(
       handleHostEvent,
       onSessionCreated,
       eventSequencer,
+      getCallerToolHandoff,
       ...sessionOptions
     } = input;
     let session: HostPiSession;
@@ -61,6 +66,7 @@ export function createPiGenerationExecutor(
         operation,
         signal: input.signal,
         pauseController,
+        getCallerToolHandoff,
         translateEvent,
         handleHostEvent,
         eventSequencer,

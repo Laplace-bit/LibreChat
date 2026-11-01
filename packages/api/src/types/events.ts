@@ -45,7 +45,17 @@ export type FinalEvent = {
    * durably published (for example, the owner crashed in that narrow window).
    * Clients close the stream and refetch authoritative message/status state. */
   reconcile?: boolean;
-  reconcileReason?: 'terminal_payload_missing' | 'generation_replaced' | 'abort_persistence_failed';
+  reconcileReason?:
+    | 'terminal_payload_missing'
+    | 'generation_replaced'
+    | 'abort_persistence_failed'
+    | 'provider_owner_lost';
+  /** A crashed Pi owner is not replayed because an admitted external effect may have completed. */
+  providerRecoveryOutcome?: 'outcome_unknown';
+  providerRecoveryId?: string;
+  providerRecoveryFence?: number;
+  providerOwnerLostAt?: number;
+  providerRecoveryErrorCode?: 'PI_PROVIDER_OWNER_LOST';
   terminalStatus?: 'complete' | 'error' | 'aborted';
   generationCreatedAt?: number;
   requestMessage?: FinalMessageFields | null;

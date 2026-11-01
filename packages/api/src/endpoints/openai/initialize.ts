@@ -21,6 +21,8 @@ import {
 import { setInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
 import { OPENAI_API, OPENAI_BASE_URL, OPENAI_COMPLETIONS_API } from '~/agents/pi/model';
 import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
+import { createAuthorizedPiAzureModelCandidate } from './azurePiModel';
+import { createPiAzureModelBinding } from '~/agents/pi/azureModel';
 import { resolveModelTransportTimeouts } from '~/agents/config';
 import { createPiOpenAIModelBinding } from '~/agents/pi/model';
 import { getOpenAIEndpointParameters } from './parameters';
@@ -596,6 +598,39 @@ export async function initializeOpenAI(
     setInitializeResultPiModelBindingFactory(options, () =>
       createPiOpenAIModelBinding(piModelCandidate),
     );
+  }
+
+  if (isAzureOpenAI) {
+    let credentialSource: 'server-admin-environment' | 'server-admin-model-group' | 'user';
+    if (mappedAzureConfig != null) {
+      credentialSource = 'server-admin-model-group';
+    } else if (userProvidesKey) {
+      credentialSource = 'user';
+    } else {
+      credentialSource = 'server-admin-environment';
+    }
+    const piAzureModelCandidate = await createAuthorizedPiAzureModelCandidate({
+      endpoint,
+      credentialSource,
+      adminApiKey:
+        mappedAzureConfig?.azureOptions.azureOpenAIApiKey ??
+        (clientOptions.azure === false ? undefined : clientOptions.azure?.azureOpenAIApiKey),
+      resolvedApiKey: apiKey,
+      userProvidedBaseURL: userProvidesURL && !mappedAzureConfig?.baseURL,
+      configuredBaseURL: clientOptions.reverseProxyUrl,
+      azureConfig,
+      allConfig,
+      mappedAzureConfig,
+      clientOptions,
+      modelParameters: model_parameters,
+      modelName,
+      initializeResult: options,
+    });
+    if (piAzureModelCandidate !== undefined) {
+      setInitializeResultPiModelBindingFactory(options, () =>
+        createPiAzureModelBinding(piAzureModelCandidate),
+      );
+    }
   }
 
   return options;

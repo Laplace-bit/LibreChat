@@ -19,6 +19,8 @@ export interface PiHostToolBatchOptions {
   metadata: Record<string, unknown>;
   /** Exact tool definitions admitted for this isolated Pi generation. */
   authorizedToolNames?: readonly string[];
+  /** Re-checks the live provider fence at the final server-side execution boundary. */
+  authorize?: (signal?: AbortSignal) => boolean | Promise<boolean>;
   codeSessionBridge?: PiCodeSessionBridge;
   onError?: (error: AgentRuntimeUnavailableError) => void;
 }
@@ -36,6 +38,10 @@ function createAbortError(): Error {
   const error = new Error('Tool execution was aborted.');
   error.name = 'AbortError';
   return error;
+}
+
+function isSignalAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
 }
 
 function reportUnavailable(
@@ -87,7 +93,7 @@ export function createPiHostToolBatchExecutor(
     if (!authorizedToolNames.has(hostCall.name)) {
       return Promise.reject(reportUnavailable(options.onError));
     }
-    if (signal?.aborted === true) {
+    if (isSignalAborted(signal)) {
       return Promise.reject(createAbortError());
     }
     if (handler == null) {
@@ -133,51 +139,72 @@ export function createPiHostToolBatchExecutor(
         }
       };
 
-      try {
-        signal?.addEventListener('abort', onAbort, { once: true });
-        if (signal?.aborted === true) {
-          onAbort();
-          return;
-        }
-
-        const configurable = {
-          req: options.request,
-          user_id: options.userId,
-          thread_id: options.threadId,
-          run_id: options.runId,
-        };
-        const batchMetadata = { ...metadata };
-        const batch: ToolExecuteBatchRequest = {
-          toolCalls: [
-            {
-              id: hostCall.id,
-              name: hostCall.name,
-              args: hostCall.args,
-              stepId: hostCall.stepId,
-              ...(hostCall.turn == null ? {} : { turn: hostCall.turn }),
-              ...(hostCall.codeSessionContext == null
-                ? {}
-                : { codeSessionContext: hostCall.codeSessionContext }),
-            },
-          ],
-          userId: options.userId,
-          agentId: options.agentId,
-          configurable,
-          metadata: batchMetadata,
-          signal,
-          resolve: acceptResults,
-          reject: (error) => fail(error),
-        };
-
-        const handleResult = handler.handle(GraphEvents.ON_TOOL_EXECUTE, batch, batchMetadata);
-        void Promise.resolve(handleResult).then(() => {
-          if (!settled) {
-            fail(new Error('The host tool handler did not settle the batch.'));
+      const invokeHandler = async (): Promise<void> => {
+        try {
+          signal?.addEventListener('abort', onAbort, { once: true });
+          if (isSignalAborted(signal)) {
+            onAbort();
+            return;
           }
-        }, fail);
-      } catch (error) {
-        fail(error);
-      }
+
+          /** Admission commits the single-use receipt. This second check is deliberately
+           * adjacent to host dispatch so an owner reaped while the caller awaited admission
+           * cannot start a side effect. The host call follows this await synchronously. */
+          const authorized =
+            typeof options.authorize === 'function' && (await options.authorize(signal));
+          if (!authorized) {
+            fail(new Error('Provider ownership is no longer valid.'));
+            return;
+          }
+          if (isSignalAborted(signal)) {
+            onAbort();
+            return;
+          }
+          if (settled) {
+            return;
+          }
+
+          const configurable = {
+            req: options.request,
+            user_id: options.userId,
+            thread_id: options.threadId,
+            run_id: options.runId,
+          };
+          const batchMetadata = { ...metadata };
+          const batch: ToolExecuteBatchRequest = {
+            toolCalls: [
+              {
+                id: hostCall.id,
+                name: hostCall.name,
+                args: hostCall.args,
+                stepId: hostCall.stepId,
+                ...(hostCall.turn == null ? {} : { turn: hostCall.turn }),
+                ...(hostCall.codeSessionContext == null
+                  ? {}
+                  : { codeSessionContext: hostCall.codeSessionContext }),
+              },
+            ],
+            userId: options.userId,
+            agentId: options.agentId,
+            configurable,
+            metadata: batchMetadata,
+            signal,
+            resolve: acceptResults,
+            reject: (error) => fail(error),
+          };
+
+          const handleResult = handler.handle(GraphEvents.ON_TOOL_EXECUTE, batch, batchMetadata);
+          void Promise.resolve(handleResult).then(() => {
+            if (!settled) {
+              fail(new Error('The host tool handler did not settle the batch.'));
+            }
+          }, fail);
+        } catch (error) {
+          fail(error);
+        }
+      };
+
+      void invokeHandler();
     });
   };
 

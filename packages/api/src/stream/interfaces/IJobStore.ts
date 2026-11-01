@@ -257,6 +257,21 @@ export interface SerializableJobData {
   /** False while the identified provider segment can still mutate user data;
    * true before provider startup and after the owner has fully unwound. */
   providerDrained?: boolean;
+  /** Current Pi provider owner. These fields are server-only fencing evidence;
+   * they never contain credentials or client supplied values. */
+  providerOwnerId?: string;
+  providerOwnerFence?: number;
+  providerLeaseExpiresAt?: number;
+  /** Stable crash-recovery identity, bound to the generation and lost owner fence. */
+  providerRecoveryId?: string;
+  /** Recovery id whose terminal frame was atomically published by Redis. */
+  providerRecoveryPublishedId?: string;
+  providerRecoveryFence?: number;
+  providerOwnerLostAt?: number;
+  providerRecoveryErrorCode?: 'PI_PROVIDER_OWNER_LOST';
+  /** A crashed provider is never replayed. Its external tool outcome is retained
+   * as unknown until a human or an authoritative history read resolves it. */
+  providerRecoveryOutcome?: 'outcome_unknown';
 
   /** Whether the user-message created event has been emitted */
   createdEventEmitted?: boolean;
@@ -306,6 +321,10 @@ export interface SerializableJobData {
 
   /** Serialized final event for replay */
   finalEvent?: string;
+  /** Stable terminal outbox identity; retained until the event transport publishes it. */
+  terminalPublicationId?: string;
+  /** Terminal outbox identity atomically marked published with Redis PUBLISH. */
+  terminalPublicationPublishedId?: string;
 
   /** Abort won its terminal CAS but the route is still saving the partial
    * response / pruning HITL state. No normal terminal payload may be exposed
@@ -745,7 +764,26 @@ export interface JobStatusTransition {
    * transition. Used by running→requires_action so no enqueue can land between
    * a pre-pause TTL pass and the status CAS. */
   steerReceiptTtlSeconds?: number;
+  /** Current Pi provider capability. Checked atomically with the transition. */
+  expectProviderOwner?: ProviderOwnerContext;
+  /** Recovery-only CAS: the exact owner fence must have expired by Redis TIME. */
+  expectExpiredProviderOwner?: ProviderOwnerContext;
 }
+
+/** Fencing capability for one Pi provider segment. `fence` only increases for
+ * each successful owner acquisition on the generation. */
+export interface ProviderOwnerContext {
+  readonly streamId: string;
+  readonly createdAt: number;
+  readonly providerExecutionId: string;
+  readonly ownerId: string;
+  readonly fence: number;
+}
+
+export const PI_PROVIDER_LEASE_MS = 45_000;
+export const PI_PROVIDER_HEARTBEAT_MS = 10_000;
+export const PI_PROVIDER_OWNER_LOST_ERROR =
+  'Agent run stopped after its provider owner lease expired. Tool outcome is unknown; no work was automatically retried.';
 
 /** Value stored under an idempotency claim: the stream a retried request should attach to. */
 export interface IdempotencyClaimValue {
@@ -1004,6 +1042,7 @@ export interface IJobStore {
     streamId: string,
     updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void>;
   transitionStatus(streamId: string, args: JobStatusTransition): Promise<boolean>;
 
@@ -1089,6 +1128,9 @@ export interface IJobStore {
     streamId: string,
     event: unknown,
     expectedCreatedAt?: number,
+    deliveredSteer?: SteerQueueItem,
+    options?: { coalesce?: boolean },
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void | boolean>;
 
   /** Optional batching capability: persist any coalesced appends buffered for
@@ -1100,6 +1142,7 @@ export interface IJobStore {
     streamId: string,
     runSteps: Agents.RunStep[],
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void>;
   setCollectedUsage(
     streamId: string,
@@ -1167,6 +1210,7 @@ export interface IJobStoreV2 extends IJobStore {
     streamId: string,
     updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void>;
 
   /** Atomically marks only the exact provider segment as fully unwound. */
@@ -1174,6 +1218,7 @@ export interface IJobStoreV2 extends IJobStore {
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean>;
 
   /** Activates the provider only while its exact generation is still running. */
@@ -1181,6 +1226,32 @@ export interface IJobStoreV2 extends IJobStore {
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
+  ): Promise<boolean>;
+
+  /** Pi-only ownership methods. Pi dispatch fails closed when these are absent. */
+  acquirePiProviderOwner?(
+    streamId: string,
+    expectedCreatedAt: number,
+    providerExecutionId: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<ProviderOwnerContext | false>;
+  renewPiProviderOwner?(owner: ProviderOwnerContext, leaseMs: number): Promise<boolean>;
+  assertPiProviderOwner?(owner: ProviderOwnerContext): Promise<boolean>;
+  admitPiToolInvocation?(owner: ProviderOwnerContext, invocationId: string): Promise<boolean>;
+  claimExpiredPiProviderOwner?(owner: ProviderOwnerContext): Promise<boolean>;
+  getTerminalPersistencePendingJobs?(): Promise<SerializableJobData[]>;
+  /** Acknowledges a published owner-loss terminal and releases its retry index. */
+  acknowledgePiProviderRecoveryPublication?(
+    streamId: string,
+    expectedCreatedAt: number,
+    recoveryId: string,
+  ): Promise<boolean>;
+  /** Releases terminal-persistence discovery only after the final frame was published. */
+  acknowledgeTerminalPublication?(
+    streamId: string,
+    expectedCreatedAt: number,
+    publicationId: string,
   ): Promise<boolean>;
 
   /** Includes terminal jobs whose provider still owns user-data writes. */
@@ -1193,6 +1264,8 @@ export interface IJobStoreV2 extends IJobStore {
     streamId: string,
     expectedCreatedAt: number,
     finalEvent: string,
+    providerOwner?: ProviderOwnerContext,
+    terminalPublicationId?: string,
   ): Promise<boolean>;
 
   /**
@@ -1483,6 +1556,7 @@ export interface IJobStoreV2 extends IJobStore {
      * append may batch with its window peers. Stores without batching (and any
      * append carrying a steer receipt) ignore it and stay per-event. */
     options?: { coalesce?: boolean },
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean>;
 
   /**
@@ -1509,6 +1583,7 @@ export interface IJobStoreV2 extends IJobStore {
     streamId: string,
     runSteps: Agents.RunStep[],
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void>;
 
   /**
@@ -1782,7 +1857,12 @@ export interface IEventTransport {
    * Redis returns the assigned absolute sequence so locally replayed events can
    * advance a subscriber to the exact ordering frontier.
    */
-  emitChunk(streamId: string, event: unknown, generationId?: number): void | Promise<void | number>;
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+  ): void | Promise<void | number>;
 
   /** Retain an observational chunk even with no viewers, then publish it atomically. */
   emitReplayableChunk?(
@@ -1802,13 +1882,25 @@ export interface IEventTransport {
    * Publish a done event - returns Promise in Redis mode for ordered delivery.
    * `generationId` is optional for compatibility with legacy, untagged publishers.
    */
-  emitDone(streamId: string, event: unknown, generationId?: number): void | Promise<void>;
+  emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+    providerRecoveryId?: string,
+    terminalPublicationId?: string,
+  ): void | Promise<void>;
 
   /**
    * Publish an error event - returns Promise in Redis mode for ordered delivery.
    * `generationId` is optional for compatibility with legacy, untagged publishers.
    */
-  emitError(streamId: string, error: string, generationId?: number): void | Promise<void>;
+  emitError(
+    streamId: string,
+    error: string,
+    generationId?: number,
+    providerOwner?: ProviderOwnerContext,
+  ): void | Promise<void>;
 
   /** Optional live-view demand marker used by observational streams that do not replay. */
   renewDemand?(streamId: string, ttlMs: number): void | Promise<void>;

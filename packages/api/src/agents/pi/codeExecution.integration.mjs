@@ -1,8 +1,8 @@
-import assert from 'node:assert/strict';
-import { generateKeyPairSync, randomUUID, verify as verifySignature } from 'node:crypto';
-import { createServer } from 'node:http';
 import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { generateKeyPairSync, randomUUID, verify as verifySignature } from 'node:crypto';
 import { Constants as AgentConstants, createBashExecutionTool } from '@librechat/agents';
 
 const require = createRequire(import.meta.url);
@@ -163,6 +163,7 @@ test('Pi bash tool sends a Code API request with signed tenant-bound JWT claims'
       threadId: 'thread-pi-code-api-1',
       runId: 'run-pi-code-api-1',
       metadata: {},
+      authorize: async () => true,
       authorizedToolNames: [AgentConstants.BASH_TOOL],
       codeSessionBridge,
     });

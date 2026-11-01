@@ -1352,6 +1352,34 @@ describe('RedisEventTransport', () => {
     transport.destroy();
   });
 
+  it('marks the terminal outbox in the same script as Redis PUBLISH', async () => {
+    const mockPublisher = createMockPublisher();
+    const mockSubscriber = createMockSubscriber();
+    const transport = new RedisEventTransport(
+      mockPublisher as unknown as Redis,
+      mockSubscriber as unknown as Redis,
+    );
+
+    await transport.emitDone(
+      'terminal-outbox-atomic-publish',
+      { final: true },
+      777,
+      undefined,
+      undefined,
+      'terminal:777',
+    );
+
+    const [script, ...args] = mockPublisher.eval.mock.calls[0];
+    expect(script).toContain('HGET", KEYS[2], "terminalPublicationId") ~= terminalPublicationId');
+    expect(script).toContain('redis.call("PUBLISH", ARGV[1]');
+    expect(script).toContain(
+      'redis.call("HSET", KEYS[2], "terminalPublicationPublishedId", terminalPublicationId)',
+    );
+    expect(args[17]).toBe('terminal:777');
+
+    transport.destroy();
+  });
+
   it('guards terminal publications with the winning finalized epoch', async () => {
     const mockPublisher = createMockPublisher();
     const mockSubscriber = createMockSubscriber();

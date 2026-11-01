@@ -1,9 +1,20 @@
 import { Providers } from '@librechat/agents';
 import { AuthKeys, EModelEndpoint } from 'librechat-data-provider';
+import { HarmBlockThreshold, HarmCategory } from '@google/generative-ai';
+import type { GoogleClientOptions } from '@librechat/agents';
 import type { EndpointDbMethods, ServerRequest } from '~/types';
+import { getInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
 
 const mockGetGoogleConfig = jest.fn(
-  (_credentials?: unknown, _options?: unknown, _acceptRawApiKey?: unknown) => ({
+  (
+    _credentials?: unknown,
+    _options?: unknown,
+    _acceptRawApiKey?: unknown,
+  ): {
+    provider: string;
+    tools?: unknown[];
+    llmConfig: GoogleClientOptions;
+  } => ({
     provider: Providers.VERTEXAI,
     llmConfig: { model: 'gemini-2.5-flash' },
   }),
@@ -64,6 +75,18 @@ describe('initializeGoogle', () => {
     delete process.env.GOOGLE_CLOUD_PROJECT;
     delete process.env.GCLOUD_PROJECT;
     delete process.env.GOOGLE_PROJECT_ID;
+    for (const key of [
+      'PROXY',
+      'proxy',
+      'HTTP_PROXY',
+      'http_proxy',
+      'HTTPS_PROXY',
+      'https_proxy',
+      'NO_PROXY',
+      'no_proxy',
+    ]) {
+      delete process.env[key];
+    }
   });
 
   afterAll(() => {
@@ -127,6 +150,72 @@ describe('initializeGoogle', () => {
         modelOptions: { model: 'gemini-2.5-flash' },
       }),
     );
+  });
+
+  it('attaches a Pi model binding factory only for resolved direct server-admin Google auth', async () => {
+    process.env.GOOGLE_KEY = 'AIza-direct-admin-key';
+    mockGetGoogleConfig.mockReturnValueOnce({
+      provider: Providers.GOOGLE,
+      tools: [],
+      llmConfig: {
+        model: 'gemini-2.5-flash',
+        maxRetries: 2,
+        maxOutputTokens: 1024,
+        safetySettings: [
+          {
+            category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+          },
+          {
+            category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+          },
+          {
+            category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+          },
+          {
+            category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+          },
+          {
+            category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+            threshold: HarmBlockThreshold.BLOCK_NONE,
+          },
+        ],
+      },
+    });
+
+    const result = await initializeGoogle({
+      req: createReq(),
+      endpoint: EModelEndpoint.google,
+      model_parameters: { model: 'gemini-2.5-flash' },
+      db: createDb(),
+    });
+
+    expect(getInitializeResultPiModelBindingFactory(result)).toEqual(expect.any(Function));
+  });
+
+  it('leaves Pi binding absent when the resolved provider is Vertex', async () => {
+    process.env.GOOGLE_KEY = 'AIza-direct-admin-key';
+    mockGetGoogleConfig.mockReturnValueOnce({
+      provider: Providers.VERTEXAI,
+      tools: [],
+      llmConfig: {
+        model: 'gemini-2.5-flash',
+        maxRetries: 2,
+        maxOutputTokens: 1024,
+      },
+    });
+
+    const result = await initializeGoogle({
+      req: createReq(),
+      endpoint: EModelEndpoint.google,
+      model_parameters: { model: 'gemini-2.5-flash' },
+      db: createDb(),
+    });
+
+    expect(getInitializeResultPiModelBindingFactory(result)).toBeUndefined();
   });
 
   it('loads the stored API key when a resumed request omits expiry metadata', async () => {

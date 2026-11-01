@@ -161,6 +161,7 @@ function createHarness(
     threadId: 'thread-1',
     runId: 'run-1',
     metadata: {},
+    authorize: async () => true,
     ...(codeSessionBridge == null ? {} : { codeSessionBridge }),
   });
   const executePiTool = createPiHostToolExecutor({
@@ -311,6 +312,7 @@ describe('createPiHostToolExecutor', () => {
       threadId: 'thread-1',
       runId: 'run-1',
       metadata: {},
+      authorize: async () => true,
     });
     const execute = createPiHostToolExecutor({
       createStepIdentity: () => {

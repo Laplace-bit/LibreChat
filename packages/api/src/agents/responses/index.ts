@@ -175,6 +175,7 @@ export {
   buildAggregatedResponse,
   buildResponsesUsage,
   createAggregatorEventHandlers,
+  addCallerToolHandoff,
   type ResponseAggregator,
 } from './service';
 

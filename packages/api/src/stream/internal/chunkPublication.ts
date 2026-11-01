@@ -1,4 +1,4 @@
-import type { IEventTransport } from '../interfaces/IJobStore';
+import type { IEventTransport, ProviderOwnerContext } from '../interfaces/IJobStore';
 
 /**
  * Internal publication result used to fence same-replica replay against Redis Pub/Sub.
@@ -17,6 +17,7 @@ export type ChunkPublicationReceipt = number | false | void;
  */
 export interface ChunkPublicationOptions {
   coalesce?: boolean;
+  providerOwner?: ProviderOwnerContext;
 }
 
 type ChunkPublicationCapability = (
@@ -58,7 +59,9 @@ export function emitChunkWithReceipt(
       ? capability(streamId, event, generationId)
       : capability(streamId, event, generationId, options);
   }
-  return Promise.resolve(transport.emitChunk(streamId, event, generationId));
+  return Promise.resolve(
+    transport.emitChunk(streamId, event, generationId, options?.providerOwner),
+  );
 }
 
 /**

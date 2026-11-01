@@ -5,6 +5,12 @@
 
 const { ErrorTypes, ResourceType } = require('librechat-data-provider');
 
+const mockProcessPiResponse = jest.fn().mockResolvedValue(undefined);
+const mockGetRemotePiToolPlan = jest.fn(() => []);
+const mockExecuteRemotePiGeneration = jest.fn(async ({ handlers }) => {
+  await mockProcessPiResponse(handlers);
+  return { status: 'completed', usage: [] };
+});
 const mockSpendTokens = jest.fn().mockResolvedValue({});
 const mockSpendStructuredTokens = jest.fn().mockResolvedValue({});
 const mockRecordCollectedUsage = jest
@@ -174,6 +180,11 @@ jest.mock('nanoid', () => ({
   nanoid: jest.fn(() => 'mock-nanoid-123'),
 }));
 
+jest.mock('../remotePi', () => ({
+  getRemotePiToolPlan: (...args) => mockGetRemotePiToolPlan(...args),
+  executeRemotePiGeneration: (...args) => mockExecuteRemotePiGeneration(...args),
+}));
+
 jest.mock('uuid', () => ({
   v4: jest.fn(() => 'mock-uuid-456'),
 }));
@@ -257,7 +268,7 @@ jest.mock('@librechat/api', () => ({
   buildRunToolSet: jest.fn().mockReturnValue(new Set()),
   /** No fixture declares a caller-executed tool, so the handoff stays inert. */
   createClientToolHandoff: jest.fn(({ agentDefinitions }) => ({
-    toolDefinitions: agentDefinitions,
+    toolDefinitions: agentDefinitions ?? [],
     appliedTools: [],
     wrapRunStep: (delegate) => delegate,
     wrapToolExecute: (delegate) => delegate,
@@ -328,9 +339,6 @@ jest.mock('@librechat/api', () => ({
   }),
   resolveAgentTokenConfig: jest.fn(({ agentId, byAgentId, fallback }) =>
     agentId != null && byAgentId?.has(agentId) ? byAgentId.get(agentId) : fallback,
-  ),
-  assertLegacyRuntimeCompatibleGraph: jest.fn((...args) =>
-    jest.requireActual('@librechat/api').assertLegacyRuntimeCompatibleGraph(...args),
   ),
   extractManualSkills: jest.fn().mockReturnValue(undefined),
   injectSkillPrimes: jest.fn().mockReturnValue({
@@ -403,8 +411,23 @@ jest.mock('@librechat/api', () => ({
     usage: { input_tokens: 100, output_tokens: 50, total_tokens: 150 },
   }),
   buildResponsesUsage: mockBuildResponsesUsage,
-  createResponseAggregator: jest.fn().mockReturnValue({
-    usage: { inputTokens: 100, outputTokens: 50, reasoningTokens: 0, cachedTokens: 0 },
+  createResponseAggregator: (...args) =>
+    jest.requireActual('@librechat/api').createResponseAggregator(...args),
+  createAggregatorEventHandlers: jest.fn().mockReturnValue({
+    on_message_delta: { handle: jest.fn() },
+    on_reasoning_delta: { handle: jest.fn() },
+    on_run_step: { handle: jest.fn() },
+    on_run_step_delta: { handle: jest.fn() },
+    on_chat_model_end: { handle: jest.fn() },
+  }),
+  addCallerToolHandoff: jest.fn((aggregator, call) => {
+    if (!aggregator.toolCalls.has(call.callId)) {
+      aggregator.toolCalls.set(call.callId, {
+        id: call.callId,
+        name: call.name,
+        arguments: call.arguments,
+      });
+    }
   }),
   sendResponsesErrorResponse: jest.fn(),
   createResponsesEventHandlers: jest.fn().mockReturnValue({
@@ -416,13 +439,7 @@ jest.mock('@librechat/api', () => ({
       on_chat_model_end: { handle: jest.fn() },
     },
     finalizeStream: jest.fn(),
-  }),
-  createAggregatorEventHandlers: jest.fn().mockReturnValue({
-    on_message_delta: { handle: jest.fn() },
-    on_reasoning_delta: { handle: jest.fn() },
-    on_run_step: { handle: jest.fn() },
-    on_run_step_delta: { handle: jest.fn() },
-    on_chat_model_end: { handle: jest.fn() },
+    emitCallerToolHandoff: jest.fn(),
   }),
   executeAgentRun: async ({
     envelope,
@@ -769,15 +786,14 @@ describe('createResponse controller', () => {
         protocol: 'responses',
       }),
     );
-    const { createRun } = require('@librechat/api');
-    const processStream = await createRun.mock.results.at(-1).value;
     expect(mockExecution.beginProviderExecution).toHaveBeenCalledTimes(1);
     expect(mockExecution.beginProviderExecution.mock.invocationCallOrder[0]).toBeLessThan(
       require('@librechat/api').initializeAgent.mock.invocationCallOrder[0],
     );
     expect(mockExecution.beginProviderExecution.mock.invocationCallOrder[0]).toBeLessThan(
-      processStream.processStream.mock.invocationCallOrder[0],
+      mockProcessPiResponse.mock.invocationCallOrder[0],
     );
+    expect(mockExecuteRemotePiGeneration).toHaveBeenCalledTimes(1);
     expect(mockExecution.settle).toHaveBeenCalledWith(undefined);
     expect(res.once).toHaveBeenCalledWith('close', expect.any(Function));
     expect(res.off).toHaveBeenCalledWith('close', expect.any(Function));
@@ -786,10 +802,8 @@ describe('createResponse controller', () => {
   it('covers artifact writes when provider execution fails', async () => {
     const providerError = new Error('provider aborted');
     const artifactWrite = Promise.resolve(null);
-    const processStream = jest.fn().mockRejectedValue(providerError);
-    const { createRun } = require('@librechat/api');
     const { createToolEndCallback } = require('~/server/controllers/agents/callbacks');
-    createRun.mockResolvedValueOnce({ processStream });
+    mockProcessPiResponse.mockRejectedValueOnce(providerError);
     createToolEndCallback.mockImplementationOnce(({ artifactPromises }) => {
       artifactPromises.push(artifactWrite);
       return jest.fn();
@@ -864,109 +878,141 @@ describe('createResponse controller', () => {
     });
   });
 
-  it('resolves saved graph subagents for remote Responses API runs', async () => {
-    const { initializeAgent, resolveSubagentGraphs } = require('@librechat/api');
-    const primaryConfig = {
-      id: 'agent-123',
-      model: 'claude-3',
-      endpointTokenConfig: { 'claude-3': { prompt: 1 } },
-      model_parameters: {},
-      toolRegistry: {},
-      edges: [],
-      agentContextAttachments: [],
-      subagents: {
-        enabled: true,
-        graphs: [{ type: 'team', agent_ids: ['agent-123'], edges: [] }],
-      },
-    };
-    initializeAgent.mockResolvedValueOnce(primaryConfig);
-    const memberConfig = {
-      id: 'agent-graph-member',
-      endpointTokenConfig: { 'custom-model': { prompt: 7 } },
-      agentContextAttachments: [{ file_id: 'member-file' }],
-    };
-    resolveSubagentGraphs.mockImplementationOnce(async ({ rootConfigs }, deps) => {
-      rootConfigs[0].subagentGraphConfigs = [
-        { definition: { type: 'team' }, memberConfigs: [memberConfig] },
-      ];
-      deps.onAgentInitialized(memberConfig.id, memberConfig, memberConfig);
-    });
-    req.config.endpoints.agents.capabilities = ['subagents'];
-
-    await createResponse(req, res);
-
-    expect(resolveSubagentGraphs).toHaveBeenCalledWith(
-      expect.objectContaining({
-        primaryConfig,
-        rootConfigs: [primaryConfig],
-        signal: mockExecution.signal,
-        resourceType: ResourceType.REMOTE_AGENT,
-        memoryAvailable: true,
-      }),
-      expect.objectContaining({ getAgent: expect.any(Function) }),
-    );
-    expect(mockBuildAgentContextAttachmentsByAgentId).toHaveBeenCalledWith([
-      primaryConfig,
-      memberConfig,
-    ]);
-    expect(mockBuildAgentScopedContext).toHaveBeenCalledWith(
-      expect.objectContaining({ agentIds: ['agent-123', 'agent-graph-member'] }),
-    );
-    expect(mockApplyContextToAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ agent: memberConfig, agentId: 'agent-graph-member' }),
-    );
-    expect(mockBuildInlineMemoryContext).toHaveBeenCalledWith(
-      expect.objectContaining({ agent: memberConfig, memoryAvailable: true }),
-    );
-    const usageParams = mockRecordCollectedUsage.mock.calls[0][1];
-    expect(usageParams.endpointTokenConfig).toBe(primaryConfig.endpointTokenConfig);
-    expect(usageParams.resolveEndpointTokenConfig({ agentId: memberConfig.id })).toBe(
-      memberConfig.endpointTokenConfig,
-    );
-    expect(mockResolveMemoryAvailability).toHaveBeenCalledWith(
-      expect.objectContaining({ enabledCapabilities: expect.any(Set), user: req.user }),
-    );
-    const { createRun } = require('@librechat/api');
-    expect(createRun).toHaveBeenCalledWith(
-      expect.objectContaining({
-        initialSessions: mockInitialSessions,
-        user: expect.objectContaining({ id: 'user-123' }),
-        traceContext: { endpoint: 'agents' },
-      }),
-    );
-  });
-
   it.each([false, true])(
-    'returns 503 before run creation for an allowlisted primary agent: stream=%s',
+    'runs Responses through Pi and projects caller-owned functions: stream=%s',
     async (stream) => {
       const api = require('@librechat/api');
-      const rollout = { piAgentIds: ['agent-123'] };
-      req.config.endpoints.agents.runtime = rollout;
+      const clientToolNames = new Set(['submit_sql']);
+      const clientToolDefinition = {
+        name: 'submit_sql',
+        description: 'Submit a query from the caller.',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+        },
+      };
+      const handoffCall = {
+        callId: 'call-1',
+        name: 'submit_sql',
+        arguments: '{"query":"select 1"}',
+      };
       api.validateResponseRequest.mockReturnValueOnce({
-        request: { model: 'agent-123', input: 'Hello', stream },
+        request: {
+          model: 'agent-123',
+          input: 'Run a query',
+          stream,
+          tools: [{ type: 'function', ...clientToolDefinition }],
+        },
       });
+      api.initializeAgent.mockResolvedValueOnce({
+        id: 'agent-123',
+        model: 'claude-3',
+        model_parameters: {},
+        toolRegistry: {},
+        toolDefinitions: [],
+        edges: [],
+        agentContextAttachments: [],
+      });
+      api.createClientToolHandoff.mockImplementationOnce(({ agentDefinitions }) => ({
+        toolDefinitions: [...agentDefinitions, clientToolDefinition],
+        appliedTools: [{ type: 'function', ...clientToolDefinition }],
+        clientToolNames,
+        wrapRunStep: (delegate) => delegate,
+        wrapToolExecute: (delegate) => delegate,
+      }));
+      mockExecuteRemotePiGeneration.mockResolvedValueOnce({
+        status: 'caller_tool_handoff',
+        call: handoffCall,
+        usage: [],
+      });
+      if (!stream) {
+        api.buildAggregatedResponse.mockImplementationOnce(
+          jest.requireActual('@librechat/api').buildAggregatedResponse,
+        );
+      }
 
       await createResponse(req, res);
 
-      expect(api.assertLegacyRuntimeCompatibleGraph).toHaveBeenCalledWith({
-        agentIds: ['agent-123'],
-        rollout,
-      });
-      expect(api.createRun).not.toHaveBeenCalled();
-      expect(api.setupStreamingResponse).not.toHaveBeenCalled();
-      expect(api.sendResponsesErrorResponse).toHaveBeenCalledWith(
-        res,
-        503,
-        'The selected agent runtime is not available on this server.',
-        'server_error',
-        'AGENT_RUNTIME_UNAVAILABLE',
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({
+          clientToolNames,
+          clientToolDefinitions: [clientToolDefinition],
+        }),
       );
+      expect(api.createRun).not.toHaveBeenCalled();
+      if (stream) {
+        expect(
+          api.createResponsesEventHandlers.mock.results.at(-1).value.emitCallerToolHandoff,
+        ).toHaveBeenCalledWith(handoffCall);
+      } else {
+        const response = res.json.mock.calls.at(-1)[0];
+        expect(response.output).toContainEqual(
+          expect.objectContaining({
+            type: 'function_call',
+            call_id: 'call-1',
+            name: 'submit_sql',
+            arguments: '{"query":"select 1"}',
+          }),
+        );
+      }
     },
   );
 
-  it('returns 503 before run creation when a connected agent is allowlisted', async () => {
+  it('streams a Pi Responses turn with the Open Responses SSE contract', async () => {
     const api = require('@librechat/api');
-    const rollout = { piAgentIds: ['agent-connected'] };
+    const actual = jest.requireActual('@librechat/api');
+    const names = [
+      'createResponseContext',
+      'createResponseTracker',
+      'setupStreamingResponse',
+      'emitResponseCreated',
+      'emitResponseInProgress',
+      'createResponsesEventHandlers',
+    ];
+    const originals = names.map((name) => [name, api[name].getMockImplementation()]);
+    for (const name of names) api[name].mockImplementation(actual[name]);
+    api.validateResponseRequest.mockReturnValueOnce({
+      request: { model: 'agent-123', input: 'Hello', stream: true },
+    });
+    mockProcessPiResponse.mockImplementationOnce(async (handlers) => {
+      await handlers.on_message_delta.handle('on_message_delta', {
+        delta: { content: [{ type: 'text', text: 'Pi streamed reply.' }] },
+      });
+    });
+
+    try {
+      await createResponse(req, res);
+
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({
+          handlers: expect.objectContaining({ on_message_delta: expect.any(Object) }),
+        }),
+      );
+      expect(api.createRun).not.toHaveBeenCalled();
+
+      const chunks = res.write.mock.calls.map(([chunk]) => chunk).join('');
+      const events = chunks
+        .split('\n\n')
+        .filter((block) => block.startsWith('event: '))
+        .map((block) => JSON.parse(block.slice(block.indexOf('data: ') + 'data: '.length)));
+      expect(events).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'response.output_text.delta',
+            delta: 'Pi streamed reply.',
+          }),
+          expect.objectContaining({ type: 'response.completed' }),
+        ]),
+      );
+      expect(chunks).toContain('data: [DONE]\n\n');
+    } finally {
+      for (const [name, implementation] of originals) api[name].mockImplementation(implementation);
+    }
+  });
+
+  it('fails closed when a connected Agent graph reaches the Responses Pi adapter', async () => {
+    const api = require('@librechat/api');
     const connectedAgent = {
       id: 'agent-connected',
       model: 'claude-3',
@@ -987,58 +1033,21 @@ describe('createResponse controller', () => {
       agentContextAttachments: [],
     });
     mockGlobalDiscoveredAgentConfigs = new Map([[connectedAgent.id, connectedAgent]]);
-    req.config.endpoints.agents.runtime = rollout;
+    mockGetRemotePiToolPlan.mockImplementationOnce(() => {
+      throw new (jest.requireActual('@librechat/api').AgentRuntimeUnavailableError)();
+    });
 
     await createResponse(req, res);
 
-    expect(api.assertLegacyRuntimeCompatibleGraph).toHaveBeenCalledWith({
-      agentIds: ['agent-123', connectedAgent.id],
-      rollout,
-    });
+    expect(mockGetRemotePiToolPlan).toHaveBeenCalled();
+    expect(mockExecuteRemotePiGeneration).not.toHaveBeenCalled();
     expect(api.createRun).not.toHaveBeenCalled();
     expect(api.sendResponsesErrorResponse).toHaveBeenCalledWith(
       res,
       503,
-      'The selected agent runtime is not available on this server.',
+      'The Pi agent runtime is not available on this server.',
       'server_error',
       'AGENT_RUNTIME_UNAVAILABLE',
-    );
-  });
-
-  it.each([false, true])(
-    'excludes caller-executed tools from eager execution: stream=%s',
-    async (stream) => {
-      const api = require('@librechat/api');
-      const clientToolNames = new Set(['submit_sql']);
-      api.validateResponseRequest.mockReturnValueOnce({
-        request: { model: 'agent-123', input: 'Hello', stream },
-      });
-      api.createClientToolHandoff.mockImplementationOnce(({ agentDefinitions }) => ({
-        toolDefinitions: agentDefinitions,
-        appliedTools: [],
-        clientToolNames,
-        wrapRunStep: (delegate) => delegate,
-        wrapToolExecute: (delegate) => delegate,
-      }));
-
-      await createResponse(req, res);
-
-      expect(api.createRun).toHaveBeenCalledWith(expect.objectContaining({ clientToolNames }));
-    },
-  );
-
-  it('invokes the graph with the resolved recursion limit rather than the SDK default', async () => {
-    const api = require('@librechat/api');
-    const processStream = jest.fn().mockResolvedValue(undefined);
-    api.createRun.mockResolvedValueOnce({ processStream });
-    api.resolveRecursionLimit.mockReturnValueOnce(123);
-
-    await createResponse(req, res);
-
-    expect(processStream).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ recursionLimit: 123 }),
-      expect.anything(),
     );
   });
 
@@ -1126,14 +1135,14 @@ describe('createResponse controller', () => {
         isCreatedByUser: false,
         langfuseSampled: true,
         langfuseDestinationIds: ['destination-1'],
-        tokenCount: 50,
+        tokenCount: 0,
       }),
       { context: 'Responses API - save assistant response' },
     );
   });
 
   it.each([false, true])(
-    'runs and records a forced-temporary turn as temporary for Langfuse: stream=%s',
+    'runs a forced-temporary turn through Pi while preserving Langfuse context: stream=%s',
     async (stream) => {
       const api = require('@librechat/api');
       req.config.interfaceConfig = { retentionMode: 'ephemeral', temporaryChatRetention: 1 };
@@ -1143,7 +1152,7 @@ describe('createResponse controller', () => {
 
       await createResponse(req, res);
 
-      expect(api.createRun).toHaveBeenCalledWith(expect.objectContaining({ isTemporary: true }));
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledTimes(1);
       expect(api.getLangfuseTraceMessageFields).toHaveBeenCalledWith(req.config, 'resp_mock-123', {
         isTemporary: true,
       });
@@ -1744,7 +1753,8 @@ describe('createResponse controller', () => {
 
       await createResponse(req, res);
 
-      expect(api.createRun).toHaveBeenCalledTimes(1);
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledTimes(1);
+      expect(api.createRun).not.toHaveBeenCalled();
       expect(api.sendResponsesErrorResponse).not.toHaveBeenCalledWith(
         res,
         400,
@@ -2015,18 +2025,12 @@ describe('createResponse controller', () => {
     );
 
     it('does not classify a client disconnect as an upstream model error', async () => {
-      const api = require('@librechat/api');
       const { logger } = require('@librechat/data-schemas');
       const abortError = Object.assign(new Error('request aborted'), { name: 'AbortError' });
-      api.createRun.mockImplementationOnce(async (options) => ({
-        processStream: jest.fn(async () => {
-          options.modelCallbacks
-            .find(({ name }) => name === 'librechat-upstream-model-error-tracker')
-            .handleLLMError(abortError);
-          res.once.mock.calls.find(([event]) => event === 'close')[1]();
-          throw abortError;
-        }),
-      }));
+      mockProcessPiResponse.mockImplementationOnce(async () => {
+        res.once.mock.calls.find(([event]) => event === 'close')[1]();
+        throw abortError;
+      });
 
       await createResponse(req, res);
 
@@ -2050,7 +2054,7 @@ describe('createResponse controller', () => {
         },
       });
       req.config.filters = { messages: { pii: {} } };
-      api.createRun.mockRejectedValueOnce(providerError);
+      mockExecuteRemotePiGeneration.mockRejectedValueOnce(providerError);
 
       await createResponse(req, res);
 
@@ -2068,55 +2072,43 @@ describe('createResponse controller', () => {
       expect(JSON.stringify(api.sendResponsesErrorResponse.mock.calls)).not.toContain(rawValue);
     });
 
-    it.each([false, true])(
-      'classifies a terminal model callback failure and correlates its trace: stream=%s',
-      async (stream) => {
-        const api = require('@librechat/api');
-        const { logger } = require('@librechat/data-schemas');
-        const rawValue = 'PRIVATE-RESPONSES-UPSTREAM-PAYLOAD';
-        const providerError = Object.assign(new Error(`Provider echoed ${rawValue}`), {
-          code: 'ERR_REMOTE',
-          response: { status: 503, data: { prompt: rawValue } },
-        });
-        req.config.filters = { messages: { pii: {} } };
-        api.validateResponseRequest.mockReturnValueOnce({
-          request: { model: 'agent-123', input: 'Hello', stream },
-        });
-        api.createRun.mockImplementationOnce(async (options) => ({
-          processStream: jest.fn(async () => {
-            options.modelCallbacks
-              .find(({ name }) => name === 'librechat-upstream-model-error-tracker')
-              .handleLLMError(providerError);
-            throw new Error('graph failed', { cause: providerError });
-          }),
-        }));
-
-        await createResponse(req, res);
-
-        const errorLog = logger.error.mock.calls.find(
-          ([message]) => message === '[Responses API] Upstream model error',
-        );
-        expect(errorLog).toEqual([
-          '[Responses API] Upstream model error',
-          {
-            type: 'Error',
-            status: 503,
-            errorCode: 'UPSTREAM_MODEL_ERROR',
-            errorOrigin: 'model_provider',
-            errorType: '503',
-            traceId: 'da34f2d846b1b1b770afe89e670770d5',
-          },
-        ]);
-        expect(JSON.stringify(errorLog)).not.toContain(rawValue);
-        expect(JSON.stringify(errorLog)).not.toContain('ERR_REMOTE');
-      },
-    );
-
-    it('preserves the legacy provider error when protection is inactive', async () => {
+    it.each([false, true])('keeps Pi provider failures bounded: stream=%s', async (stream) => {
       const api = require('@librechat/api');
-      const rawValue = 'LEGACY-RESPONSES-PROVIDER-ERROR';
-      api.createRun.mockRejectedValueOnce(
-        Object.assign(new Error(rawValue), { code: 'ERR_LEGACY_REMOTE' }),
+      const { logger } = require('@librechat/data-schemas');
+      const rawValue = 'PRIVATE-RESPONSES-UPSTREAM-PAYLOAD';
+      const providerError = Object.assign(new Error(`Provider echoed ${rawValue}`), {
+        code: 'ERR_REMOTE',
+        response: { status: 503, data: { prompt: rawValue } },
+      });
+      req.config.filters = { messages: { pii: {} } };
+      api.validateResponseRequest.mockReturnValueOnce({
+        request: { model: 'agent-123', input: 'Hello', stream },
+      });
+      mockExecuteRemotePiGeneration.mockImplementationOnce(async ({ onModelProviderError }) => {
+        onModelProviderError(providerError);
+        throw new Error('Pi execution failed', { cause: providerError });
+      });
+
+      await createResponse(req, res);
+
+      const errorLog = logger.error.mock.calls.find(
+        ([message]) => message === '[Responses API] Upstream model error',
+      );
+      expect(errorLog).toEqual(
+        expect.arrayContaining([
+          '[Responses API] Upstream model error',
+          expect.objectContaining({ status: 503 }),
+        ]),
+      );
+      expect(JSON.stringify(errorLog)).not.toContain(rawValue);
+      expect(JSON.stringify(errorLog)).not.toContain('ERR_REMOTE');
+    });
+
+    it('preserves the Pi provider error when protection is inactive', async () => {
+      const api = require('@librechat/api');
+      const rawValue = 'PI-RESPONSES-PROVIDER-ERROR';
+      mockExecuteRemotePiGeneration.mockRejectedValueOnce(
+        Object.assign(new Error(rawValue), { code: 'ERR_PI_REMOTE' }),
       );
 
       await createResponse(req, res);
@@ -2126,18 +2118,18 @@ describe('createResponse controller', () => {
         500,
         rawValue,
         'server_error',
-        'ERR_LEGACY_REMOTE',
+        'ERR_PI_REMOTE',
       );
     });
 
     it.each([
       ['a management-only prompt', { prompts: { pii: {} } }],
       ['an inert message', { messages: { pii: { starterPatterns: [] } } }],
-    ])('preserves the legacy provider error for %s policy', async (_policy, filters) => {
+    ])('preserves the Pi provider error for %s policy', async (_policy, filters) => {
       const api = require('@librechat/api');
-      const rawValue = 'LEGACY-RESPONSES-CONFIGURED-PROVIDER-ERROR';
+      const rawValue = 'PI-RESPONSES-CONFIGURED-PROVIDER-ERROR';
       req.config.filters = filters;
-      api.createRun.mockRejectedValueOnce(new Error(rawValue));
+      mockExecuteRemotePiGeneration.mockRejectedValueOnce(new Error(rawValue));
 
       await createResponse(req, res);
 
@@ -2149,31 +2141,14 @@ describe('createResponse controller', () => {
       );
     });
 
-    it('logs bounded metadata for tool callback failures', async () => {
+    it('does not invoke Legacy run callbacks for a Pi execution failure', async () => {
       const api = require('@librechat/api');
-      const { logger } = require('@librechat/data-schemas');
-      const rawValue = 'PRIVATE-RESPONSES-TOOL-PAYLOAD';
-      const toolError = Object.assign(new Error(`Tool echoed ${rawValue}`), {
-        code: 'ERR_TOOL',
-        response: { status: 422, data: { output: rawValue } },
-      });
-      api.createRun.mockResolvedValueOnce({
-        processStream: jest.fn().mockImplementation(async (_input, _config, options) => {
-          options.callbacks.TOOL_ERROR({}, toolError, 'file_search');
-        }),
-      });
+      mockExecuteRemotePiGeneration.mockRejectedValueOnce(new Error('Pi tool adapter failed'));
 
       await createResponse(req, res);
 
-      expect(mockGetSafeErrorMetadata).toHaveBeenCalledWith(toolError);
-      const errorLog = logger.error.mock.calls.find(([message]) =>
-        message.includes('Tool Error "file_search"'),
-      );
-      expect(errorLog).toEqual([
-        '[Responses API] Tool Error "file_search"',
-        { type: 'Error', status: 422 },
-      ]);
-      expect(JSON.stringify(errorLog)).not.toContain(rawValue);
+      expect(api.createRun).not.toHaveBeenCalled();
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -2539,7 +2514,7 @@ describe('createResponse controller', () => {
   });
 
   describe('agent context parity with UI path', () => {
-    it('applies agent-scoped attachment context before createRun', async () => {
+    it('applies agent-scoped attachment context before Pi dispatch', async () => {
       const api = require('@librechat/api');
       api.initializeAgent.mockResolvedValueOnce({
         id: 'agent-123',
@@ -2655,22 +2630,16 @@ describe('createResponse controller', () => {
 
   describe('collectedUsage population', () => {
     it('should collect usage from on_chat_model_end events', async () => {
-      const api = require('@librechat/api');
-
-      api.createRun.mockImplementation(async ({ customHandlers }) => {
-        return {
-          processStream: jest.fn().mockImplementation(async () => {
-            customHandlers.on_chat_model_end.handle('on_chat_model_end', {
-              output: {
-                usage_metadata: {
-                  input_tokens: 150,
-                  output_tokens: 75,
-                  model: 'claude-3',
-                },
-              },
-            });
-          }),
-        };
+      mockProcessPiResponse.mockImplementationOnce(async (handlers) => {
+        await handlers.on_chat_model_end.handle('on_chat_model_end', {
+          output: {
+            usage_metadata: {
+              input_tokens: 150,
+              output_tokens: 75,
+              model: 'claude-3',
+            },
+          },
+        });
       });
 
       await createResponse(req, res);

@@ -14,6 +14,11 @@ import {
   mergeHeaders,
   resolveHeaders,
 } from '~/utils';
+import { createPiGoogleModelBinding, GOOGLE_GENERATIVE_BASE_URL } from '~/agents/pi/googleModel';
+import { setInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
+import { createAuthorizedPiGoogleModelCandidate } from './piModel';
+import { resolveModelTransportTimeouts } from '~/agents/config';
+import { getProxyUrlForUrl } from '~/utils/proxy';
 import { resolveEndpointRuntime } from '~/types';
 import { getGoogleConfig } from './llm';
 
@@ -130,6 +135,32 @@ export async function initializeGoogle(
 
   if (clientOptions.streamRate != null) {
     result.llmConfig._lc_stream_delay = clientOptions.streamRate;
+  }
+
+  const expectedProxyURL = getProxyUrlForUrl(GOOGLE_GENERATIVE_BASE_URL);
+  const piModelCandidate = createAuthorizedPiGoogleModelCandidate({
+    endpoint,
+    adminApiKey: GOOGLE_KEY,
+    resolvedApiKey: credentials[AuthKeys.GOOGLE_API_KEY],
+    userProvidedApiKey: isUserProvided,
+    resolvedProvider: result.provider,
+    configuredBaseURL: googleConfig?.baseURL ?? allConfig?.baseURL,
+    reverseProxyURL: GOOGLE_REVERSE_PROXY,
+    authHeader: clientOptions.authHeader === true,
+    googleConfig,
+    allConfig,
+    modelParameters: model_parameters,
+    expectedProxyURL,
+    transport: {
+      ...resolveModelTransportTimeouts(appConfig?.endpoints?.agents),
+      proxy: expectedProxyURL,
+    },
+    initializeResult: result,
+  });
+  if (piModelCandidate !== undefined) {
+    setInitializeResultPiModelBindingFactory(result, () =>
+      createPiGoogleModelBinding(piModelCandidate),
+    );
   }
 
   return result;

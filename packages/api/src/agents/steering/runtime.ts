@@ -84,6 +84,79 @@ export interface SteerDrainHookOptions {
   onMediaError?: (item: SteerQueueItem, error: unknown) => void | Promise<void>;
 }
 
+export interface SteerTurnEndConsumerOptions extends SteerDrainHookOptions {
+  /** Revalidates the live Pi provider lease before draining or delivering work. */
+  assertProviderOwner(signal?: AbortSignal): Promise<boolean>;
+  /** A pending approval/question leaves queued steers for the resumed owner. */
+  isDeferred?(): boolean;
+}
+
+export interface SteerTurnEndDelivery {
+  /** Queues one already durably applied steer in the active runtime. */
+  deliver(message: InjectedMessage): void | Promise<void>;
+}
+
+/**
+ * Drains the shared generation steering queue at Pi's awaited `finishTurn`
+ * boundary. `finishTurn` runs after the assistant message and tool results have
+ * been persisted, but before Pi polls its in-memory steering queue for the next
+ * provider request. The generation store remains the only durable queue.
+ */
+export async function consumeSteersAtTurnEnd(
+  opts: SteerTurnEndConsumerOptions,
+  signal: AbortSignal | undefined,
+  delivery: SteerTurnEndDelivery,
+): Promise<void> {
+  const shouldDefer = () => signal?.aborted === true || opts.isDeferred?.() === true;
+  const assertOwner = async (): Promise<boolean> => {
+    if (shouldDefer()) {
+      return false;
+    }
+    if (await opts.assertProviderOwner(signal)) {
+      return true;
+    }
+    if (shouldDefer()) {
+      return false;
+    }
+    const error = new Error('This run no longer owns the permission to consume queued steers.');
+    Object.assign(error, { code: 'PROVIDER_OWNER_FENCED' });
+    throw error;
+  };
+
+  if (!(await assertOwner())) {
+    return;
+  }
+  let applyOwnerFailure: unknown;
+  const messages = await drainAndBuildInjections({
+    ...opts,
+    applySteer: async (item) => {
+      try {
+        if (!(await assertOwner())) {
+          throw new Error('Pi generation stopped before the queued steer could be applied.');
+        }
+      } catch (error) {
+        if (!shouldDefer()) {
+          applyOwnerFailure = error;
+        }
+        throw error;
+      }
+      await opts.applySteer(item);
+    },
+  });
+  if (applyOwnerFailure != null && !shouldDefer()) {
+    throw applyOwnerFailure;
+  }
+  if (messages.length === 0 || !(await assertOwner())) {
+    return;
+  }
+  for (const message of messages) {
+    if (!(await assertOwner())) {
+      return;
+    }
+    await delivery.deliver(message);
+  }
+}
+
 /**
  * Shared drain body for all injection boundaries (PostToolBatch,
  * PreemptBoundary, and terminal Stop) — the provider-safety argument rests on each site

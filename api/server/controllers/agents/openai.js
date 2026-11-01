@@ -1,6 +1,6 @@
 const { nanoid } = require('nanoid');
 const { logger } = require('@librechat/data-schemas');
-const { Callback, formatAgentMessages } = require('@librechat/agents');
+const { formatAgentMessages } = require('@librechat/agents');
 const {
   createOpenAIToolCallStream: createAcceptedToolCallStream,
 } = require('@librechat/agents/openai');
@@ -13,7 +13,6 @@ const {
 } = require('librechat-data-provider');
 const {
   writeSSE,
-  createRun,
   createChunk,
   applyContextToAgent,
   buildRunToolSet,
@@ -24,13 +23,11 @@ const {
   AgentRunEnvelopeError,
   createAgentRunEnvelope,
   createAgentExecutionContext,
-  assertLegacyRuntimeCompatibleGraph,
   createMCPRuntimeRequestBody,
   loadSkillStates,
   loadSkillAccess,
   sendFinalChunk,
   buildCompletionUsage,
-  createSafeUser,
   validateRequest,
   initializeAgent,
   getBalanceConfig,
@@ -38,10 +35,8 @@ const {
   extractManualSkills,
   createErrorResponse,
   recordCollectedUsage,
-  createSubagentUsageSink,
   getTransactionsConfig,
   resolveAgentTokenConfig,
-  resolveRecursionLimit,
   inspectContent,
   extractMessageContent,
   extractModelParameterContent,
@@ -77,10 +72,10 @@ const {
   resolveApiConversationProject,
   resolveAdmittedCodeEnvironmentDecision,
   createTerminalRunErrorObserver,
-  isTemporaryTurn,
   getModelEndUsage,
   hasEntityEmbeddings,
 } = require('@librechat/api');
+const { executeRemotePiGeneration, getRemotePiToolPlan } = require('./remotePi');
 const {
   buildSummarizationHandlers,
   contextualizeModelUsage,
@@ -692,7 +687,6 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
 
       let handoffAgentConfigs = new Map();
       let discoveredEdges = [];
-      let discoveredMCPAuthMap;
       const subagentsCapabilityEnabled = enabledCapabilities.has(AgentCapabilities.subagents);
       const primaryHasGraphSubagents =
         subagentsCapabilityEnabled &&
@@ -771,14 +765,11 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
           initializeAgent,
         };
         if (primaryConfig.edges?.length) {
-          ({
-            agentConfigs: handoffAgentConfigs,
-            edges: discoveredEdges,
-            userMCPAuthMap: discoveredMCPAuthMap,
-          } = await discoverConnectedAgents(discoveryParams, discoveryDeps));
+          ({ agentConfigs: handoffAgentConfigs, edges: discoveredEdges } =
+            await discoverConnectedAgents(discoveryParams, discoveryDeps));
         }
         if (subagentsCapabilityEnabled) {
-          discoveredMCPAuthMap = await resolveSubagentGraphs(
+          await resolveSubagentGraphs(
             {
               ...discoveryParams,
               rootConfigs: [primaryConfig, ...handoffAgentConfigs.values()],
@@ -790,9 +781,18 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
 
       primaryConfig.edges = discoveredEdges;
       const runAgents = [primaryConfig, ...handoffAgentConfigs.values()];
-      assertLegacyRuntimeCompatibleGraph({
-        agentIds: runAgents.map((runAgent) => runAgent.id),
-        rollout: appConfig?.endpoints?.[EModelEndpoint.agents]?.runtime,
+      const openaiMessages = convertMessages(request.messages);
+      const toolSet = buildRunToolSet(
+        primaryConfig,
+        handoffAgentConfigs.values(),
+        undefined,
+        openaiMessages,
+        true,
+      );
+      const piToolDefinitions = getRemotePiToolPlan({
+        agent: primaryConfig,
+        agents: runAgents,
+        callableToolNames: [...toolSet],
       });
       const endpointTokenConfigByAgentId = new Map();
       for (const [agentId, context] of agentToolContexts) {
@@ -927,15 +927,6 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
 
       const summarizationConfig = appConfig?.summarization;
 
-      const openaiMessages = convertMessages(request.messages);
-
-      const toolSet = buildRunToolSet(
-        primaryConfig,
-        handoffAgentConfigs.values(),
-        undefined,
-        openaiMessages,
-        true,
-      );
       const formatted = formatAgentMessages(stripActivityLabelParts(openaiMessages), {}, toolSet);
       const formattedMessages = formatted.messages;
       const initialSummary = formatted.summary;
@@ -1075,10 +1066,6 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
       // Create and run the agent
       const userId = principal.userId;
 
-      // Extract merged userMCPAuthMap (needed for MCP tool connections across
-      // the primary and any discovered handoff sub-agents)
-      const userMCPAuthMap = discoveredMCPAuthMap ?? primaryConfig.userMCPAuthMap;
-
       const contextAgentsById = new Map(runAgents.map((runAgent) => [runAgent.id, runAgent]));
       for (const runAgent of runAgents) {
         for (const graph of runAgent.subagentGraphConfigs ?? []) {
@@ -1123,55 +1110,24 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
       );
       const initialSessions = buildInitialToolSessions({ agents: runAgents });
 
-      const run = await createRun({
-        agents: runAgents,
-        messages: formattedMessages,
-        indexTokenCountMap,
-        initialSessions,
-        initialSummary,
-        runId: responseId,
-        summarizationConfig,
-        appConfig,
-        signal: execution.signal,
-        customHandlers: handlers,
-        modelCallbacks: [terminalRunError.modelCallback],
-        requestBody: mcpRequestBody,
-        user: { ...createSafeUser(req.user), id: userId },
-        traceContext: { endpoint: EModelEndpoint.agents },
-        tenantId: principal.tenantId,
-        isTemporary: isTemporaryTurn(req),
-        /** Bills subagent child-run model calls (reported outside the
-         *  streamEvents loop) into the same collectedUsage array. */
-        subagentUsageSink: createSubagentUsageSink(collectedUsage),
-      });
-
-      if (!run) {
-        throw new Error('Failed to create agent run');
-      }
-
-      const config = {
-        runName: 'AgentRun',
-        configurable: {
-          thread_id: conversationId,
-          user_id: userId,
-          user: createSafeUser(req.user),
-          requestBody: mcpRequestBody,
-          ...(userMCPAuthMap != null && { userMCPAuthMap }),
-        },
-        recursionLimit: resolveRecursionLimit(agentsEConfig, agent),
-        signal: execution.signal,
-        streamMode: 'values',
-        version: 'v2',
-      };
-
       await completeOpenAIToolCalls(toolCallStream, async () => {
-        await run.processStream({ messages: formattedMessages }, config, {
-          callbacks: {
-            [Callback.TOOL_ERROR]: (graph, error, toolId) => {
-              logger.error(`[OpenAI API] Tool Error "${toolId}"`, getSafeErrorMetadata(error));
-            },
-          },
+        const outcome = await executeRemotePiGeneration({
+          execution,
+          req,
+          agent: primaryConfig,
+          agents: runAgents,
+          callableToolNames: [...toolSet],
+          toolDefinitions: piToolDefinitions,
+          messages: formattedMessages,
+          summary: initialSummary,
+          conversationId,
+          userId,
+          handlers,
+          toolExecuteHandler: handlers.on_tool_execute,
+          initialSessions,
+          usageAttribution: { provider: primaryConfig.provider },
         });
+        collectedUsage.push(...outcome.usage);
 
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);

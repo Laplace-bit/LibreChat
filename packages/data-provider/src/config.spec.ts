@@ -3240,36 +3240,13 @@ describe('agent recursion limits', () => {
   );
 });
 
-describe('Pi agent runtime rollout config', () => {
-  it('defaults to no Pi agents and accepts a bounded, normalized operator allowlist', () => {
-    const defaults = configSchema.parse({
-      version: '1.0',
-      endpoints: { agents: {} },
-    });
-    expect(defaults.endpoints?.agents?.runtime).toEqual({ piAgentIds: [] });
-
+describe('Pi-only agent runtime config', () => {
+  it('does not expose an operator allowlist that can choose a different Agent engine', () => {
     const configured = configSchema.parse({
       version: '1.0',
-      endpoints: { agents: { runtime: { piAgentIds: [' agent-canary '] } } },
+      endpoints: { agents: { runtime: { piAgentIds: [] } } },
     });
-    expect(configured.endpoints?.agents?.runtime).toEqual({ piAgentIds: ['agent-canary'] });
-  });
-
-  it('rejects duplicate, empty, oversized and unknown rollout configuration', () => {
-    for (const runtime of [
-      { piAgentIds: ['agent-a', 'agent-a'] },
-      { piAgentIds: [''] },
-      { piAgentIds: ['a'.repeat(129)] },
-      { piAgentIds: Array.from({ length: 1_001 }, (_, index) => `agent-${index}`) },
-      { piAgentIds: [], defaultEngine: 'pi' },
-    ]) {
-      expect(
-        configSchema.safeParse({
-          version: '1.0',
-          endpoints: { agents: { runtime } },
-        }).success,
-      ).toBe(false);
-    }
+    expect(configured.endpoints?.agents).not.toHaveProperty('runtime');
   });
 });
 
@@ -3309,7 +3286,6 @@ describe('DEPLOYMENT_ONLY_CONFIG_PATHS', () => {
     expect(DEPLOYMENT_ONLY_CONFIG_PATHS).toMatchObject({
       includedTools: 'operator',
       filteredTools: 'operator',
-      'endpoints.agents.runtime': 'operator',
       'endpoints.agents.toolApproval.hooks': 'operator',
       cache: 'unused',
     });

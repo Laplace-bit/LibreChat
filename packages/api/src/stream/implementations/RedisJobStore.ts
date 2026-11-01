@@ -35,6 +35,7 @@ import type {
   ParkedSteerClaim,
   ScheduleCleanupScope,
   ScheduleProviderOwner,
+  ProviderOwnerContext,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
@@ -48,6 +49,7 @@ import {
   PAUSE_PERSISTENCE_TIMEOUT_ERROR,
   PAUSE_PERSISTENCE_TIMEOUT_MS,
   PROVIDER_DRAIN_TIMEOUT_MS,
+  PI_PROVIDER_OWNER_LOST_ERROR,
   isPendingActionStale,
   toWireRunSteps,
 } from '~/stream/interfaces/IJobStore';
@@ -57,19 +59,27 @@ import {
   resolveCoalesceWindowMs,
 } from '~/stream/internal/coalescing';
 import {
+  assertRuntimeIdentityImmutable,
+  resolveStoredAgentRuntime,
+} from '~/agents/runtime/selection';
+import {
   SCHEDULE_MCP_RECEIPT_LUA,
   SCHEDULE_RETENTION_LUA,
 } from '~/stream/internal/scheduleReceipts';
 import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuation';
 import { instrumentIORedisClient, RedisUseCases } from '~/cache/redisTelemetry';
 import { RecoveredSteerPayloadMismatchError } from '~/stream/SteerRecovery';
-import { assertRuntimeIdentityImmutable } from '~/agents/runtime/selection';
 import { SCHEDULE_MCP_FAILURE_PATCH_LUA } from '../scheduleFailure';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { createToolTimingTracker } from '~/agents/toolTiming';
 import { evalScript } from '~/cache/redisScript';
 
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+
+function isPiAgentGeneration(job: Pick<SerializableJobData, 'agentRuntime'>): boolean {
+  const runtime = resolveStoredAgentRuntime(job.agentRuntime);
+  return runtime.status === 'resolved';
+}
 
 function parseStoredRuntimeIdentity(value: string | undefined): unknown {
   if (value === undefined) {
@@ -79,7 +89,7 @@ function parseStoredRuntimeIdentity(value: string | undefined): unknown {
     return JSON.parse(value) as unknown;
   } catch {
     // Keep malformed persisted identity visible to the runtime boundary, where it
-    // fails closed. Treating it as absent would silently select the legacy engine.
+    // fails closed. Treating it as absent could route it through generic job bookkeeping.
     return value;
   }
 }
@@ -160,6 +170,7 @@ function assertCreateIdempotencyArguments(
  *     parkedSteersTtl,
  *     generationEpochGraceTtl,
  *     steerReceiptTtl (0 to leave unchanged),
+ *     ownerId, providerExecutionId, providerFence, ownerLeaseMode,
  *     returnDrainedSteers,
  *     hdelCount,
  *     ...hdelFields,
@@ -175,6 +186,14 @@ const JOB_CAS_LUA =
   'if ARGV[4] ~= "" then local now = redis.call("TIME") ' +
   'local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
   'if nowMs >= tonumber(ARGV[4]) then return -1 end end ' +
+  'if ARGV[12] ~= "" then ' +
+  'if redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[12] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[13] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[14] then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if ARGV[15] == "expired" then if not leaseUntil or leaseUntil > nowMs then return 0 end ' +
+  'else if not leaseUntil or leaseUntil <= nowMs then return 0 end end end ' +
   'local currentCreatedAt = redis.call("HGET", KEYS[1], "createdAt") ' +
   'local ttl = tonumber(ARGV[5]) ' +
   'local terminal = ARGV[6] == "1" ' +
@@ -215,12 +234,35 @@ const JOB_CAS_LUA =
   'or (item.recoveringCreatedAt and (type(item.recoveringCreatedAt) ~= "number" or item.recoveringCreatedAt < 0)) then return 0 end ' +
   'validatedPrior[#validatedPrior + 1] = item end end end ' +
   'local currentReceipt = redis.call("HGET", KEYS[1], "scheduleOutcomeError") ' +
-  'local clearReceipt = false local hdelCount = tonumber(ARGV[13]) ' +
-  'for i = 14, 13 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
-  'local idx = 14 ' +
+  'local clearReceipt = false local hdelCount = tonumber(ARGV[17]) ' +
+  'for i = 18, 17 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
+  'local hsetStart = 18 + hdelCount local targetStatus = nil ' +
+  'for i = hsetStart, #ARGV, 2 do if ARGV[i] == "status" then targetStatus = ARGV[i+1] break end end ' +
+  'if terminal and (targetStatus == "complete" or targetStatus == "error") and ARGV[12] == "" ' +
+  'and redis.call("HGET", KEYS[1], "providerDrained") == "0" then ' +
+  'local identity = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'if identity then local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then return 0 end end end ' +
+  'if not terminal and targetStatus == "requires_action" and ARGV[12] == "" ' +
+  'and redis.call("HGET", KEYS[1], "providerDrained") == "0" then ' +
+  'local identity = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'if identity then local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then return 0 end end end ' +
+  'if terminal and targetStatus ~= "aborted" and (ARGV[12] == "" or ARGV[15] == "expired") ' +
+  'and redis.call("HGET", KEYS[1], "providerOwnerId") then ' +
+  'local fence = tonumber(redis.call("HGET", KEYS[1], "providerOwnerFence") or "0") ' +
+  'if fence < 9007199254740990 then redis.call("HSET", KEYS[1], "providerOwnerFence", fence + 1) end ' +
+  'redis.call("HDEL", KEYS[1], "providerOwnerId", "providerLeaseExpiresAt") end ' +
+  'local ownerLostAt = nil ' +
+  'if terminal and ARGV[15] == "expired" then local now = redis.call("TIME") ' +
+  'ownerLostAt = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'redis.call("HSET", KEYS[1], "providerOwnerLostAt", ownerLostAt) end ' +
+  'local idx = 18 ' +
   'for i = 1, hdelCount do redis.call("HDEL", KEYS[1], ARGV[idx]) idx = idx + 1 end ' +
   'local hset = {} ' +
   'for i = idx, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
+  'if ownerLostAt then hset[#hset + 1] = "completedAt" hset[#hset + 1] = ownerLostAt ' +
+  'hset[#hset + 1] = "terminalPersistenceStartedAt" hset[#hset + 1] = ownerLostAt end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, currentReceipt, clearReceipt, originalReceipt) ' +
@@ -284,7 +326,7 @@ const JOB_CAS_LUA =
   'redis.call("DEL", KEYS[5], KEYS[6]) ' +
   'if chunksTtl == 0 then redis.call("DEL", KEYS[3]) else redis.call("EXPIRE", KEYS[3], chunksTtl) end ' +
   'if runStepsTtl == 0 then redis.call("DEL", KEYS[4]) else redis.call("EXPIRE", KEYS[4], runStepsTtl) end ' +
-  'if ARGV[12] == "1" then if #items == 0 then return "[]" end return cjson.encode(items) end ' +
+  'if ARGV[16] == "1" then if #items == 0 then return "[]" end return cjson.encode(items) end ' +
   'else ' +
   'redis.call("EXPIRE", KEYS[3], ttl) ' +
   'redis.call("EXPIRE", KEYS[4], ttl) ' +
@@ -657,9 +699,20 @@ const JOB_UPDATE_LUA =
   SCHEDULE_MEMBERSHIP_INVALIDATE_LUA +
   'if redis.call("EXISTS", KEYS[1]) == 0 then return 0 end ' +
   'if ARGV[1] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
+  'if ARGV[6] ~= "" then ' +
+  'if redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[6] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[7] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[8] then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'else if redis.call("HGET", KEYS[1], "providerDrained") == "0" then ' +
+  'local identity = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'if identity then local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then return 0 end end end end ' +
   'local hset = {} local releaseRetention = false ' +
-  'for i = 6, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
-  'for i = 6, #ARGV, 2 do if ARGV[i] == "preserveForScheduleReconcile" and ARGV[i+1] == "0" then releaseRetention = true end end ' +
+  'for i = 9, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
+  'for i = 9, #ARGV, 2 do if ARGV[i] == "preserveForScheduleReconcile" and ARGV[i+1] == "0" then releaseRetention = true end end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, redis.call("HGET", KEYS[1], "scheduleOutcomeError"), false, originalReceipt) ' +
@@ -743,6 +796,21 @@ const HAS_ACTIVE_SUBSCRIBER_LUA =
 const PROVIDER_DRAIN_LUA =
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] then return 0 end ' +
+  'if ARGV[3] ~= "" then ' +
+  'if redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[5] ' +
+  'or redis.call("HGET", KEYS[1], "providerDrained") ~= "0" ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryOutcome") == "outcome_unknown" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'if redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[4] then return 0 end ' +
+  'redis.call("HSET", KEYS[1], "providerDrained", "1") ' +
+  'redis.call("HDEL", KEYS[1], "providerOwnerId", "providerLeaseExpiresAt") return 1 end ' +
+  'local identity = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'if identity and redis.call("HGET", KEYS[1], "providerDrained") == "0" then ' +
+  'local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then return 0 end end ' +
   'redis.call("HSET", KEYS[1], "providerDrained", "1") return 1';
 
 /** Legacy host-action recovery. Scheduled obligations require exact segment
@@ -777,13 +845,102 @@ const PROVIDER_BEGIN_LUA =
   'if redis.call("HGET", KEYS[1], "providerDrained") ~= "1" then return 0 end ' +
   'redis.call("HSET", KEYS[1], "providerDrained", "0", "providerExecutionStartedId", ARGV[2]) return 1';
 
+/** Starts a Pi provider segment and assigns its durable owner fence. */
+const PI_PROVIDER_BEGIN_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return false end ' +
+  'if redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] then return false end ' +
+  'if redis.call("HGET", KEYS[1], "status") ~= "running" then return false end ' +
+  'if redis.call("HGET", KEYS[1], "providerDrained") ~= "1" then return false end ' +
+  'local identity = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'if not identity then return false end local decoded, runtime = pcall(cjson.decode, identity) ' +
+  'if not decoded or type(runtime) ~= "table" or runtime.engine ~= "pi" then return false end ' +
+  'local fence = tonumber(redis.call("HGET", KEYS[1], "providerOwnerFence") or "0") ' +
+  'if not fence or fence < 0 or fence >= 9007199254740990 then return false end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = nowMs + tonumber(ARGV[4]) ' +
+  'redis.call("HSET", KEYS[1], "providerOwnerId", ARGV[3], "providerOwnerFence", fence + 1, ' +
+  '"providerLeaseExpiresAt", leaseUntil, "providerDrained", "0", "providerExecutionStartedId", ARGV[2]) ' +
+  'return { tostring(fence + 1), tostring(leaseUntil) }';
+
+const PI_PROVIDER_RENEW_LUA =
+  SCHEDULE_RETENTION_LUA +
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[4] ' +
+  'or redis.call("HGET", KEYS[1], "providerDrained") ~= "0" ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryOutcome") == "outcome_unknown" then return 0 end ' +
+  'local status = redis.call("HGET", KEYS[1], "status") ' +
+  'if status ~= "running" and status ~= "requires_action" and status ~= "complete" and status ~= "error" and status ~= "aborted" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'local leaseMs = tonumber(ARGV[5]) ' +
+  'redis.call("HSET", KEYS[1], "providerLeaseExpiresAt", nowMs + leaseMs) ' +
+  'if status == "running" then redis.call("HSET", KEYS[1], "lastActiveAt", nowMs) ' +
+  'local runningTtl = tonumber(ARGV[7]) local jobTtl = redis.call("TTL", KEYS[1]) ' +
+  'if jobTtl < runningTtl then expireScheduleJob(KEYS[1], runningTtl) end end ' +
+  'if redis.call("EXISTS", KEYS[2]) == 1 then redis.call("PEXPIRE", KEYS[2], leaseMs + tonumber(ARGV[6])) end ' +
+  'return 1';
+
+const PI_PROVIDER_ASSERT_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[4] ' +
+  'or redis.call("HGET", KEYS[1], "providerDrained") ~= "0" ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryOutcome") == "outcome_unknown" then return 0 end ' +
+  'local status = redis.call("HGET", KEYS[1], "status") ' +
+  'if status ~= "running" and status ~= "requires_action" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end return 1';
+
+/** The call-id receipt is committed in the same Redis TIME-checked boundary
+ * that admits a host effect. Reusing a Pi tool call id is denied, even by the
+ * same owner, so a retry after an ambiguous response cannot repeat the effect. */
+const PI_TOOL_ADMISSION_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[4] ' +
+  'or redis.call("HGET", KEYS[1], "providerDrained") ~= "0" ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryOutcome") == "outcome_unknown" then return 0 end ' +
+  'local status = redis.call("HGET", KEYS[1], "status") ' +
+  'if status ~= "running" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'if redis.call("HSETNX", KEYS[2], ARGV[5], ARGV[2] .. ":" .. ARGV[4]) ~= 1 then return 0 end ' +
+  'redis.call("PEXPIRE", KEYS[2], tonumber(ARGV[6])) return 1';
+
+const ACK_PI_PROVIDER_RECOVERY_PUBLICATION_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryOutcome") ~= "outcome_unknown" ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryId") ~= ARGV[2] ' +
+  'or redis.call("HGET", KEYS[1], "providerRecoveryPublishedId") ~= ARGV[2] then return 0 end return 1';
+
+const ACK_TERMINAL_PUBLICATION_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "terminalPublicationId") ~= ARGV[2] ' +
+  'or redis.call("HGET", KEYS[1], "terminalPublicationPublishedId") ~= ARGV[2] then return 0 end return 1';
+
 /** Single-winner promotion from abort-persistence pending to a consumable
  * terminal payload. Owner success/failure and stale-owner recovery share this
  * CAS, so a timeout cannot overwrite a normal FINAL (or vice versa). */
 const TERMINAL_PERSISTENCE_FINALIZE_LUA =
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" then return 0 end ' +
+  'if ARGV[3] ~= "" then ' +
+  'if redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
+  'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[4] ' +
+  'or redis.call("HGET", KEYS[1], "providerOwnerFence") ~= ARGV[5] then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end end ' +
   'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0", "finalEvent", ARGV[2]) ' +
+  'if ARGV[6] ~= "" then redis.call("HSET", KEYS[1], "terminalPublicationId", ARGV[6]) ' +
+  'redis.call("HDEL", KEYS[1], "terminalPublicationPublishedId") end ' +
   'return 1';
 
 /**
@@ -796,6 +953,9 @@ const TERMINAL_PERSISTENCE_FINALIZE_LUA =
  */
 const JOB_DELETE_LUA =
   'if ARGV[1] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
+  'local publicationId = redis.call("HGET", KEYS[1], "terminalPublicationId") ' +
+  'if publicationId and publicationId ~= "" and ' +
+  'redis.call("HGET", KEYS[1], "terminalPublicationPublishedId") ~= publicationId then return 0 end ' +
   'local existed = redis.call("EXISTS", KEYS[1]) ' +
   'if ARGV[2] == "1" and existed == 1 then return 0 end ' +
   'redis.call("DEL", KEYS[1], KEYS[2], KEYS[3], KEYS[4], KEYS[5]) ' +
@@ -921,6 +1081,19 @@ const CHUNK_APPEND_LUA =
   'if ARGV[3] ~= "" and currentCreatedAt ~= ARGV[3] then return 0 end ' +
   'local currentStatus = redis.call("HGET", KEYS[2], "status") ' +
   'if currentStatus ~= "running" and currentStatus ~= "requires_action" then return 0 end ' +
+  'local ownerId = ARGV[9] ' +
+  'if ownerId ~= "" then ' +
+  'if redis.call("HGET", KEYS[2], "providerOwnerId") ~= ownerId ' +
+  'or redis.call("HGET", KEYS[2], "providerExecutionId") ~= ARGV[10] ' +
+  'or redis.call("HGET", KEYS[2], "providerOwnerFence") ~= ARGV[11] ' +
+  'or redis.call("HGET", KEYS[2], "providerDrained") ~= "0" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[2], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'else local identity = redis.call("HGET", KEYS[2], "agentRuntime") ' +
+  'if identity then local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" ' +
+  'and redis.call("HGET", KEYS[2], "providerDrained") == "0" then return 0 end end end ' +
   'local retainedEpoch = redis.call("GET", KEYS[8]) ' +
   'if retainedEpoch and retainedEpoch ~= currentCreatedAt then return 0 end ' +
   'local protocolV2 = redis.call("HGET", KEYS[2], "generationProtocolVersion") == "2" ' +
@@ -970,6 +1143,7 @@ const CHUNK_APPEND_LUA =
   'if #kept > 0 then redis.call("RPUSH", KEYS[5], unpack(kept)) ' +
   'if claimTtl > 0 then redis.call("PEXPIRE", KEYS[5], claimTtl) end end end ' +
   'redis.call("XADD", KEYS[1], "*", "event", ARGV[1]) ' +
+  'if ownerId ~= "" and redis.call("EXISTS", KEYS[9]) == 1 then redis.call("PEXPIRE", KEYS[9], tonumber(ARGV[12])) end ' +
   'local durable = redis.call("HGET", KEYS[2], "durableEventCount") ' +
   'local priorLength = redis.call("XLEN", KEYS[1]) - 1 ' +
   'if not durable or tonumber(durable) < priorLength then durable = priorLength end ' +
@@ -1057,7 +1231,21 @@ const RUNSTEPS_SAVE_LUA =
   'if ARGV[3] ~= "" and currentCreatedAt ~= ARGV[3] then return 0 end ' +
   'local currentStatus = redis.call("HGET", KEYS[2], "status") ' +
   'local terminalHostActionPending = redis.call("HGET", KEYS[2], "terminalHostActionPending") == "1" or redis.call("HGET", KEYS[2], "detachedAgentEventTerminalHostActionPending") == "1" ' +
-  'if currentStatus ~= "running" and currentStatus ~= "requires_action" and not terminalHostActionPending then return 0 end ' +
+  'local ownerId = ARGV[4] ' +
+  'if ownerId ~= "" then ' +
+  'if redis.call("HGET", KEYS[2], "providerOwnerId") ~= ownerId ' +
+  'or redis.call("HGET", KEYS[2], "providerExecutionId") ~= ARGV[5] ' +
+  'or redis.call("HGET", KEYS[2], "providerOwnerFence") ~= ARGV[6] ' +
+  'or redis.call("HGET", KEYS[2], "providerDrained") ~= "0" ' +
+  'or redis.call("HGET", KEYS[2], "providerRecoveryOutcome") == "outcome_unknown" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[2], "providerLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil <= nowMs then return 0 end ' +
+  'elseif currentStatus ~= "running" and currentStatus ~= "requires_action" and not terminalHostActionPending then return 0 end ' +
+  'if ownerId == "" and redis.call("HGET", KEYS[2], "providerDrained") == "0" then ' +
+  'local identity = redis.call("HGET", KEYS[2], "agentRuntime") ' +
+  'if identity then local ok, runtime = pcall(cjson.decode, identity) ' +
+  'if ok and type(runtime) == "table" and runtime.engine == "pi" then return 0 end end end ' +
   'redis.call("SET", KEYS[1], ARGV[1]) ' +
   'local run = tonumber(ARGV[2]) ' +
   'local target = run ' +
@@ -1772,6 +1960,9 @@ const KEYS = {
   steerReceiptOrder: (streamId: string) => `stream:{${streamId}}:steer-receipt-order`,
   /** Latest generation epoch, retained briefly beyond the live job hash. */
   generationEpoch: (streamId: string) => `stream:{${streamId}}:generation-epoch`,
+  /** Generation-scoped host-tool invocation admission receipts. */
+  piToolAdmissions: (streamId: string, createdAt: number) =>
+    `stream:{${streamId}}:pi-tool-admissions:${createdAt}`,
   /** Expiring, generation-scoped subscriber-group leases. */
   subscriberLeases: (streamId: string, createdAt: number) =>
     `stream:{${streamId}}:subscriber-leases:${createdAt}`,
@@ -1782,6 +1973,8 @@ const KEYS = {
   /** Terminal jobs that still owe a durable host lifecycle hook (global set). Retains
    *  the aborted approval-expiry job for cross-replica / post-restart hook retry. */
   terminalHostActionJobs: 'stream:terminal_host_action',
+  /** Generation-scoped discoverability for terminal payloads awaiting recovery. */
+  terminalPersistenceJobs: 'stream:terminal_persistence:v1',
   /** Versioned, epoch-bound schedule settlement/release retry hints. */
   scheduleReconcileJobs: 'stream:schedule_reconcile:v1',
   /** Versioned recovery lane for detached Event Actor completion generations.
@@ -2440,6 +2633,7 @@ export class RedisJobStore implements IJobStoreV2 {
     streamId: string,
     updates: MutableJobDataPatch,
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     assertRuntimeIdentityImmutable(updates);
     const key = KEYS.job(streamId);
@@ -2458,6 +2652,7 @@ export class RedisJobStore implements IJobStoreV2 {
           to: status!,
           patch,
           expectCreatedAt: expectedCreatedAt ?? observed.createdAt,
+          ...(providerOwner == null ? {} : { expectProviderOwner: providerOwner }),
         });
         return;
       }
@@ -2502,6 +2697,9 @@ export class RedisJobStore implements IJobStoreV2 {
       String(completedTtl),
       String(this.ttl.chunksAfterComplete),
       String(this.ttl.runStepsAfterComplete),
+      providerOwner?.ownerId ?? '',
+      providerOwner?.providerExecutionId ?? '',
+      providerOwner != null ? String(providerOwner.fence) : '',
       ...fields,
     );
     if (updated !== 1) {
@@ -2660,6 +2858,7 @@ export class RedisJobStore implements IJobStoreV2 {
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean> {
     return (
       Number(
@@ -2669,6 +2868,9 @@ export class RedisJobStore implements IJobStoreV2 {
           KEYS.job(streamId),
           String(expectedCreatedAt),
           providerExecutionId,
+          providerOwner?.ownerId ?? '',
+          providerOwner?.providerExecutionId ?? '',
+          providerOwner != null ? String(providerOwner.fence) : '',
         ),
       ) === 1
     );
@@ -2692,12 +2894,191 @@ export class RedisJobStore implements IJobStoreV2 {
     );
   }
 
+  async acquirePiProviderOwner(
+    streamId: string,
+    expectedCreatedAt: number,
+    providerExecutionId: string,
+    ownerId: string,
+    leaseMs: number,
+  ): Promise<ProviderOwnerContext | false> {
+    if (
+      ownerId.length === 0 ||
+      ownerId.length > 128 ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs < 1000 ||
+      leaseMs > 120_000
+    ) {
+      return false;
+    }
+    const raw = await this.redis.eval(
+      PI_PROVIDER_BEGIN_LUA,
+      1,
+      KEYS.job(streamId),
+      String(expectedCreatedAt),
+      providerExecutionId,
+      ownerId,
+      String(leaseMs),
+    );
+    if (!Array.isArray(raw) || raw.length !== 2) return false;
+    const fence = Number(raw[0]);
+    const leaseExpiresAt = Number(raw[1]);
+    if (!Number.isSafeInteger(fence) || fence <= 0 || !Number.isSafeInteger(leaseExpiresAt)) {
+      return false;
+    }
+    return Object.freeze({
+      streamId,
+      createdAt: expectedCreatedAt,
+      providerExecutionId,
+      ownerId,
+      fence,
+    });
+  }
+
+  async renewPiProviderOwner(owner: ProviderOwnerContext, leaseMs: number): Promise<boolean> {
+    if (!Number.isSafeInteger(leaseMs) || leaseMs < 1000 || leaseMs > 120_000) return false;
+    return (
+      Number(
+        await this.redis.eval(
+          PI_PROVIDER_RENEW_LUA,
+          2,
+          KEYS.job(owner.streamId),
+          KEYS.piToolAdmissions(owner.streamId, owner.createdAt),
+          String(owner.createdAt),
+          owner.providerExecutionId,
+          owner.ownerId,
+          String(owner.fence),
+          String(leaseMs),
+          String(TERMINAL_PERSISTENCE_RETENTION_TTL_S * 1000),
+          String(this.runningStorageTtlSeconds()),
+        ),
+      ) === 1
+    );
+  }
+
+  async assertPiProviderOwner(owner: ProviderOwnerContext): Promise<boolean> {
+    return (
+      Number(
+        await this.redis.eval(
+          PI_PROVIDER_ASSERT_LUA,
+          1,
+          KEYS.job(owner.streamId),
+          String(owner.createdAt),
+          owner.providerExecutionId,
+          owner.ownerId,
+          String(owner.fence),
+        ),
+      ) === 1
+    );
+  }
+
+  async admitPiToolInvocation(owner: ProviderOwnerContext, invocationId: string): Promise<boolean> {
+    if (invocationId.length === 0 || invocationId.length > 256) return false;
+    return (
+      Number(
+        await this.redis.eval(
+          PI_TOOL_ADMISSION_LUA,
+          2,
+          KEYS.job(owner.streamId),
+          KEYS.piToolAdmissions(owner.streamId, owner.createdAt),
+          String(owner.createdAt),
+          owner.providerExecutionId,
+          owner.ownerId,
+          String(owner.fence),
+          invocationId,
+          String(
+            Math.max(this.runningStorageTtlSeconds(), TERMINAL_PERSISTENCE_RETENTION_TTL_S) * 1000,
+          ),
+        ),
+      ) === 1
+    );
+  }
+
+  async claimExpiredPiProviderOwner(owner: ProviderOwnerContext): Promise<boolean> {
+    const job = await this.getJob(owner.streamId);
+    if (
+      job == null ||
+      job.createdAt !== owner.createdAt ||
+      job.providerExecutionId !== owner.providerExecutionId ||
+      job.providerOwnerId !== owner.ownerId ||
+      job.providerOwnerFence !== owner.fence ||
+      job.providerDrained !== false ||
+      !isPiAgentGeneration(job) ||
+      (job.status !== 'running' &&
+        job.status !== 'requires_action' &&
+        (!(job.status === 'complete' || job.status === 'error' || job.status === 'aborted') ||
+          job.terminalPersistencePending !== true))
+    ) {
+      return false;
+    }
+    const recoveryId = `pi-owner-lost:${owner.createdAt}:${owner.fence}`;
+    const transition = await this.transitionStatusAndDrainSteers(owner.streamId, {
+      from: job.status,
+      to: 'error',
+      expectCreatedAt: owner.createdAt,
+      expectExpiredProviderOwner: owner,
+      patch: {
+        error: PI_PROVIDER_OWNER_LOST_ERROR,
+        terminalPersistencePending: true,
+        providerRecoveryOutcome: 'outcome_unknown',
+        providerRecoveryId: recoveryId,
+        providerRecoveryFence: owner.fence,
+        providerRecoveryErrorCode: 'PI_PROVIDER_OWNER_LOST',
+      },
+      clear: [
+        'pendingAction',
+        'pendingActionId',
+        'piResumeContinuation',
+        'providerOwnerId',
+        'providerLeaseExpiresAt',
+      ],
+    });
+    return transition != null;
+  }
+
+  async getTerminalPersistencePendingJobs(): Promise<SerializableJobData[]> {
+    const members = await this.redis.smembers(KEYS.terminalPersistenceJobs);
+    if (members.length === 0) return [];
+    const indexed = members.map((member) => ({ member, ...parseTerminalHostActionMember(member) }));
+    const jobs = await Promise.all(indexed.map(({ streamId }) => this.getJob(streamId)));
+    const pending: SerializableJobData[] = [];
+    const stale: string[] = [];
+    for (let index = 0; index < indexed.length; index++) {
+      const job = jobs[index];
+      const item = indexed[index];
+      const awaitingRecoveryPublication =
+        job?.providerRecoveryOutcome === 'outcome_unknown' &&
+        job.providerRecoveryId != null &&
+        job.providerRecoveryPublishedId !== job.providerRecoveryId;
+      const awaitingTerminalPublication =
+        job?.terminalPublicationId != null &&
+        job.terminalPublicationPublishedId !== job.terminalPublicationId;
+      if (
+        job != null &&
+        job.createdAt === item.createdAt &&
+        (job.terminalPersistencePending === true ||
+          awaitingRecoveryPublication ||
+          awaitingTerminalPublication) &&
+        ['complete', 'error', 'aborted'].includes(job.status)
+      ) {
+        pending.push(job);
+      } else {
+        stale.push(item.member);
+      }
+    }
+    if (stale.length > 0) {
+      await this.redis.srem(KEYS.terminalPersistenceJobs, ...stale).catch(() => undefined);
+    }
+    return pending;
+  }
+
   async finalizeTerminalPersistence(
     streamId: string,
     expectedCreatedAt: number,
     finalEvent: string,
+    providerOwner?: ProviderOwnerContext,
+    terminalPublicationId?: string,
   ): Promise<boolean> {
-    return (
+    const finalized =
       Number(
         await this.redis.eval(
           TERMINAL_PERSISTENCE_FINALIZE_LUA,
@@ -2705,9 +3086,69 @@ export class RedisJobStore implements IJobStoreV2 {
           KEYS.job(streamId),
           String(expectedCreatedAt),
           finalEvent,
+          providerOwner?.ownerId ?? '',
+          providerOwner?.providerExecutionId ?? '',
+          providerOwner != null ? String(providerOwner.fence) : '',
+          terminalPublicationId ?? '',
         ),
-      ) === 1
-    );
+      ) === 1;
+    if (finalized) {
+      const job = await this.getJob(streamId).catch(() => null);
+      if (job?.providerRecoveryOutcome !== 'outcome_unknown' && terminalPublicationId == null) {
+        await this.redis
+          .srem(KEYS.terminalPersistenceJobs, terminalHostActionMember(streamId, expectedCreatedAt))
+          .catch(() => undefined);
+      }
+    }
+    return finalized;
+  }
+
+  async acknowledgePiProviderRecoveryPublication(
+    streamId: string,
+    expectedCreatedAt: number,
+    recoveryId: string,
+  ): Promise<boolean> {
+    const acknowledged =
+      Number(
+        await this.redis.eval(
+          ACK_PI_PROVIDER_RECOVERY_PUBLICATION_LUA,
+          1,
+          KEYS.job(streamId),
+          String(expectedCreatedAt),
+          recoveryId,
+        ),
+      ) === 1;
+    if (acknowledged) {
+      await this.redis.srem(
+        KEYS.terminalPersistenceJobs,
+        terminalHostActionMember(streamId, expectedCreatedAt),
+      );
+    }
+    return acknowledged;
+  }
+
+  async acknowledgeTerminalPublication(
+    streamId: string,
+    expectedCreatedAt: number,
+    publicationId: string,
+  ): Promise<boolean> {
+    const acknowledged =
+      Number(
+        await this.redis.eval(
+          ACK_TERMINAL_PUBLICATION_LUA,
+          1,
+          KEYS.job(streamId),
+          String(expectedCreatedAt),
+          publicationId,
+        ),
+      ) === 1;
+    if (acknowledged) {
+      await this.redis.srem(
+        KEYS.terminalPersistenceJobs,
+        terminalHostActionMember(streamId, expectedCreatedAt),
+      );
+    }
+    return acknowledged;
   }
 
   private sameMembershipSource(
@@ -3070,6 +3511,17 @@ export class RedisJobStore implements IJobStoreV2 {
     ).flat();
     const clearFields = (clear ?? []).map(String);
 
+    if (args.expectProviderOwner != null && args.expectExpiredProviderOwner != null) {
+      throw new Error('A status transition cannot assert active and expired Pi owners together');
+    }
+    const expectedProviderOwner = args.expectProviderOwner ?? args.expectExpiredProviderOwner;
+    let providerOwnerMode = '';
+    if (args.expectExpiredProviderOwner != null) {
+      providerOwnerMode = 'expired';
+    } else if (args.expectProviderOwner != null) {
+      providerOwnerMode = 'active';
+    }
+
     let ttl = terminal ? this.ttl.completed : this.runningStorageTtlSeconds();
     if (terminal && patch?.terminalPersistencePending === true) {
       ttl = Math.max(ttl, TERMINAL_PERSISTENCE_RETENTION_TTL_S);
@@ -3098,6 +3550,15 @@ export class RedisJobStore implements IJobStoreV2 {
           : KEYS.terminalHostActionJobs;
       await this.redis.sadd(
         terminalHostActionIndex,
+        terminalHostActionMember(streamId, terminalMemberCreatedAt),
+      );
+    }
+    if (terminal && patch?.terminalPersistencePending === true && terminalMemberCreatedAt != null) {
+      // This index is global because Redis Cluster cannot transact a cross-slot set
+      // with the generation hash. Pre-arm before the same-slot terminal CAS: a
+      // crash after CAS must leave another replica a durable discovery path.
+      await this.redis.sadd(
+        KEYS.terminalPersistenceJobs,
         terminalHostActionMember(streamId, terminalMemberCreatedAt),
       );
     }
@@ -3134,16 +3595,24 @@ export class RedisJobStore implements IJobStoreV2 {
       String(ttl),
       terminal ? '1' : '0',
       String(
-        terminal && patch?.terminalHostActionPending === true ? ttl : this.ttl.chunksAfterComplete,
+        terminal &&
+          (patch?.terminalHostActionPending === true || patch?.terminalPersistencePending === true)
+          ? ttl
+          : this.ttl.chunksAfterComplete,
       ),
       String(
-        terminal && patch?.terminalHostActionPending === true
+        terminal &&
+          (patch?.terminalHostActionPending === true || patch?.terminalPersistencePending === true)
           ? ttl
           : this.ttl.runStepsAfterComplete,
       ),
       String(this.parkedRecoveryTtlSeconds()),
       String(GENERATION_EPOCH_GRACE_TTL_S),
       String(args.steerReceiptTtlSeconds ?? 0),
+      expectedProviderOwner?.ownerId ?? '',
+      expectedProviderOwner?.providerExecutionId ?? '',
+      expectedProviderOwner != null ? String(expectedProviderOwner.fence) : '',
+      providerOwnerMode,
       returnDrainedSteers ? '1' : '0',
       String(clearFields.length),
       ...clearFields,
@@ -5199,8 +5668,14 @@ export class RedisJobStore implements IJobStoreV2 {
     expectedCreatedAt?: number,
     deliveredSteer?: SteerQueueItem,
     options?: { coalesce?: boolean },
+    providerOwner?: ProviderOwnerContext,
   ): Promise<boolean> {
-    if (options?.coalesce === true && deliveredSteer == null && this.coalesceWindowMs > 0) {
+    if (
+      providerOwner == null &&
+      options?.coalesce === true &&
+      deliveredSteer == null &&
+      this.coalesceWindowMs > 0
+    ) {
       return this.enqueueCoalescedAppend(streamId, event, expectedCreatedAt);
     }
     /** The chunk log is replayed in XADD order, so a per-event append (durable
@@ -5222,7 +5697,7 @@ export class RedisJobStore implements IJobStoreV2 {
     // {streamId} hash tag, so the multi-key eval stays on one slot under Redis Cluster.
     const appended = await this.redis.eval(
       CHUNK_APPEND_LUA,
-      8,
+      9,
       key,
       jobKey,
       KEYS.steerReceipts(streamId),
@@ -5231,6 +5706,7 @@ export class RedisJobStore implements IJobStoreV2 {
       KEYS.steers(streamId),
       KEYS.parkedSteers(streamId),
       KEYS.generationEpoch(streamId),
+      KEYS.piToolAdmissions(streamId, expectedCreatedAt ?? 0),
       JSON.stringify(event),
       String(this.runningStorageTtlSeconds()),
       expectedCreatedAt != null ? String(expectedCreatedAt) : '',
@@ -5239,6 +5715,12 @@ export class RedisJobStore implements IJobStoreV2 {
       String(Date.now()),
       String(this.parkedRecoveryTtlSeconds()),
       String(GENERATION_EPOCH_GRACE_TTL_S),
+      providerOwner?.ownerId ?? '',
+      providerOwner?.providerExecutionId ?? '',
+      providerOwner != null ? String(providerOwner.fence) : '',
+      String(
+        Math.max(this.runningStorageTtlSeconds(), TERMINAL_PERSISTENCE_RETENTION_TTL_S) * 1000,
+      ),
     );
     return appended === 1;
   }
@@ -5416,6 +5898,7 @@ export class RedisJobStore implements IJobStoreV2 {
     streamId: string,
     runSteps: Agents.RunStep[],
     expectedCreatedAt?: number,
+    providerOwner?: ProviderOwnerContext,
   ): Promise<void> {
     await this.redis.eval(
       RUNSTEPS_SAVE_LUA,
@@ -5425,6 +5908,9 @@ export class RedisJobStore implements IJobStoreV2 {
       JSON.stringify(runSteps),
       String(this.runningStorageTtlSeconds()),
       expectedCreatedAt != null ? String(expectedCreatedAt) : '',
+      providerOwner?.ownerId ?? '',
+      providerOwner?.providerExecutionId ?? '',
+      providerOwner != null ? String(providerOwner.fence) : '',
     );
   }
 
@@ -5689,6 +6175,8 @@ export class RedisJobStore implements IJobStoreV2 {
       sender: data.sender || undefined,
       syncSent: data.syncSent === '1',
       finalEvent: data.finalEvent || undefined,
+      terminalPublicationId: data.terminalPublicationId || undefined,
+      terminalPublicationPublishedId: data.terminalPublicationPublishedId || undefined,
       terminalPersistencePending:
         data.terminalPersistencePending != null
           ? data.terminalPersistencePending === '1'
@@ -5696,6 +6184,27 @@ export class RedisJobStore implements IJobStoreV2 {
       terminalPersistenceStartedAt: data.terminalPersistenceStartedAt
         ? parseInt(data.terminalPersistenceStartedAt, 10)
         : undefined,
+      providerOwnerId: data.providerOwnerId || undefined,
+      providerOwnerFence: data.providerOwnerFence
+        ? parseInt(data.providerOwnerFence, 10)
+        : undefined,
+      providerLeaseExpiresAt: data.providerLeaseExpiresAt
+        ? parseInt(data.providerLeaseExpiresAt, 10)
+        : undefined,
+      providerRecoveryOutcome:
+        data.providerRecoveryOutcome === 'outcome_unknown' ? 'outcome_unknown' : undefined,
+      providerRecoveryId: data.providerRecoveryId || undefined,
+      providerRecoveryPublishedId: data.providerRecoveryPublishedId || undefined,
+      providerRecoveryFence: data.providerRecoveryFence
+        ? parseInt(data.providerRecoveryFence, 10)
+        : undefined,
+      providerOwnerLostAt: data.providerOwnerLostAt
+        ? parseInt(data.providerOwnerLostAt, 10)
+        : undefined,
+      providerRecoveryErrorCode:
+        data.providerRecoveryErrorCode === 'PI_PROVIDER_OWNER_LOST'
+          ? 'PI_PROVIDER_OWNER_LOST'
+          : undefined,
       endpoint: data.endpoint || undefined,
       iconURL: data.iconURL || undefined,
       model: data.model || undefined,

@@ -6,6 +6,11 @@
 const { ErrorTypes, ResourceType } = require('librechat-data-provider');
 
 const mockProcessStream = jest.fn().mockResolvedValue(undefined);
+const mockGetRemotePiToolPlan = jest.fn(() => []);
+const mockExecuteRemotePiGeneration = jest.fn(async ({ handlers }) => {
+  await mockProcessStream(handlers);
+  return { status: 'completed', usage: [] };
+});
 const mockSpendTokens = jest.fn().mockResolvedValue({});
 const mockSpendStructuredTokens = jest.fn().mockResolvedValue({});
 const mockRecordCollectedUsage = jest
@@ -164,6 +169,11 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
+jest.mock('../remotePi', () => ({
+  getRemotePiToolPlan: (...args) => mockGetRemotePiToolPlan(...args),
+  executeRemotePiGeneration: (...args) => mockExecuteRemotePiGeneration(...args),
+}));
+
 jest.mock('@librechat/agents', () => ({
   ...jest.requireActual('@librechat/agents'),
   Callback: { TOOL_ERROR: 'TOOL_ERROR' },
@@ -184,8 +194,6 @@ jest.mock('@librechat/api', () => ({
   /* Provisioning moved into this package; the controllers build the callback from it. */
   createProvisionFilesCallback: () => async () => {},
   createAgentExecutionContext: (context) => context,
-  assertLegacyRuntimeCompatibleGraph: (...args) =>
-    jest.requireActual('@librechat/api').assertLegacyRuntimeCompatibleGraph(...args),
   resolveApiConversationProject: jest.fn((...args) =>
     jest.requireActual('@librechat/api').resolveApiConversationProject(...args),
   ),
@@ -543,8 +551,7 @@ describe('OpenAIChatCompletionController', () => {
       for (const name of names) api[name].mockImplementation(actual[name]);
       req.body.stream = streaming;
       api.validateRequest.mockReturnValueOnce({ request: req.body });
-      mockProcessStream.mockImplementationOnce(async () => {
-        const { customHandlers: handlers } = api.createRun.mock.calls.at(-1)[0];
+      mockProcessStream.mockImplementationOnce(async (handlers) => {
         expect(handlers.on_run_step).toBeUndefined();
         expect(handlers.on_run_step_delta).toBeUndefined();
         expect(handlers.on_run_step_completed).toBeUndefined();
@@ -605,8 +612,7 @@ describe('OpenAIChatCompletionController', () => {
       for (const name of names) api[name].mockImplementation(actual[name]);
       req.body.stream = streaming;
       api.validateRequest.mockReturnValueOnce({ request: req.body });
-      mockProcessStream.mockImplementationOnce(async () => {
-        const { customHandlers: handlers } = api.createRun.mock.calls.at(-1)[0];
+      mockProcessStream.mockImplementationOnce(async (handlers) => {
         await handlers.on_model_response.handle('on_model_response', {
           type: 'model_response',
           id: 'discarded',
@@ -688,8 +694,7 @@ describe('OpenAIChatCompletionController', () => {
   it('discards client delegation on failure and ignores late accepted responses', async () => {
     const api = require('@librechat/api');
     api.validateRequest.mockReturnValueOnce({ request: req.body });
-    mockProcessStream.mockImplementationOnce(async () => {
-      const { customHandlers: handlers } = api.createRun.mock.calls.at(-1)[0];
+    mockProcessStream.mockImplementationOnce(async (handlers) => {
       await handlers.on_model_response.handle('on_model_response', {
         type: 'model_response',
         id: 'before-failure',
@@ -703,7 +708,7 @@ describe('OpenAIChatCompletionController', () => {
     await OpenAIChatCompletionController(req, res);
     expect(JSON.stringify(res.json.mock.calls)).not.toContain('DO_NOT_SEND');
     expect(api.buildNonStreamingResponse).not.toHaveBeenCalled();
-    const { customHandlers: handlers } = api.createRun.mock.calls.at(-1)[0];
+    const { handlers } = mockExecuteRemotePiGeneration.mock.calls.at(-1)[0];
     await handlers.on_model_response.handle('on_model_response', {
       type: 'model_response',
       id: 'too-late',
@@ -718,8 +723,7 @@ describe('OpenAIChatCompletionController', () => {
   it('fails closed on an invalid accepted client call without returning its arguments', async () => {
     const api = require('@librechat/api');
     api.validateRequest.mockReturnValueOnce({ request: req.body });
-    mockProcessStream.mockImplementationOnce(async () => {
-      const { customHandlers: handlers } = api.createRun.mock.calls.at(-1)[0];
+    mockProcessStream.mockImplementationOnce(async (handlers) => {
       await handlers.on_model_response.handle('on_model_response', {
         type: 'model_response',
         id: 'invalid-client',
@@ -839,110 +843,103 @@ describe('OpenAIChatCompletionController', () => {
     });
   });
 
-  it('resolves saved graph subagents for remote chat-completion runs', async () => {
-    const {
-      initializeAgent,
-      resolveSubagentGraphs,
-      createSubagentUsageSink,
-    } = require('@librechat/api');
-    const primaryConfig = {
-      id: 'agent-123',
-      model: 'gpt-4',
-      endpointTokenConfig: { 'gpt-4': { prompt: 1 } },
-      model_parameters: {},
-      toolRegistry: {},
-      edges: [],
-      subagents: {
-        enabled: true,
-        graphs: [{ type: 'team', agent_ids: ['agent-123'], edges: [] }],
-      },
-    };
-    initializeAgent.mockResolvedValueOnce(primaryConfig);
-    const memberTokenConfig = { 'custom-model': { prompt: 7 } };
-    const memberConfig = {
-      id: 'agent-graph-member',
-      endpointTokenConfig: memberTokenConfig,
-      agentContextAttachments: [{ file_id: 'member-file' }],
-    };
-    resolveSubagentGraphs.mockImplementationOnce(async ({ rootConfigs }, deps) => {
-      rootConfigs[0].subagentGraphConfigs = [
-        { definition: { type: 'team' }, memberConfigs: [memberConfig] },
-      ];
-      deps.onAgentInitialized('agent-graph-member', { id: 'agent-graph-member' }, memberConfig);
-    });
-    req.config.endpoints.agents.capabilities = ['subagents'];
-
-    await OpenAIChatCompletionController(req, res);
-
-    expect(resolveSubagentGraphs).toHaveBeenCalledWith(
-      expect.objectContaining({
-        primaryConfig,
-        rootConfigs: [primaryConfig],
-        signal: mockExecution.signal,
-        resourceType: ResourceType.REMOTE_AGENT,
-        memoryAvailable: true,
-      }),
-      expect.objectContaining({ getAgent: expect.any(Function) }),
-    );
-    const usageParams = mockRecordCollectedUsage.mock.calls[0][1];
-    expect(usageParams.endpointTokenConfig).toBe(primaryConfig.endpointTokenConfig);
-    expect(usageParams.resolveEndpointTokenConfig({ agentId: 'agent-graph-member' })).toBe(
-      memberTokenConfig,
-    );
-    expect(mockResolveMemoryAvailability).toHaveBeenCalledWith(
-      expect.objectContaining({ enabledCapabilities: expect.any(Set), user: req.user }),
-    );
-    expect(mockBuildAgentContextAttachmentsByAgentId).toHaveBeenCalledWith([
-      primaryConfig,
-      memberConfig,
-    ]);
-    expect(mockBuildAgentScopedContext).toHaveBeenCalledWith(
-      expect.objectContaining({ agentIds: ['agent-123', 'agent-graph-member'] }),
-    );
-    expect(mockApplyContextToAgent).toHaveBeenCalledWith(
-      expect.objectContaining({ agent: memberConfig, agentId: 'agent-graph-member' }),
-    );
-    expect(mockBuildInlineMemoryContext).toHaveBeenCalledWith(
-      expect.objectContaining({ agent: memberConfig, memoryAvailable: true }),
-    );
-    const { createRun } = require('@librechat/api');
-    expect(createRun).toHaveBeenCalledWith(
-      expect.objectContaining({
-        initialSessions: mockInitialSessions,
-        user: expect.objectContaining({ id: 'user-123' }),
-        traceContext: { endpoint: 'agents' },
-      }),
-    );
-    expect(createSubagentUsageSink).toHaveBeenCalledWith(expect.any(Array));
-  });
-
-  it('returns an unavailable-runtime error before creating a run for an allowlisted primary agent', async () => {
+  it('projects a compatible Chat Completions turn through the Pi host event handlers', async () => {
     const api = require('@librechat/api');
-    api.createErrorResponse.mockImplementationOnce((message, type, code) => ({
-      error: { message, type, code },
-    }));
-    req.config.endpoints.agents.runtime = { piAgentIds: ['agent-123'] };
-
-    await OpenAIChatCompletionController(req, res);
-
-    expect(res.status).toHaveBeenCalledWith(503);
-    expect(api.createErrorResponse).toHaveBeenCalledWith(
-      'The selected agent runtime is not available on this server.',
-      'server_error',
-      'AGENT_RUNTIME_UNAVAILABLE',
-    );
-    expect(res.json).toHaveBeenCalledWith({
-      error: {
-        message: 'The selected agent runtime is not available on this server.',
-        type: 'server_error',
-        code: 'AGENT_RUNTIME_UNAVAILABLE',
-      },
+    const actual = jest.requireActual('@librechat/api');
+    const originals = ['buildNonStreamingResponse', 'createOpenAIContentAggregator'].map((name) => [
+      name,
+      api[name].getMockImplementation(),
+    ]);
+    for (const [name] of originals) api[name].mockImplementation(actual[name]);
+    mockProcessStream.mockImplementationOnce(async (handlers) => {
+      await handlers.on_message_delta.handle('on_message_delta', {
+        delta: { content: [{ type: 'text', text: 'Pi projected reply.' }] },
+      });
     });
-    expect(api.createRun).not.toHaveBeenCalled();
-    expect(mockProcessStream).not.toHaveBeenCalled();
+
+    try {
+      await OpenAIChatCompletionController(req, res);
+
+      expect(mockGetRemotePiToolPlan).toHaveBeenCalledWith(
+        expect.objectContaining({ agent: expect.objectContaining({ id: 'agent-123' }) }),
+      );
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({
+          agent: expect.objectContaining({ id: 'agent-123' }),
+          handlers: expect.objectContaining({ on_message_delta: expect.any(Object) }),
+          messages: expect.any(Array),
+          toolDefinitions: expect.any(Array),
+        }),
+      );
+      expect(api.buildNonStreamingResponse).toHaveBeenCalledWith(
+        expect.anything(),
+        'Pi projected reply.',
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+        true,
+      );
+      expect(api.createRun).not.toHaveBeenCalled();
+    } finally {
+      for (const [name, implementation] of originals) api[name].mockImplementation(implementation);
+    }
   });
 
-  it('rejects a legacy run when any connected agent is allowlisted for Pi', async () => {
+  it('streams a Pi Chat Completions turn with the OpenAI SSE contract', async () => {
+    const api = require('@librechat/api');
+    const actual = jest.requireActual('@librechat/api');
+    const names = [
+      'createChunk',
+      'writeSSE',
+      'sendFinalChunk',
+      'createOpenAIStreamTracker',
+      'createOpenAIContentAggregator',
+    ];
+    const originals = names.map((name) => [name, api[name].getMockImplementation()]);
+    for (const name of names) api[name].mockImplementation(actual[name]);
+    api.validateRequest.mockReturnValueOnce({
+      request: { ...req.body, stream: true },
+    });
+    mockProcessStream.mockImplementationOnce(async (handlers) => {
+      await handlers.on_message_delta.handle('on_message_delta', {
+        delta: { content: [{ type: 'text', text: 'Pi streamed reply.' }] },
+      });
+      await handlers.on_reasoning_delta.handle('on_reasoning_delta', {
+        delta: { content: [{ type: 'reasoning', think: 'Pi reasoning.' }] },
+      });
+    });
+
+    try {
+      await OpenAIChatCompletionController(req, res);
+
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({
+          handlers: expect.objectContaining({
+            on_message_delta: expect.any(Object),
+            on_reasoning_delta: expect.any(Object),
+          }),
+        }),
+      );
+      expect(api.createRun).not.toHaveBeenCalled();
+
+      const frames = res.write.mock.calls
+        .map(([frame]) => frame)
+        .filter((frame) => typeof frame === 'string' && frame.startsWith('data: {'))
+        .map((frame) => JSON.parse(frame.slice('data: '.length)));
+      expect(frames.some((frame) => frame.choices[0].delta.content === 'Pi streamed reply.')).toBe(
+        true,
+      );
+      expect(frames.some((frame) => frame.choices[0].delta.reasoning === 'Pi reasoning.')).toBe(
+        true,
+      );
+      expect(frames.at(-1).choices[0].finish_reason).toBe('stop');
+      expect(res.write).toHaveBeenLastCalledWith('data: [DONE]\n\n');
+    } finally {
+      for (const [name, implementation] of originals) api[name].mockImplementation(implementation);
+    }
+  });
+
+  it('rejects a connected-agent graph from the OpenAI compatibility surface', async () => {
     const api = require('@librechat/api');
     const connectedAgent = {
       id: 'agent-pi-connected',
@@ -954,7 +951,6 @@ describe('OpenAIChatCompletionController', () => {
     api.createErrorResponse.mockImplementationOnce((message, type, code) => ({
       error: { message, type, code },
     }));
-    req.config.endpoints.agents.runtime = { piAgentIds: ['agent-pi-connected'] };
     api.initializeAgent.mockResolvedValueOnce({
       id: 'agent-123',
       model: 'gpt-4',
@@ -968,6 +964,9 @@ describe('OpenAIChatCompletionController', () => {
       skippedAgentIds: new Set(),
       userMCPAuthMap: undefined,
     });
+    mockGetRemotePiToolPlan.mockImplementationOnce(() => {
+      throw new (jest.requireActual('@librechat/api').AgentRuntimeUnavailableError)();
+    });
 
     await OpenAIChatCompletionController(req, res);
 
@@ -978,16 +977,19 @@ describe('OpenAIChatCompletionController', () => {
       'AGENT_RUNTIME_UNAVAILABLE',
     );
     expect(api.createRun).not.toHaveBeenCalled();
-    expect(mockProcessStream).not.toHaveBeenCalled();
+    expect(mockExecuteRemotePiGeneration).not.toHaveBeenCalled();
   });
 
-  it('runs a temporary conversation as temporary for Langfuse', async () => {
-    const { createRun } = require('@librechat/api');
+  it('forwards temporary conversation context to the Pi adapter', async () => {
     req.resolvedConversation = { isTemporary: true };
 
     await OpenAIChatCompletionController(req, res);
 
-    expect(createRun).toHaveBeenCalledWith(expect.objectContaining({ isTemporary: true }));
+    expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+      expect.objectContaining({
+        req: expect.objectContaining({ resolvedConversation: { isTemporary: true } }),
+      }),
+    );
   });
 
   it('uses collected usage for the non-streaming response', async () => {
@@ -1387,14 +1389,9 @@ describe('OpenAIChatCompletionController', () => {
 
   describe('safe error logging', () => {
     it('does not classify a client disconnect as an upstream model error', async () => {
-      const api = require('@librechat/api');
       const { logger } = require('@librechat/data-schemas');
       const abortError = Object.assign(new Error('request aborted'), { name: 'AbortError' });
       mockProcessStream.mockImplementationOnce(async () => {
-        const modelCallback = api.createRun.mock.calls
-          .at(-1)[0]
-          .modelCallbacks.find(({ name }) => name === 'librechat-upstream-model-error-tracker');
-        modelCallback.handleLLMError(abortError);
         res.once.mock.calls.find(([event]) => event === 'close')[1]();
         throw abortError;
       });
@@ -1421,13 +1418,9 @@ describe('OpenAIChatCompletionController', () => {
         },
       });
       req.config.filters = { messages: { pii: {} } };
-      mockProcessStream.mockImplementationOnce(async () => {
-        const modelCallback = api.createRun.mock.calls
-          .at(-1)[0]
-          .modelCallbacks.find(({ name }) => name === 'librechat-upstream-model-error-tracker');
-        modelCallback.handleLLMError(providerError);
-        throw new Error('graph failed', { cause: providerError });
-      });
+      mockProcessStream.mockRejectedValueOnce(
+        new Error('Pi provider failed', { cause: providerError }),
+      );
 
       await OpenAIChatCompletionController(req, res);
 
@@ -1471,13 +1464,7 @@ describe('OpenAIChatCompletionController', () => {
       res.flushHeaders.mockImplementationOnce(() => {
         res.headersSent = true;
       });
-      mockProcessStream.mockImplementationOnce(async () => {
-        api.createRun.mock.calls
-          .at(-1)[0]
-          .modelCallbacks.find(({ name }) => name === 'librechat-upstream-model-error-tracker')
-          .handleLLMError(providerError);
-        throw providerError;
-      });
+      mockProcessStream.mockRejectedValueOnce(providerError);
 
       await OpenAIChatCompletionController(req, res);
 
@@ -1497,7 +1484,7 @@ describe('OpenAIChatCompletionController', () => {
       );
     });
 
-    it('preserves the legacy provider error when protection is inactive', async () => {
+    it('preserves the provider error when protection is inactive', async () => {
       const api = require('@librechat/api');
       const rawValue = 'LEGACY-OPENAI-PROVIDER-ERROR';
       mockProcessStream.mockRejectedValueOnce(
@@ -1516,7 +1503,7 @@ describe('OpenAIChatCompletionController', () => {
     it.each([
       ['a management-only prompt', { prompts: { pii: {} } }],
       ['an inert message', { messages: { pii: { starterPatterns: [] } } }],
-    ])('preserves the legacy provider error for %s policy', async (_policy, filters) => {
+    ])('preserves the provider error for %s policy', async (_policy, filters) => {
       const api = require('@librechat/api');
       const rawValue = 'LEGACY-OPENAI-CONFIGURED-PROVIDER-ERROR';
       req.config.filters = filters;
@@ -1527,7 +1514,7 @@ describe('OpenAIChatCompletionController', () => {
       expect(api.createErrorResponse).toHaveBeenCalledWith(rawValue, 'server_error', null);
     });
 
-    it('preserves the legacy streamed provider error when protection is inactive', async () => {
+    it('preserves the streamed provider error when protection is inactive', async () => {
       const api = require('@librechat/api');
       const rawValue = 'LEGACY-OPENAI-STREAM-ERROR';
       api.validateRequest.mockReturnValueOnce({
@@ -1549,30 +1536,6 @@ describe('OpenAIChatCompletionController', () => {
         { content: `\n\nError: ${rawValue}` },
         'stop',
       );
-    });
-
-    it('logs bounded metadata for tool callback failures', async () => {
-      const { logger } = require('@librechat/data-schemas');
-      const rawValue = 'PRIVATE-OPENAI-TOOL-PAYLOAD';
-      const toolError = Object.assign(new Error(`Tool echoed ${rawValue}`), {
-        code: 'ERR_TOOL',
-        response: { status: 422, data: { output: rawValue } },
-      });
-      mockProcessStream.mockImplementationOnce(async (_input, _config, options) => {
-        options.callbacks.TOOL_ERROR({}, toolError, 'execute_code');
-      });
-
-      await OpenAIChatCompletionController(req, res);
-
-      expect(mockGetSafeErrorMetadata).toHaveBeenCalledWith(toolError);
-      const errorLog = logger.error.mock.calls.find(([message]) =>
-        message.includes('Tool Error "execute_code"'),
-      );
-      expect(errorLog).toEqual([
-        '[OpenAI API] Tool Error "execute_code"',
-        { type: 'Error', status: 422 },
-      ]);
-      expect(JSON.stringify(errorLog)).not.toContain(rawValue);
     });
   });
 
@@ -2129,30 +2092,10 @@ describe('OpenAIChatCompletionController', () => {
         }),
         expect.anything(),
       );
-      expect(createRun).toHaveBeenCalledWith(
-        expect.objectContaining({
-          requestBody: {
-            messageId: 'chatcmpl-mock-nanoid-123',
-            conversationId: 'conversation-123',
-            parentMessageId: 'parent-123',
-            codeEnvironmentMode: 'without_attached',
-          },
-        }),
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conversation-123' }),
       );
-      expect(mockProcessStream).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({
-          configurable: expect.objectContaining({
-            requestBody: {
-              messageId: 'chatcmpl-mock-nanoid-123',
-              conversationId: 'conversation-123',
-              parentMessageId: 'parent-123',
-              codeEnvironmentMode: 'without_attached',
-            },
-          }),
-        }),
-        expect.anything(),
-      );
+      expect(createRun).not.toHaveBeenCalled();
     });
 
     it('does not synthesize an MCP parent for a continuation that omits it', async () => {
@@ -2179,34 +2122,13 @@ describe('OpenAIChatCompletionController', () => {
       expect(requestBody).not.toHaveProperty('parentMessageId');
     });
 
-    it('should pass resolveRecursionLimit result to processStream config', async () => {
-      const { resolveRecursionLimit } = require('@librechat/api');
-      resolveRecursionLimit.mockReturnValueOnce(75);
+    it('routes remote Chat Completions through Pi without a Legacy recursion config', async () => {
+      const { createRun } = require('@librechat/api');
 
       await OpenAIChatCompletionController(req, res);
 
-      expect(mockProcessStream).toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({ recursionLimit: 75 }),
-        expect.anything(),
-      );
-    });
-
-    it('should call resolveRecursionLimit with agentsEConfig and agent', async () => {
-      const { resolveRecursionLimit } = require('@librechat/api');
-      const { getAgent } = require('~/models');
-      const mockAgent = { id: 'agent-123', name: 'Test', recursion_limit: 200 };
-      getAgent.mockResolvedValueOnce(mockAgent);
-
-      req.config = {
-        endpoints: {
-          agents: { recursionLimit: 100, maxRecursionLimit: 150, allowedProviders: [] },
-        },
-      };
-
-      await OpenAIChatCompletionController(req, res);
-
-      expect(resolveRecursionLimit).toHaveBeenCalledWith(req.config.endpoints.agents, mockAgent);
+      expect(mockExecuteRemotePiGeneration).toHaveBeenCalledTimes(1);
+      expect(createRun).not.toHaveBeenCalled();
     });
   });
 

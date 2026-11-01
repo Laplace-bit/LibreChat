@@ -1,16 +1,21 @@
 import type { AgentSessionEvent, PromptOptions } from '@earendil-works/pi-coding-agent';
 import type { PiPauseController, PiResumablePauseSignal } from './pause';
 import type { PiProviderEventFailure } from './providerEvents';
+import type { PiCallerToolCall } from './callerTools';
 import type { HostPiSession } from './session';
+import type { PiContentPart } from './history';
 import type { PiHostEvent } from './events';
 
 export interface PiHostEventBridgeOptions {
   session: HostPiSession;
   operation:
     | { kind: 'prompt'; text: string; options?: PromptOptions }
+    | { kind: 'ordered_prompt'; content: readonly PiContentPart[] }
     | { kind: 'continue_tool_result'; toolCallId: string };
   signal?: AbortSignal;
   pauseController?: PiPauseController;
+  /** A Responses caller-owned tool invocation that must end this Pi turn. */
+  getCallerToolHandoff?: () => PiCallerToolCall | undefined;
   translateEvent(event: AgentSessionEvent): readonly PiHostEvent[];
   handleHostEvent(event: PiHostEvent): void | Promise<void>;
   /** Shared with direct host tool events so the full run has one FIFO. */
@@ -79,6 +84,7 @@ export function createPiHostEventSequencer(
 export type PiHostSessionOutcome =
   | { status: 'completed' }
   | { status: 'cancelled' }
+  | { status: 'caller_tool_handoff'; call: PiCallerToolCall }
   | { status: 'paused'; signal: PiResumablePauseSignal }
   | { status: 'unsupported'; reason: 'multiple_tool_calls' }
   | { status: 'unsupported'; reason: 'provider_event'; failure: PiProviderEventFailure };
@@ -139,6 +145,9 @@ export async function executePiHostSession(
     for (const hostEvent of hostEvents) {
       enqueueHostEvent(hostEvent);
     }
+    if (event.type === 'agent_end' && options.getCallerToolHandoff?.() != null) {
+      void options.session.abort().catch(() => undefined);
+    }
     if (event.type === 'agent_end' && options.pauseController?.signal != null) {
       // The tool result has already entered Pi's transcript at agent_end. Abort
       // only now to stop AgentSession's outer auto-continue without racing it.
@@ -172,6 +181,9 @@ export async function executePiHostSession(
         case 'prompt':
           await options.session.prompt(options.operation.text, options.operation.options);
           break;
+        case 'ordered_prompt':
+          await options.session.promptContent(options.operation.content);
+          break;
         case 'continue_tool_result':
           await options.session.continueFromToolResult(options.operation.toolCallId);
           break;
@@ -191,14 +203,25 @@ export async function executePiHostSession(
       handlerFailure ??= { error };
     }
 
-    if (handlerFailure != null) {
+    const promptFailedBeforeCancellation = promptFailure != null && !promptWasCancelled;
+    if (
+      handlerFailure != null &&
+      (options.signal?.aborted !== true || promptFailedBeforeCancellation)
+    ) {
       throw handlerFailure.error;
+    }
+    if (options.signal?.aborted === true && !promptFailedBeforeCancellation) {
+      return { status: 'cancelled' };
     }
     const requestedPause = options.pauseController?.signal;
     if (promptFailure != null) {
       if (promptWasCancelled) {
         if (options.signal?.aborted) {
           return { status: 'cancelled' };
+        }
+        const callerToolHandoff = options.getCallerToolHandoff?.();
+        if (callerToolHandoff != null) {
+          return { status: 'caller_tool_handoff', call: callerToolHandoff };
         }
         if (
           requestedPause?.kind === 'tool_approval' ||
@@ -223,6 +246,10 @@ export async function executePiHostSession(
     // An external Stop wins if it races a pending pause while host events drain.
     if (options.signal?.aborted) {
       return { status: 'cancelled' };
+    }
+    const callerToolHandoff = options.getCallerToolHandoff?.();
+    if (callerToolHandoff != null) {
+      return { status: 'caller_tool_handoff', call: callerToolHandoff };
     }
     if (requestedPause?.kind === 'tool_approval' || requestedPause?.kind === 'ask_user_question') {
       return { status: 'paused', signal: requestedPause };

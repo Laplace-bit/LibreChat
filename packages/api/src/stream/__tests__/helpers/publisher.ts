@@ -78,6 +78,11 @@ export function createMockPublisher(): MockPublisher {
       _generationEpochGraceTtl: string,
       _requireActiveJob: string,
       sequenceCount = '1',
+      _providerOwnerId: string,
+      _providerExecutionId: string,
+      _providerOwnerFence: string,
+      _providerRecoveryId: string,
+      _terminalPublicationId: string,
       ...chunkSuffixes: string[]
     ) => {
       if (_numKeys === 1) {

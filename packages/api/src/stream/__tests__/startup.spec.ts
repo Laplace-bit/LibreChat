@@ -17,6 +17,8 @@ import { registerChunkPublicationCapability } from '~/stream/internal/chunkPubli
 import { GenerationPublicationFencedError } from '~/stream/interfaces/IJobStore';
 import { buildToolApprovalPayload } from '~/agents/hitl/__fixtures__/approval';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
+import { PI_PROVIDER_HEARTBEAT_MS } from '~/stream/interfaces/IJobStore';
+import { PINNED_PI_AGENT_RUNTIME } from '~/agents/runtime/selection';
 import { buildPendingAction } from '~/agents/hitl/policy';
 
 function createTelemetry(): jest.Mocked<AgentStartupTelemetry> {
@@ -124,6 +126,68 @@ it('keeps a fresh terminal writer and its DONE subscription when cleanup reaps a
     expect(onDone).toHaveBeenCalledTimes(1);
     expect(onError).not.toHaveBeenCalled();
     await manager.finishTerminalJob(claim!);
+    subscription?.unsubscribe();
+  } finally {
+    await manager.destroy();
+  }
+});
+
+it('keeps terminal publication indexed until publish succeeds and ACK can be retried', async () => {
+  const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+  const transport = new InMemoryEventTransport();
+  const manager = new GenerationJobManagerClass();
+  manager.configure({
+    jobStore: store,
+    eventTransport: transport,
+    isRedis: false,
+    cleanupOnComplete: false,
+  });
+  manager.initialize();
+  const onDone = jest.fn();
+  const onError = jest.fn();
+
+  try {
+    const job = await manager.createJob('terminal-publication-outbox-retry', 'user-1');
+    const subscription = await manager.subscribe(job.streamId, () => undefined, onDone, onError);
+    const claim = await manager.claimTerminalJob(
+      job.streamId,
+      'complete',
+      undefined,
+      job.createdAt,
+      { persistencePending: true },
+    );
+    if (!claim) throw new Error('Expected a terminal claim.');
+
+    jest
+      .spyOn(store, 'acknowledgeTerminalPublication')
+      .mockRejectedValueOnce(new Error('simulated crash after publish'));
+    const finalEvent = {
+      final: true,
+      terminalStatus: 'complete',
+      generationCreatedAt: job.createdAt,
+    } as ServerSentEvent;
+
+    await expect(manager.publishTerminalClaim(claim, finalEvent)).rejects.toThrow(
+      'simulated crash after publish',
+    );
+    await expect(store.getJob(job.streamId)).resolves.toMatchObject({
+      terminalPersistencePending: false,
+      terminalPublicationId: `terminal:${job.createdAt}`,
+    });
+    await expect(store.getTerminalPersistencePendingJobs()).resolves.toHaveLength(1);
+
+    // Reading the durable job replays the unacknowledged outbox. The transport
+    // suppresses a duplicate frame, then the store ACK removes the retry entry.
+    await expect(manager.getJob(job.streamId)).resolves.toBeDefined();
+    await expect(store.getJob(job.streamId)).resolves.toMatchObject({
+      terminalPublicationPublishedId: `terminal:${job.createdAt}`,
+    });
+    await expect(store.getTerminalPersistencePendingJobs()).resolves.toHaveLength(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalled();
+
+    await manager.finishTerminalJob(claim);
     subscription?.unsubscribe();
   } finally {
     await manager.destroy();
@@ -275,6 +339,55 @@ describe('GenerationJobManager startup telemetry', () => {
       job.metadata.providerExecutionId!,
     );
     await manager.destroy();
+  });
+
+  it('drains a stopped Pi heartbeat before a late renewal can abort the segment', async () => {
+    jest.useFakeTimers();
+    const jobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const manager = new GenerationJobManagerClass();
+    manager.configure({
+      jobStore,
+      eventTransport: new InMemoryEventTransport(),
+      isRedis: false,
+      cleanupOnComplete: false,
+    });
+    manager.initialize();
+    let finishRenewal: ((renewed: boolean) => void) | undefined;
+    const renew = jest.spyOn(jobStore, 'renewPiProviderOwner').mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishRenewal = resolve;
+        }),
+    );
+
+    try {
+      const streamId = 'stream-pi-heartbeat-drain-race';
+      const job = await manager.createJob(streamId, 'user-1', streamId, {
+        initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+      });
+      const providerExecutionId = job.metadata.providerExecutionId!;
+      await expect(
+        manager.beginProviderExecution(streamId, job.createdAt, providerExecutionId),
+      ).resolves.toBe(true);
+
+      await jest.advanceTimersByTimeAsync(PI_PROVIDER_HEARTBEAT_MS);
+      expect(renew).toHaveBeenCalledTimes(1);
+      expect(finishRenewal).toBeDefined();
+
+      await expect(
+        manager.markProviderExecutionDrained(streamId, job.createdAt, providerExecutionId),
+      ).resolves.toBe(true);
+      expect(job.abortController.signal.aborted).toBe(false);
+
+      // The stopped heartbeat may still receive its in-flight negative reply.
+      finishRenewal?.(false);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(job.abortController.signal.aborted).toBe(false);
+    } finally {
+      jest.useRealTimers();
+      manager.prepareForShutdown();
+      await manager.destroy();
+    }
   });
 
   it('waits for provider-owner drain proof before destructive abort returns', async () => {
@@ -609,12 +722,14 @@ describe('GenerationJobManager startup telemetry', () => {
       'stream-hot-path',
       firstDelta,
       job.createdAt,
+      { providerOwner: undefined },
     );
     expect(publishWithReceipt).toHaveBeenNthCalledWith(
       2,
       'stream-hot-path',
       laterDelta,
       job.createdAt,
+      { providerOwner: undefined },
     );
     expect(emitChunk).not.toHaveBeenCalled();
 
@@ -2209,6 +2324,9 @@ describe('GenerationJobManager startup telemetry', () => {
         streamId,
         expect.objectContaining({ final: true, aborted: true }),
         job.createdAt,
+        undefined,
+        undefined,
+        `terminal:${job.createdAt}`,
       );
       await expect(jobStore.getJob(streamId)).resolves.toMatchObject({
         createdAt: job.createdAt,
@@ -2281,6 +2399,9 @@ describe('GenerationJobManager startup telemetry', () => {
         streamId,
         completionFinal,
         job.createdAt,
+        undefined,
+        undefined,
+        `terminal:${job.createdAt}`,
       );
       await expect(jobStore.getJob(streamId)).resolves.toMatchObject({
         createdAt: job.createdAt,
@@ -3863,6 +3984,9 @@ describe('GenerationJobManager startup telemetry', () => {
         reconcileReason: 'abort_persistence_failed',
       }),
       job.createdAt,
+      undefined,
+      undefined,
+      `terminal:${job.createdAt}`,
     );
     expect(eventTransport.emitDone).not.toHaveBeenCalledWith(
       streamId,
@@ -4231,6 +4355,7 @@ describe('GenerationJobManager startup telemetry', () => {
       'stream-shutdown-owned',
       'Generation interrupted because its server shut down',
       job.createdAt,
+      undefined,
     );
   });
 

@@ -14,6 +14,7 @@ import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTr
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
 import {
+  consumeSteersAtTurnEnd,
   createSteerDrainHook,
   createSteerPreemptBoundaryHook,
   createSteerTerminalContinuationHook,
@@ -329,6 +330,36 @@ describe('createSteerDrainHook', () => {
     expect((await GenerationJobManager.steering.peek(streamId)).map((item) => item.text)).toEqual([
       'survives',
     ]);
+  });
+
+  it('restores a claimed steer and fails closed if Pi loses ownership before durable apply', async () => {
+    const streamId = `drain-owner-fence-${Date.now()}`;
+    const job = await GenerationJobManager.createJob(streamId, 'user-1');
+    const queued = buildSteer('s1', 'survives an owner handoff');
+    await GenerationJobManager.steering.enqueue(streamId, queued, job.createdAt);
+    const assertProviderOwner = jest
+      .fn<Promise<boolean>, [AbortSignal | undefined]>()
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(false);
+    const applySteer = jest.fn();
+    const deliver = jest.fn();
+
+    await expect(
+      consumeSteersAtTurnEnd(
+        {
+          streamId,
+          jobCreatedAt: job.createdAt,
+          assertProviderOwner,
+          applySteer,
+        },
+        abortSignal,
+        { deliver },
+      ),
+    ).rejects.toMatchObject({ code: 'PROVIDER_OWNER_FENCED' });
+
+    expect(applySteer).not.toHaveBeenCalled();
+    expect(deliver).not.toHaveBeenCalled();
+    expect(await GenerationJobManager.steering.peek(streamId, job.createdAt)).toEqual([queued]);
   });
 
   it('injects encoded media content for steers that carry files', async () => {

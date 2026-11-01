@@ -1,12 +1,12 @@
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
-import test from 'node:test';
+import { GraphEvents } from '@librechat/agents';
+import { Tools, UsageEvents } from 'librechat-data-provider';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { GraphEvents } from '@librechat/agents';
 import { HumanMessage, SystemMessage } from '@librechat/agents/langchain/messages';
-import { Tools, UsageEvents } from 'librechat-data-provider';
 
 const require = createRequire(import.meta.url);
 const {
@@ -299,6 +299,7 @@ function generationInput({
       user_id: `user-${agentId}`,
       agent_id: agentId,
     },
+    authorize: async () => true,
   });
 
   return {

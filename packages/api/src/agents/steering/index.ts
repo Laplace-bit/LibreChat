@@ -1,4 +1,5 @@
 export {
+  consumeSteersAtTurnEnd,
   createSteerDrainHook,
   createSteerPreemptBoundaryHook,
   createSteerTerminalContinuationHook,
@@ -9,6 +10,8 @@ export {
   isSteerTerminalContinuationSupported,
 } from './runtime';
 export type {
+  SteerTurnEndConsumerOptions,
+  SteerTurnEndDelivery,
   SteerDrainHookOptions,
   SteerMediaResult,
   TerminalSteerHook,

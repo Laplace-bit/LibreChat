@@ -7,6 +7,7 @@ import type { Agents } from 'librechat-data-provider';
 import type {
   IJobStoreV2,
   JobMetadataPatch,
+  ProviderOwnerContext,
   SerializableJobData,
   SteerQueueItem,
 } from '~/stream/interfaces/IJobStore';
@@ -21,6 +22,7 @@ import {
 } from '~/stream/interfaces/IJobStore';
 
 export interface ApprovalLifecycleCallbacks {
+  getProviderOwner?: (streamId: string, createdAt: number) => ProviderOwnerContext | undefined;
   onPaused?: (streamId: string, createdAt: number) => void;
   onResumed?: (streamId: string, createdAt: number) => void;
   onExpired?: (streamId: string, createdAt: number) => void;
@@ -132,6 +134,7 @@ export class ApprovalLifecycle {
       return false;
     }
     const expectedCreatedAt = options.expectedCreatedAt ?? job.createdAt;
+    const providerOwner = this.callbacks.getProviderOwner?.(streamId, expectedCreatedAt);
     const discoveredTools = options.discoveredTools;
     const activityPhaseSnapshot = options.activityPhaseSnapshot;
     const compactionSemanticIndex = options.compactionSemanticIndex;
@@ -152,6 +155,7 @@ export class ApprovalLifecycle {
       ok = await this.store.transitionStatus(streamId, {
         from: 'running',
         to: 'requires_action',
+        ...(providerOwner != null && { expectProviderOwner: providerOwner }),
         // pendingActionId is the flat mirror the atomic resolve/expire guard on.
         patch: {
           pendingAction,
@@ -229,16 +233,23 @@ export class ApprovalLifecycle {
     expectedActionId: string,
     expectedCreatedAt?: number,
   ): Promise<boolean> {
+    const job = await this.store.getJob(streamId);
+    const createdAt = expectedCreatedAt ?? job?.createdAt;
+    const providerOwner =
+      createdAt != null && job?.createdAt === createdAt
+        ? this.callbacks.getProviderOwner?.(streamId, createdAt)
+        : undefined;
     return this.store.transitionStatus(streamId, {
       from: 'requires_action',
       to: 'requires_action',
+      ...(providerOwner != null && { expectProviderOwner: providerOwner }),
       patch: {
         pendingActionId: expectedActionId,
         terminalPersistencePending: false,
       },
       clear: ['terminalPersistenceStartedAt'],
       expectActionId: pausePersistenceActionId(expectedActionId),
-      expectCreatedAt: expectedCreatedAt,
+      expectCreatedAt: createdAt,
     });
   }
 
@@ -314,9 +325,11 @@ export class ApprovalLifecycle {
     }
 
     const completedAt = Date.now();
+    const providerOwner = this.callbacks.getProviderOwner?.(streamId, job.createdAt);
     const drainedSteers = await this.store.transitionStatusAndDrainSteers(streamId, {
       from: 'requires_action',
       to: 'error',
+      ...(providerOwner != null && { expectProviderOwner: providerOwner }),
       expectActionId: job.pendingActionId,
       expectCreatedAt: job.createdAt,
       patch: {

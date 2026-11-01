@@ -10,10 +10,18 @@ import type { IJobStore, IJobStoreV2 } from './interfaces/IJobStore';
  */
 export const JOB_STORE_V2_REQUIRED_METHODS = [
   'acknowledgeReplacedJobs',
+  'acquirePiProviderOwner',
+  'renewPiProviderOwner',
+  'assertPiProviderOwner',
+  'admitPiToolInvocation',
+  'claimExpiredPiProviderOwner',
   'markProviderExecutionDrained',
   'beginProviderExecution',
   'getCleanupBlockingJobIdsByUser',
   'finalizeTerminalPersistence',
+  'getTerminalPersistencePendingJobs',
+  'acknowledgePiProviderRecoveryPublication',
+  'acknowledgeTerminalPublication',
   'transitionStatusAndDrainSteers',
   'takeoverIdempotencyKey',
   'markIdempotencyKeyStarted',

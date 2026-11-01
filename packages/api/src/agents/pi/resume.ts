@@ -867,12 +867,7 @@ export function appendPiToolResultContinuation(input: {
   now?: () => number;
 }): PiHistoryMessage[] {
   const now = input.now ?? Date.now;
-  const promptContent = [
-    ...(input.conversion.prompt.text.length === 0
-      ? []
-      : [{ type: 'text' as const, text: input.conversion.prompt.text }]),
-    ...input.conversion.prompt.images,
-  ];
+  const promptContent = input.conversion.prompt.content;
   const assistant: AssistantMessage = {
     role: 'assistant',
     content: [

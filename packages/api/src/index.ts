@@ -155,6 +155,7 @@ export * from './agents/pi/actionSchema';
 export * from './agents/pi/tools';
 export * from './agents/pi/codeSession';
 export * from './agents/pi/history';
+export * from './agents/pi/steering';
 export * from './agents/pi/resume';
 export * from './agents/runtime/selection';
 export * from './agents/runtime/execution';

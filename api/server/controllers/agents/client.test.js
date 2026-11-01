@@ -2753,18 +2753,11 @@ describe('AgentClient - startup telemetry', () => {
     },
   );
 
-  it('uses request-scoped hook resolution when deciding whether a scheduled run can pause', async () => {
+  it('rejects scheduled Agent runs instead of selecting another execution engine', async () => {
     mockIsHITLEnabled.mockReturnValue(true);
     registerToolApprovalHook((context) =>
       context.userId === 'different-user' ? async () => ({ decision: 'ask' }) : undefined,
     );
-    const processStream = jest.fn().mockResolvedValue();
-    mockCreateRun.mockResolvedValueOnce({
-      Graph: null,
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-      getInterrupt: jest.fn(() => undefined),
-    });
     const client = new AgentClient({
       req: {
         user: { id: 'user-123' },
@@ -2780,6 +2773,7 @@ describe('AgentClient - startup telemetry', () => {
         _resumableStreamId: 'scheduled-request-scoped-hook',
       },
       res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       agent: {
         id: 'agent-123',
         endpoint: EModelEndpoint.openAI,
@@ -2801,7 +2795,11 @@ describe('AgentClient - startup telemetry', () => {
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
     await expect(client.chatCompletion({ payload: [] })).resolves.toBeUndefined();
-    expect(mockCreateRun.mock.calls.at(-1)?.[0]?.resolvedToolApprovalHooks).toEqual([]);
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
   });
 
   it('admits deployment PreToolUse hooks as pause-capable for scheduled runs', async () => {
@@ -3009,13 +3007,6 @@ describe('AgentClient - startup telemetry', () => {
         providedEntryCount: compactionSemanticIndex.length,
       },
     });
-    const processStream = jest.fn().mockResolvedValue();
-    mockCreateRun.mockResolvedValueOnce({
-      Graph: null,
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-      getInterrupt: jest.fn(() => undefined),
-    });
     const client = new AgentClient({
       req: {
         user: { id: 'user-123' },
@@ -3024,6 +3015,7 @@ describe('AgentClient - startup telemetry', () => {
         _resumableStreamId: 'semantic-index-conversation',
       },
       res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       agent: {
         id: 'agent-primary',
         endpoint: EModelEndpoint.openAI,
@@ -3068,10 +3060,11 @@ describe('AgentClient - startup telemetry', () => {
     expect(formatOptions.compactionSemanticIndex.intentToolNames).toEqual(
       new Set(['web_search', 'read_file']),
     );
-    expect(mockCreateRun).toHaveBeenCalledWith(
-      expect.objectContaining({ compactionSemanticIndex }),
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
     );
-    expect(processStream).toHaveBeenCalledTimes(1);
   });
 
   it('preserves provider messages while deriving the full semantic index', () => {
@@ -4591,7 +4584,7 @@ describe('AgentClient - titleConvo', () => {
           model_parameters: { model: 'claude-sonnet-4-5' },
         };
         const anthropicClient = new AgentClient({ req, res: {}, agent, endpointTokenConfig: {} });
-        anthropicClient.run = mockRun;
+        anthropicClient.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
         anthropicClient.responseMessageId = 'response-123';
         anthropicClient.conversationId = 'convo-123';
         anthropicClient.contentParts = [{ type: 'text', text: 'Test content' }];
@@ -4600,7 +4593,8 @@ describe('AgentClient - titleConvo', () => {
         await anthropicClient.titleConvo({ text: 'Hello', abortController: new AbortController() });
 
         const defaultHeaders =
-          mockRun.generateTitle.mock.calls[0][0].clientOptions?.clientOptions?.defaultHeaders;
+          mockGenerateAgentConversationTitle.mock.calls[0][0].clientOptions?.clientOptions
+            ?.defaultHeaders;
         // Custom header survives the `omitTitleOptions` strip and resolves the conversationId
         expect(defaultHeaders?.['X-Conversation-Id']).toBe('convo-123');
         // Provider-managed beta header is preserved alongside it
@@ -10388,12 +10382,15 @@ describe('AgentClient - Pi generation dispatch', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    jest.spyOn(GenerationJobManager, 'admitPiToolInvocation').mockResolvedValue(true);
+    jest.spyOn(GenerationJobManager, 'assertPiProviderOwner').mockResolvedValue(true);
     mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
     mockExecutePiGeneration.mockResolvedValue({ status: 'completed', usage: [] });
     mockIsHITLEnabled.mockReturnValue(false);
   });
 
   afterEach(() => {
+    jest.restoreAllMocks();
     mockFormatAgentMessages.mockReset();
     mockFormatAgentMessages.mockReturnValue({
       messages: [],

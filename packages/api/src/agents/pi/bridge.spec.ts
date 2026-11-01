@@ -51,6 +51,9 @@ function createSession(
     prompt() {
       return runPrompt((event) => listener?.(event));
     },
+    promptContent() {
+      return runPrompt((event) => listener?.(event));
+    },
     continueFromToolResult() {
       return runPrompt((event) => listener?.(event));
     },
@@ -149,6 +152,34 @@ describe('executePiHostSession', () => {
     expect(harness.unsubscribeCount).toBe(1);
   });
 
+  it('runs an ordered prompt through the host session prompt boundary', async () => {
+    const content = [
+      { type: 'text' as const, text: 'before' },
+      { type: 'image' as const, mimeType: 'image/png', data: 'YQ==' },
+      { type: 'text' as const, text: 'after' },
+    ];
+    let receivedContent: unknown;
+    const harness = createSession(async (emit) => {
+      emit(sessionEvent('agent_end'));
+      emit(sessionEvent('agent_settled'));
+    });
+    const originalPromptContent = harness.session.promptContent;
+    harness.session.promptContent = async (value) => {
+      receivedContent = value;
+      await originalPromptContent(value);
+    };
+
+    await expect(
+      executePiHostSession({
+        session: harness.session,
+        operation: { kind: 'ordered_prompt', content },
+        translateEvent: () => [],
+        handleHostEvent: () => undefined,
+      }),
+    ).resolves.toEqual({ status: 'completed' });
+    expect(receivedContent).toEqual(content);
+  });
+
   it('continues a restored tool result without appending another user prompt', async () => {
     let listener: AgentSessionEventListener | undefined;
     let promptCalls = 0;
@@ -163,6 +194,9 @@ describe('executePiHostSession', () => {
         };
       },
       async prompt() {
+        promptCalls += 1;
+      },
+      async promptContent() {
         promptCalls += 1;
       },
       async continueFromToolResult(toolCallId) {
@@ -191,6 +225,28 @@ describe('executePiHostSession', () => {
     expect(continuationCalls).toEqual(['reviewed-call']);
   });
 
+  it('ends the Pi turn after a caller-owned function and returns its exact handoff', async () => {
+    const call = {
+      callId: 'call_exact_1',
+      name: 'lookup_order',
+      arguments: '{"order":"WO-42"}',
+    };
+    const harness = createSession(async (emit) => {
+      emit(sessionEvent('agent_end'));
+    });
+
+    await expect(
+      executePiHostSession({
+        session: harness.session,
+        operation: { kind: 'prompt', text: 'Look up WO-42.' },
+        translateEvent: () => [],
+        handleHostEvent: () => undefined,
+        getCallerToolHandoff: () => call,
+      }),
+    ).resolves.toEqual({ status: 'caller_tool_handoff', call });
+    expect(harness.abortCount).toBe(1);
+  });
+
   it('fails closed when a low-level continuation would need AgentSession retry handling', async () => {
     let listener: AgentSessionEventListener | undefined;
     let abortCalls = 0;
@@ -204,6 +260,7 @@ describe('executePiHostSession', () => {
         };
       },
       async prompt() {},
+      async promptContent() {},
       async continueFromToolResult() {
         listener?.({ type: 'agent_end', messages: [], willRetry: true });
       },
@@ -410,6 +467,42 @@ describe('executePiHostSession', () => {
     releaseHandler.resolve(undefined);
 
     await expect(execution).resolves.toEqual({ status: 'cancelled' });
+  });
+
+  it('treats a fenced host event as cancellation when the Pi owner is stopped', async () => {
+    const controller = new AbortController();
+    const promptAbortRequested = deferred<void>();
+    const handlerStarted = deferred<void>();
+    const releaseHandler = deferred<void>();
+    const harness = createSession(
+      async (emit) => {
+        emit(sessionEvent('agent_end'));
+        await promptAbortRequested.promise;
+        const abortError = new Error('Pi prompt aborted');
+        abortError.name = 'AbortError';
+        throw abortError;
+      },
+      () => promptAbortRequested.resolve(undefined),
+    );
+    const execution = executePiHostSession({
+      session: harness.session,
+      operation: { kind: 'prompt', text: 'hello' },
+      signal: controller.signal,
+      translateEvent: (event) => [createHostEvent(event.type)],
+      handleHostEvent: async () => {
+        handlerStarted.resolve(undefined);
+        await releaseHandler.promise;
+        throw new Error('stale event append fenced by replacement');
+      },
+    });
+
+    await handlerStarted.promise;
+    controller.abort();
+    await harness.session.abort();
+    releaseHandler.resolve(undefined);
+
+    await expect(execution).resolves.toEqual({ status: 'cancelled' });
+    expect(harness.unsubscribeCount).toBe(1);
   });
 
   it('does not subscribe when the host signal was already aborted', async () => {

@@ -1,9 +1,5 @@
 import type { SerializableJobData } from '~/stream/interfaces/IJobStore';
-import {
-  LEGACY_AGENT_RUNTIME,
-  PINNED_PI_AGENT_RUNTIME,
-  resolveStoredAgentRuntime,
-} from '~/agents/runtime/selection';
+import { PINNED_PI_AGENT_RUNTIME, resolveStoredAgentRuntime } from '~/agents/runtime/selection';
 import { RedisJobStore } from '../implementations/RedisJobStore';
 
 type JobSerializer = (job: Partial<SerializableJobData>) => Record<string, string>;
@@ -29,19 +25,16 @@ describe('RedisJobStore runtime identity persistence', () => {
     ...(agentRuntime !== undefined && { agentRuntime }),
   });
 
-  it('round-trips legacy and pinned Pi identities without changing old jobs', () => {
-    const legacy = readJob(serializeJob(job(LEGACY_AGENT_RUNTIME)));
+  it('round-trips Pi identity and leaves generic jobs unselected', () => {
     const pi = readJob(serializeJob(job(PINNED_PI_AGENT_RUNTIME)));
     const oldJobHash = serializeJob(job());
     delete oldJobHash.agentRuntime;
     const oldJob = readJob(oldJobHash);
 
-    expect(legacy.agentRuntime).toEqual(LEGACY_AGENT_RUNTIME);
     expect(pi.agentRuntime).toEqual(PINNED_PI_AGENT_RUNTIME);
     expect(oldJob.agentRuntime).toBeUndefined();
     expect(resolveStoredAgentRuntime(oldJob.agentRuntime)).toEqual({
-      status: 'resolved',
-      selection: LEGACY_AGENT_RUNTIME,
+      status: 'unselected',
     });
   });
 
@@ -59,26 +52,26 @@ describe('RedisJobStore runtime identity persistence', () => {
 
   it('rejects runtime identity changes before attempting a Redis write', async () => {
     await expect(
-      updateJob.call(store, 'stream-1', { agentRuntime: LEGACY_AGENT_RUNTIME }),
+      updateJob.call(store, 'stream-1', { agentRuntime: PINNED_PI_AGENT_RUNTIME }),
     ).rejects.toThrow('Generation runtime identity is immutable');
     await expect(
       updateJob.call(store, 'stream-1', {
         patch: {},
-        agentRuntime: LEGACY_AGENT_RUNTIME,
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
       }),
     ).rejects.toThrow('Generation runtime identity is immutable');
     await expect(
       transitionStatus.call(store, 'stream-1', {
         from: 'requires_action',
         to: 'running',
-        patch: { agentRuntime: LEGACY_AGENT_RUNTIME },
+        patch: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
       }),
     ).rejects.toThrow('Generation runtime identity is immutable');
     await expect(
       transitionStatus.call(store, 'stream-1', {
         from: 'requires_action',
         to: 'running',
-        patch: { patch: {}, agentRuntime: LEGACY_AGENT_RUNTIME },
+        patch: { patch: {}, agentRuntime: PINNED_PI_AGENT_RUNTIME },
       }),
     ).rejects.toThrow('Generation runtime identity is immutable');
     await expect(

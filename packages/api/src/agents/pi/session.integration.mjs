@@ -5,7 +5,7 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { StepTypes, Tools, UsageEvents } from 'librechat-data-provider';
+import { StepTypes, SteerEvents, Tools, UsageEvents } from 'librechat-data-provider';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
 import {
   AIMessage,
@@ -17,13 +17,16 @@ import {
 const require = createRequire(import.meta.url);
 const {
   convertLibreChatHistoryToPi,
+  consumeSteersAtTurnEnd,
   createHostPiSession,
+  createStreamServices,
   executePiGeneration,
+  GenerationJobManager,
+  PINNED_PI_AGENT_RUNTIME,
   PiContextBudgetExceededError,
   PiContextUsageUnavailableError,
   createPiContentEventTranslator,
-  LEGACY_AGENT_RUNTIME,
-  PINNED_PI_AGENT_RUNTIME,
+  convertPiSteerContent,
   resolveResumableAgentRuntime,
   resolveStoredAgentRuntime,
 } = require('../../../dist/index.cjs');
@@ -362,8 +365,9 @@ test('LibreChat history becomes structured Pi messages and preserves the current
         }),
         new HumanMessage({
           content: [
-            { type: 'text', text: 'What is in this image?' },
+            { type: 'text', text: 'Before the photo: ' },
             { type: 'image_url', image_url: { url: `data:image/png;base64,${tinyPngBase64}` } },
+            { type: 'text', text: ' What details stand out?' },
           ],
         }),
       ],
@@ -378,9 +382,14 @@ test('LibreChat history becomes structured Pi messages and preserves the current
     assert.equal(conversion.history[2].role, 'toolResult');
     assert.match(conversion.systemPrompt, /Host policy instructions\./);
     assert.match(conversion.systemPrompt, /Agent system instructions\./);
-    assert.equal(conversion.prompt.text, 'What is in this image?');
+    assert.equal(conversion.prompt.text, 'Before the photo:  What details stand out?');
     assert.deepEqual(conversion.prompt.images, [
       { type: 'image', mimeType: 'image/png', data: tinyPngBase64 },
+    ]);
+    assert.deepEqual(conversion.prompt.content, [
+      { type: 'text', text: 'Before the photo: ' },
+      { type: 'image', mimeType: 'image/png', data: tinyPngBase64 },
+      { type: 'text', text: ' What details stand out?' },
     ]);
 
     session = await createHostPiSession({
@@ -389,7 +398,9 @@ test('LibreChat history becomes structured Pi messages and preserves the current
       history: conversion.history,
       tools: [],
     });
-    await session.prompt(conversion.prompt.text, { images: conversion.prompt.images });
+    const lifecycleEvents = [];
+    session.subscribe((event) => lifecycleEvents.push(event.type));
+    await session.promptContent(conversion.prompt.content);
 
     const { messages } = fakeProvider.getRequestBody();
     assert.deepEqual(
@@ -400,10 +411,15 @@ test('LibreChat history becomes structured Pi messages and preserves the current
     assert.equal(messages[1].content, 'Previous user question.');
     assert.equal(messages[2].tool_calls[0].id, 'historical-query-1');
     assert.equal(messages[3].content, 'Stored result: 42 units.');
-    assert.ok(
-      JSON.stringify(messages[4].content).includes(tinyPngBase64),
-      JSON.stringify(messages[4].content),
+    assert.deepEqual(
+      messages[4].content.map(({ type }) => type),
+      ['text', 'image_url', 'text'],
     );
+    assert.equal(messages[4].content[0].text, 'Before the photo: ');
+    assert.equal(messages[4].content[1].image_url.url, `data:image/png;base64,${tinyPngBase64}`);
+    assert.equal(messages[4].content[2].text, ' What details stand out?');
+    assert.ok(lifecycleEvents.includes('agent_start'), lifecycleEvents.join(', '));
+    assert.ok(lifecycleEvents.includes('agent_settled'), lifecycleEvents.join(', '));
   } finally {
     try {
       await session?.dispose();
@@ -473,15 +489,9 @@ test('LibreChat history conversion rejects incomplete tool state, signatures, an
   );
 });
 
-test('generation runtime identity defaults old jobs to legacy and rejects unknown Pi versions', () => {
-  assert.deepEqual(resolveStoredAgentRuntime(undefined), {
-    status: 'resolved',
-    selection: LEGACY_AGENT_RUNTIME,
-  });
-  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'legacy' }), {
-    status: 'resolved',
-    selection: LEGACY_AGENT_RUNTIME,
-  });
+test('generation runtime identity is Pi-only and generic jobs stay unselected', () => {
+  assert.deepEqual(resolveStoredAgentRuntime(undefined), { status: 'unselected' });
+  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'legacy' }), { status: 'unsupported' });
   assert.deepEqual(resolveStoredAgentRuntime(PINNED_PI_AGENT_RUNTIME), {
     status: 'resolved',
     selection: PINNED_PI_AGENT_RUNTIME,
@@ -490,14 +500,8 @@ test('generation runtime identity defaults old jobs to legacy and rejects unknow
     status: 'unsupported',
   });
   assert.deepEqual(resolveStoredAgentRuntime(null), { status: 'unsupported' });
-  assert.deepEqual(resolveStoredAgentRuntime({ engine: 'legacy', sdkVersion: 'future' }), {
-    status: 'unsupported',
-  });
   assert.deepEqual(resolveStoredAgentRuntime({ engine: 'other' }), { status: 'unsupported' });
-  assert.deepEqual(resolveResumableAgentRuntime(undefined), {
-    status: 'available',
-    selection: LEGACY_AGENT_RUNTIME,
-  });
+  assert.deepEqual(resolveResumableAgentRuntime(undefined), { status: 'unavailable' });
   assert.deepEqual(resolveResumableAgentRuntime(PINNED_PI_AGENT_RUNTIME), {
     status: 'unavailable',
   });
@@ -1376,6 +1380,232 @@ test('Pi host session cancels its active provider request when the job signal ab
   assert.equal(generationAborted, true);
   assert.equal(fakeProvider.wasClientCancelled(), true);
   assert.equal(bindingDisposals, 1);
+});
+
+test('a durable queued steer is consumed before Pi sends its next provider request', async () => {
+  const streamId = `pi-steer-turn-end-${Date.now()}`;
+  const fakeProvider = await createFakeChatServer();
+  let job;
+  let providerExecutionStarted = false;
+  let appliedSteerCount = 0;
+
+  try {
+    await GenerationJobManager.destroy();
+    GenerationJobManager.configure({
+      ...createStreamServices({ useRedis: false }),
+      cleanupOnComplete: false,
+    });
+    GenerationJobManager.initialize();
+
+    job = await GenerationJobManager.createJob(streamId, 'user-pi-steer', streamId, {
+      initialMetadata: {
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
+        agent_id: 'agent-pi-steer',
+        responseMessageId: `response-${streamId}`,
+      },
+    });
+    assert.equal(
+      await GenerationJobManager.beginProviderExecution(
+        streamId,
+        job.createdAt,
+        job.metadata.providerExecutionId,
+      ),
+      true,
+      'the Pi runtime owns this generation before consuming queued input',
+    );
+    providerExecutionStarted = true;
+
+    const queuedSteer = {
+      steerId: `steer-${streamId}`,
+      text: 'Use the updated safety threshold from the latest inspection.',
+      userId: 'user-pi-steer',
+      createdAt: Date.now(),
+    };
+    assert.equal(
+      await GenerationJobManager.steering.enqueue(streamId, queuedSteer, job.createdAt),
+      1,
+      'the shared GenerationJobManager queue accepts the steer',
+    );
+
+    const modelBinding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => undefined);
+    const outcome = await executePiGeneration({
+      messages: [new HumanMessage('Summarize the current safety status.')],
+      createModelBinding: async () => modelBinding,
+      createStepIdentity: () => ({
+        id: `step-${streamId}`,
+        index: 0,
+        messageId: `response-${streamId}`,
+        runId: `response-${streamId}`,
+        agentId: 'agent-pi-steer',
+      }),
+      handleHostEvent: async () => undefined,
+      onTurnEnd: async ({ signal, steer }) => {
+        await consumeSteersAtTurnEnd(
+          {
+            streamId,
+            jobCreatedAt: job.createdAt,
+            assertProviderOwner: (turnSignal) =>
+              GenerationJobManager.assertPiProviderOwner(streamId, job.createdAt, turnSignal),
+            applySteer: async (item) => {
+              appliedSteerCount += 1;
+              await GenerationJobManager.emitChunk(
+                streamId,
+                {
+                  event: SteerEvents.ON_STEER_APPLIED,
+                  data: {
+                    steerId: item.steerId,
+                    index: 0,
+                    part: {
+                      type: 'steer',
+                      steer: item.text,
+                      steerId: item.steerId,
+                      createdAt: item.createdAt,
+                    },
+                    conversationId: streamId,
+                  },
+                },
+                {
+                  durable: true,
+                  expectedCreatedAt: job.createdAt,
+                  deliveredSteer: item,
+                },
+              );
+            },
+          },
+          signal,
+          {
+            deliver: async (message) => {
+              const content = convertPiSteerContent(message.content);
+              await steer(content.text, content.images, { source: 'rpc' });
+            },
+          },
+        );
+      },
+    });
+
+    assert.equal(outcome.status, 'completed');
+    assert.equal(fakeProvider.getRequestCount(), 2, 'the queued steer schedules one next request');
+    const [initialRequest, steeredRequest] = fakeProvider.getRequestBodies();
+    assert.equal(
+      JSON.stringify(initialRequest.messages).includes(queuedSteer.text),
+      false,
+      'the steer is not moved ahead of the turn that was already in progress',
+    );
+    assert.equal(
+      JSON.stringify(steeredRequest.messages).includes(queuedSteer.text),
+      true,
+      'the next provider request contains the exact queued user instruction',
+    );
+    assert.equal(appliedSteerCount, 1, 'the durable applied event is emitted once');
+    assert.deepEqual(
+      await GenerationJobManager.steering.peek(streamId, job.createdAt),
+      [],
+      'the shared queue is empty after Pi accepts the steer',
+    );
+  } finally {
+    if (providerExecutionStarted && job != null) {
+      await GenerationJobManager.markProviderExecutionDrained(
+        streamId,
+        job.createdAt,
+        job.metadata.providerExecutionId,
+      );
+    }
+    await GenerationJobManager.destroy();
+    await fakeProvider.close();
+  }
+});
+
+test('a replaced Pi owner cannot drain or deliver the replacement generation steer', async () => {
+  const streamId = `pi-steer-replaced-${Date.now()}`;
+  let oldJob;
+  let oldProviderExecutionStarted = false;
+  let applyCount = 0;
+  let deliveryCount = 0;
+
+  try {
+    await GenerationJobManager.destroy();
+    GenerationJobManager.configure({
+      ...createStreamServices({ useRedis: false }),
+      cleanupOnComplete: false,
+    });
+    GenerationJobManager.initialize();
+
+    oldJob = await GenerationJobManager.createJob(streamId, 'user-pi-steer', streamId, {
+      initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME },
+    });
+    assert.equal(
+      await GenerationJobManager.beginProviderExecution(
+        streamId,
+        oldJob.createdAt,
+        oldJob.metadata.providerExecutionId,
+      ),
+      true,
+    );
+    oldProviderExecutionStarted = true;
+
+    await GenerationJobManager.markProviderExecutionDrained(
+      streamId,
+      oldJob.createdAt,
+      oldJob.metadata.providerExecutionId,
+    );
+    oldProviderExecutionStarted = false;
+
+    const replacementJob = await GenerationJobManager.createJob(
+      streamId,
+      'user-pi-steer',
+      streamId,
+      { initialMetadata: { agentRuntime: PINNED_PI_AGENT_RUNTIME } },
+    );
+    assert.notEqual(replacementJob.createdAt, oldJob.createdAt);
+    assert.equal(oldJob.abortController.signal.aborted, true);
+
+    const replacementSteer = {
+      steerId: `replacement-steer-${streamId}`,
+      text: 'This instruction belongs to the replacement run.',
+      userId: 'user-pi-steer',
+      createdAt: Date.now(),
+    };
+    await GenerationJobManager.steering.enqueue(
+      streamId,
+      replacementSteer,
+      replacementJob.createdAt,
+    );
+
+    await consumeSteersAtTurnEnd(
+      {
+        streamId,
+        jobCreatedAt: oldJob.createdAt,
+        assertProviderOwner: (signal) =>
+          GenerationJobManager.assertPiProviderOwner(streamId, oldJob.createdAt, signal),
+        applySteer: async () => {
+          applyCount += 1;
+        },
+      },
+      oldJob.abortController.signal,
+      {
+        deliver: async () => {
+          deliveryCount += 1;
+        },
+      },
+    );
+
+    assert.equal(applyCount, 0, 'the stale turn-end callback does not apply a steer');
+    assert.equal(deliveryCount, 0, 'the stale Pi session does not receive replacement content');
+    assert.deepEqual(
+      await GenerationJobManager.steering.peek(streamId, replacementJob.createdAt),
+      [replacementSteer],
+      'the replacement queue remains intact for its own owner',
+    );
+  } finally {
+    if (oldProviderExecutionStarted && oldJob != null) {
+      await GenerationJobManager.markProviderExecutionDrained(
+        streamId,
+        oldJob.createdAt,
+        oldJob.metadata.providerExecutionId,
+      );
+    }
+    await GenerationJobManager.destroy();
+  }
 });
 
 test('Pi host sessions isolate tool loadouts across concurrent generations', async () => {

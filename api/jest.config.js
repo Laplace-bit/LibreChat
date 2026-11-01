@@ -1,6 +1,7 @@
 const { maxWorkers, workerIdleMemoryLimit } = require('../config/jest.workers.cjs');
 
 const esModules = [
+  '@librechat/code',
   'openid-client',
   'oauth4webapi',
   'jose',
@@ -33,6 +34,8 @@ module.exports = {
     '~/data/auth.json': '<rootDir>/__mocks__/auth.mock.json',
     '^openid-client/passport$': '<rootDir>/test/__mocks__/openid-client-passport.js',
     '^openid-client$': '<rootDir>/test/__mocks__/openid-client.js',
+    '^@librechat/code/browser-enrollment$':
+      '<rootDir>/../vendor/code/browser-enrollment-protocol.ts',
   },
   transform: {
     '\\.[jt]sx?$': [

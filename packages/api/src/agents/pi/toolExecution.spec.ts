@@ -1,4 +1,4 @@
-import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
+import { Constants as DataConstants, StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import {
   Constants,
   GraphEvents,
@@ -7,12 +7,25 @@ import {
   type ToolExecuteResult,
 } from '@librechat/agents';
 import type { LCTool } from '@librechat/agents';
-import type { PiToolExecutionGate } from './toolExecution';
+import type { PiHostToolCall, PiToolExecutionGate } from './toolExecution';
+import type { PiPauseAskUserQuestionCall, PiPauseToolCall } from './pause';
+import type { PiAskUserQuestionArguments } from './tools';
 import type { PiCodeSessionBridge } from './codeSession';
 import type { PiHostEvent } from './events';
-import { PI_CALCULATOR_TOOL_NAME, PI_SET_MEMORY_TOOL_NAME, PI_SKILL_TOOL_NAME } from './toolNames';
-import { buildPiToolUsageCounts, createPiHostToolExecutor } from './toolExecution';
+import {
+  ASK_USER_QUESTION_TOOL_NAME,
+  PI_CALCULATOR_TOOL_NAME,
+  PI_SET_MEMORY_TOOL_NAME,
+  PI_SKILL_TOOL_NAME,
+} from './toolNames';
+import {
+  buildPiToolUsageCounts,
+  createPiHostToolExecutor,
+  executePiResumedToolResult,
+} from './toolExecution';
+import { createPiAskUserQuestionContinuation, createPiApprovalContinuation } from './resume';
 import { createPiHostToolBatchExecutor } from './hostToolBatch';
+import { createPiMcpToolSchemaRegistry } from './mcpSchema';
 import { createPiCodeSessionBridge } from './codeSession';
 import { createPiHostEventSequencer } from './bridge';
 import { createPiPauseController } from './pause';
@@ -777,5 +790,307 @@ describe('createPiHostToolExecutor', () => {
       data: { id: 'pi-step-1', status: 'cancelled' },
     });
     expect(JSON.stringify(events)).not.toContain('private cancellation detail');
+  });
+});
+
+function makeResumedApproval() {
+  const toolCall: PiPauseToolCall = {
+    toolCallId: 'pi-call-1',
+    name: Tools.file_search,
+    args: { query: 'maintenance manual' },
+    hostExecution: {
+      toolCallId: 'host-call-1',
+      toolTurn: 2,
+      stepIdentity: {
+        id: 'approval-step-1',
+        index: 4,
+        messageId: 'response-1',
+        runId: 'run-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 100,
+    },
+    review: { allowedDecisions: ['approve', 'reject', 'respond'] },
+  };
+
+  return createPiApprovalContinuation('action-1', toolCall);
+}
+
+function makeResumedAskUserQuestion() {
+  const args: PiAskUserQuestionArguments = {
+    questions: [{ id: 'plant_code', question: 'Which plant?' }],
+  };
+  const toolCall: PiPauseAskUserQuestionCall = {
+    toolCallId: 'pi-ask-call-1',
+    name: ASK_USER_QUESTION_TOOL_NAME,
+    args,
+    hostExecution: {
+      toolCallId: 'host-ask-call-1',
+      toolTurn: 0,
+      stepIdentity: {
+        id: 'ask-step-1',
+        index: 2,
+        messageId: 'response-1',
+        runId: 'run-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 101,
+    },
+  };
+
+  return createPiAskUserQuestionContinuation('action-2', toolCall);
+}
+
+function makeResumedMcpApproval() {
+  const name = `lookup${DataConstants.mcp_delimiter}inventory`;
+  const mcpToolSchemas = createPiMcpToolSchemaRegistry([
+    {
+      name,
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string', minLength: 2 } },
+        required: ['query'],
+      },
+    },
+  ]);
+  const [toolName] = mcpToolSchemas.keys();
+  const schema = toolName == null ? undefined : mcpToolSchemas.get(toolName);
+  if (toolName == null || schema == null) {
+    throw new Error('Test MCP schema failed to compile');
+  }
+  const toolCall: PiPauseToolCall = {
+    kind: 'mcp',
+    toolCallId: 'pi-mcp-call-1',
+    name: toolName,
+    args: { query: 'pump' },
+    schemaFingerprint: schema.fingerprint,
+    hostExecution: {
+      toolCallId: 'host-mcp-call-1',
+      toolTurn: 1,
+      stepIdentity: {
+        id: 'mcp-step-1',
+        index: 3,
+        messageId: 'response-1',
+        runId: 'run-1',
+        agentId: 'agent-1',
+      },
+      createdAt: 102,
+    },
+    review: { allowedDecisions: ['approve', 'reject'] },
+  };
+
+  return {
+    continuation: createPiApprovalContinuation('action-3', toolCall),
+    mcpToolSchemas,
+    toolName,
+    schemaFingerprint: schema.fingerprint,
+  };
+}
+
+describe('executePiResumedToolResult', () => {
+  it('settles an ask-user answer without invoking the host tool', async () => {
+    const continuation = makeResumedAskUserQuestion();
+    const answer = { answers: { plant_code: 'North' } };
+    const events: PiHostEvent[] = [];
+    let hostCalls = 0;
+
+    const result = await executePiResumedToolResult({
+      resolution: { kind: 'ask_user_question', continuation, answer },
+      executeHostToolCall: async (call) => {
+        hostCalls += 1;
+        return { toolCallId: call.id, status: 'success', content: 'unexpected' };
+      },
+      signal: new AbortController().signal,
+      now: () => 200,
+      handleHostEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    expect(hostCalls).toBe(0);
+    expect(result).toEqual({
+      content: [{ type: 'text', text: JSON.stringify(answer) }],
+      isError: false,
+    });
+    expect(events.filter((event) => event.event === GraphEvents.ON_RUN_STEP_CLOSED)).toHaveLength(
+      1,
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: GraphEvents.ON_RUN_STEP_CLOSED,
+        data: expect.objectContaining({ id: 'ask-step-1', status: 'completed' }),
+      }),
+    );
+  });
+
+  it('executes and settles an approved host call exactly once', async () => {
+    const continuation = makeResumedApproval();
+    const hostCalls: PiHostToolCall[] = [];
+    const events: PiHostEvent[] = [];
+
+    const result = await executePiResumedToolResult({
+      resolution: {
+        kind: 'approval',
+        continuation,
+        decision: { kind: 'execute', args: continuation.args },
+      },
+      executeHostToolCall: async (call) => {
+        hostCalls.push(call);
+        return { toolCallId: call.id, status: 'success', content: 'Found the manual.' };
+      },
+      signal: new AbortController().signal,
+      now: () => 200,
+      handleHostEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    expect(hostCalls).toHaveLength(1);
+    expect(hostCalls[0]).toMatchObject({
+      id: 'host-call-1',
+      name: Tools.file_search,
+      args: { query: 'maintenance manual' },
+      stepId: 'approval-step-1',
+      turn: 2,
+    });
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'Found the manual.' }],
+      isError: false,
+    });
+    expect(events.filter((event) => event.event === GraphEvents.ON_RUN_STEP_CLOSED)).toHaveLength(
+      1,
+    );
+  });
+
+  it('builds schema-bound MCP host calls from the typed continuation', async () => {
+    const { continuation, mcpToolSchemas, toolName, schemaFingerprint } = makeResumedMcpApproval();
+    const hostCalls: PiHostToolCall[] = [];
+
+    await executePiResumedToolResult({
+      resolution: {
+        kind: 'approval',
+        continuation,
+        decision: { kind: 'execute', args: continuation.args },
+      },
+      executeHostToolCall: async (call) => {
+        hostCalls.push(call);
+        return { toolCallId: call.id, status: 'success', content: 'Inventory checked.' };
+      },
+      mcpToolSchemas,
+      signal: new AbortController().signal,
+      now: () => 200,
+      handleHostEvent: () => undefined,
+    });
+
+    expect(hostCalls).toEqual([
+      expect.objectContaining({
+        kind: 'mcp',
+        id: 'host-mcp-call-1',
+        name: toolName,
+        args: { query: 'pump' },
+        schemaFingerprint,
+        stepId: 'mcp-step-1',
+        turn: 1,
+      }),
+    ]);
+  });
+
+  it('settles reject and respond decisions without host side effects', async () => {
+    const continuation = makeResumedApproval();
+    let hostCalls = 0;
+    const rejectedEvents: PiHostEvent[] = [];
+    const rejected = await executePiResumedToolResult({
+      resolution: {
+        kind: 'approval',
+        continuation,
+        decision: { kind: 'reject' },
+      },
+      executeHostToolCall: async (call) => {
+        hostCalls += 1;
+        return { toolCallId: call.id, status: 'success', content: 'unexpected' };
+      },
+      signal: new AbortController().signal,
+      now: () => 200,
+      handleHostEvent: (event) => {
+        rejectedEvents.push(event);
+      },
+    });
+
+    const respondedEvents: PiHostEvent[] = [];
+    const responded = await executePiResumedToolResult({
+      resolution: {
+        kind: 'approval',
+        continuation,
+        decision: { kind: 'respond', text: 'Search later.' },
+      },
+      signal: new AbortController().signal,
+      now: () => 200,
+      handleHostEvent: (event) => {
+        respondedEvents.push(event);
+      },
+    });
+
+    expect(hostCalls).toBe(0);
+    expect(rejected).toMatchObject({ isError: true });
+    expect(rejected.content).toEqual([
+      { type: 'text', text: 'This tool call was rejected by the user.' },
+    ]);
+    expect(responded).toEqual({
+      content: [{ type: 'text', text: 'Search later.' }],
+      isError: false,
+    });
+    expect(
+      rejectedEvents.filter((event) => event.event === GraphEvents.ON_RUN_STEP_CLOSED),
+    ).toHaveLength(1);
+    expect(
+      respondedEvents.filter((event) => event.event === GraphEvents.ON_RUN_STEP_CLOSED),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    ['error', false, 'failed'],
+    ['cancelled', true, 'cancelled'],
+  ] as const)('settles one terminal step after host execution %s', async (_name, abort, status) => {
+    const continuation = makeResumedApproval();
+    const controller = new AbortController();
+    const events: PiHostEvent[] = [];
+    const error = new Error('host execution failed');
+    let hostCalls = 0;
+
+    await expect(
+      executePiResumedToolResult({
+        resolution: {
+          kind: 'approval',
+          continuation,
+          decision: { kind: 'execute', args: continuation.args },
+        },
+        executeHostToolCall: async () => {
+          hostCalls += 1;
+          if (abort) {
+            controller.abort();
+          }
+          throw error;
+        },
+        signal: controller.signal,
+        now: () => 200,
+        handleHostEvent: (event) => {
+          events.push(event);
+        },
+      }),
+    ).rejects.toBe(error);
+
+    expect(hostCalls).toBe(1);
+    expect(
+      events.filter((event) => event.event === GraphEvents.ON_RUN_STEP_COMPLETED),
+    ).toHaveLength(1);
+    expect(events.filter((event) => event.event === GraphEvents.ON_RUN_STEP_CLOSED)).toHaveLength(
+      1,
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        event: GraphEvents.ON_RUN_STEP_CLOSED,
+        data: expect.objectContaining({ id: 'approval-step-1', status }),
+      }),
+    );
   });
 });

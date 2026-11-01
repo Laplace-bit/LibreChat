@@ -242,14 +242,14 @@ const {
   createPiCodeSessionBridge,
   createPiToolApprovalGate,
   createPiAskUserQuestionContinuation,
+  parsePiAskUserQuestionAnswer,
+  executePiResumedToolResult,
   compilePiMcpToolSchemaRegistry,
   compilePiActionToolSchemaRegistry,
   PiToolCompatibilityError,
   validatePiAskUserQuestionArguments,
   createPiHostToolBatchExecutor,
   buildPiToolUsageCounts,
-  settlePiHostToolResult,
-  settlePiHostToolStep,
   generateAgentConversationTitle,
   getAgentPiModelBindingFactory,
   buildPiApprovalInterruptPayload,
@@ -6057,24 +6057,14 @@ class AgentClient extends BaseClient {
     ) {
       throw new AgentRuntimeUnavailableError();
     }
-    if (isAskUserQuestionResume) {
-      const expectedIds = piAskUserQuestionContinuation.args.questions.map(({ id }) => id);
-      const answers = piAskUserQuestionAnswer?.answers;
-      if (
-        answers == null ||
-        typeof answers !== 'object' ||
-        Array.isArray(answers) ||
-        Object.keys(answers).length !== expectedIds.length ||
-        expectedIds.some(
-          (id) =>
-            typeof answers[id] !== 'string' ||
-            answers[id].length === 0 ||
-            answers[id].length > 16_000,
-        ) ||
-        Object.keys(answers).some((id) => !expectedIds.includes(id))
-      ) {
-        throw new AgentRuntimeUnavailableError();
-      }
+    const validatedPiAskUserQuestionAnswer = isAskUserQuestionResume
+      ? parsePiAskUserQuestionAnswer({
+          continuation: piAskUserQuestionContinuation,
+          value: piAskUserQuestionAnswer,
+        })
+      : undefined;
+    if (isAskUserQuestionResume && validatedPiAskUserQuestionAnswer == null) {
+      throw new AgentRuntimeUnavailableError();
     }
     if (!abortController) {
       abortController = new AbortController();
@@ -6437,77 +6427,17 @@ class AgentClient extends BaseClient {
         model: this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
       });
 
-      const createApprovedToolResult = async () => {
-        const continuation = piContinuation;
-        const executionInput = {
-          toolCallId: continuation.piToolCallId,
-          name: continuation.toolName,
-          args: continuationToolArguments,
-          ...getPiToolSchemaBinding({
-            name: continuation.toolName,
-            kind: continuation.kind,
-            schemaFingerprint: continuation.schemaFingerprint,
-          }),
-          turn: continuation.toolTurn,
-        };
-        let hostResult;
-        if (isAskUserQuestionResume) {
-          hostResult = {
-            status: 'success',
-            content: JSON.stringify(piAskUserQuestionAnswer),
+      const resumeToolResultResolution = isAskUserQuestionResume
+        ? {
+            kind: 'ask_user_question',
+            continuation: piAskUserQuestionContinuation,
+            answer: validatedPiAskUserQuestionAnswer,
+          }
+        : {
+            kind: 'approval',
+            continuation: piApprovalContinuation,
+            decision: piApprovalDecision,
           };
-        } else if (piApprovalDecision.kind === 'execute') {
-          if (executePiHostToolCall == null) {
-            throw new AgentRuntimeUnavailableError();
-          }
-          try {
-            hostResult = await executePiHostToolCall(
-              {
-                id: continuation.hostToolCallId,
-                name: continuation.toolName,
-                args: continuationToolArguments,
-                ...getPiToolSchemaBinding({
-                  name: continuation.toolName,
-                  kind: continuation.kind,
-                  schemaFingerprint: continuation.schemaFingerprint,
-                }),
-                stepId: continuation.stepIdentity.id,
-                turn: continuation.toolTurn,
-              },
-              abortController.signal,
-            );
-          } catch (error) {
-            const cancelled = abortController.signal.aborted === true;
-            await settlePiHostToolStep({
-              identity: continuation.stepIdentity,
-              toolCallId: continuation.hostToolCallId,
-              input: executionInput,
-              output: cancelled ? 'Tool execution was cancelled.' : 'Tool execution failed.',
-              status: cancelled ? 'cancelled' : 'error',
-              createdAt: continuation.stepCreatedAt,
-              handleHostEvent: handlePiHostEvent,
-            });
-            throw error;
-          }
-        } else {
-          hostResult =
-            piApprovalDecision.kind === 'reject'
-              ? { status: 'error', content: 'This tool call was rejected by the user.' }
-              : { status: 'success', content: piApprovalDecision.text };
-        }
-        const settled = await settlePiHostToolResult({
-          identity: continuation.stepIdentity,
-          toolCallId: continuation.hostToolCallId,
-          input: executionInput,
-          hostResult,
-          createdAt: continuation.stepCreatedAt,
-          handleHostEvent: handlePiHostEvent,
-        });
-        return {
-          content: settled.content,
-          isError: settled.isError === true,
-        };
-      };
 
       const execution = await agentRuntimeDispatcher.resumeTurn({
         engine: 'pi',
@@ -6536,7 +6466,15 @@ class AgentClient extends BaseClient {
           resumeToolResult: {
             continuation: piContinuation,
             toolArguments: continuationToolArguments,
-            execute: createApprovedToolResult,
+            execute: () =>
+              executePiResumedToolResult({
+                resolution: resumeToolResultResolution,
+                executeHostToolCall: executePiHostToolCall,
+                mcpToolSchemas: piMcpToolSchemas,
+                actionToolSchemas: piActionToolSchemas,
+                signal: abortController.signal,
+                handleHostEvent: handlePiHostEvent,
+              }),
           },
           signal: abortController.signal,
           onSessionCreated: () => {

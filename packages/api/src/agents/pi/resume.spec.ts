@@ -11,6 +11,7 @@ import {
   createPiApprovalContinuation,
   matchesPiAskUserQuestionHostState,
   matchesPiApprovalHostState,
+  parsePiAskUserQuestionAnswer,
   revalidatePiActionApprovalArguments,
   revalidatePiMcpApprovalArguments,
   resolvePiApprovalContinuation,
@@ -1029,5 +1030,98 @@ describe('Pi approval continuation', () => {
         },
       ],
     });
+  });
+});
+
+describe('Pi ask-user answer parsing', () => {
+  it('returns one answer for each question ID', () => {
+    const { continuation } = createPiAskUserQuestion();
+
+    expect(
+      parsePiAskUserQuestionAnswer({
+        continuation,
+        value: { answers: { plant_code: 'North', window_7d: 'last 7 days' } },
+      }),
+    ).toEqual({ answers: { plant_code: 'North', window_7d: 'last 7 days' } });
+  });
+
+  it.each([
+    ['a missing question ID', { plant_code: 'North' }],
+    ['an extra question ID', { plant_code: 'North', window_7d: 'last 7 days', other: 'value' }],
+  ])('rejects %s', (_reason, answers) => {
+    const { continuation } = createPiAskUserQuestion();
+
+    expect(parsePiAskUserQuestionAnswer({ continuation, value: { answers } })).toBeUndefined();
+  });
+
+  it('rejects empty answers and answers longer than 16,000 characters', () => {
+    const { continuation } = createPiAskUserQuestion();
+
+    expect(
+      parsePiAskUserQuestionAnswer({
+        continuation,
+        value: { answers: { plant_code: '', window_7d: 'last 7 days' } },
+      }),
+    ).toBeUndefined();
+    expect(
+      parsePiAskUserQuestionAnswer({
+        continuation,
+        value: {
+          answers: {
+            plant_code: 'North',
+            window_7d: 'x'.repeat(16_001),
+          },
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  it('accepts an answer at the 16,000-character limit', () => {
+    const { continuation } = createPiAskUserQuestion();
+    const answer = 'x'.repeat(16_000);
+
+    expect(
+      parsePiAskUserQuestionAnswer({
+        continuation,
+        value: { answers: { plant_code: 'North', window_7d: answer } },
+      }),
+    ).toEqual({ answers: { plant_code: 'North', window_7d: answer } });
+  });
+
+  it('rejects arrays, inherited keys, symbol keys, and accessors without invoking them', () => {
+    const { continuation } = createPiAskUserQuestion();
+    const inheritedAnswers = Object.setPrototypeOf(
+      { plant_code: 'North', window_7d: 'last 7 days' },
+      { inherited: true },
+    );
+    const symbolAnswers = { plant_code: 'North', window_7d: 'last 7 days' };
+    Object.defineProperty(symbolAnswers, Symbol('unexpected'), { value: true });
+    const getter = jest.fn(() => ({ plant_code: 'North', window_7d: 'last 7 days' }));
+    const accessorInput = Object.defineProperty({}, 'answers', { enumerable: true, get: getter });
+    const answerGetter = jest.fn(() => 'last 7 days');
+    const accessorAnswers = Object.defineProperty({ plant_code: 'North' }, 'window_7d', {
+      enumerable: true,
+      get: answerGetter,
+    });
+
+    expect(parsePiAskUserQuestionAnswer({ continuation, value: [] })).toBeUndefined();
+    expect(
+      parsePiAskUserQuestionAnswer({
+        continuation,
+        value: { answers: { plant_code: 'North', window_7d: 'last 7 days', extra: 'value' } },
+      }),
+    ).toBeUndefined();
+    expect(
+      parsePiAskUserQuestionAnswer({ continuation, value: { answers: inheritedAnswers } }),
+    ).toBeUndefined();
+    expect(
+      parsePiAskUserQuestionAnswer({ continuation, value: { answers: symbolAnswers } }),
+    ).toBeUndefined();
+    expect(parsePiAskUserQuestionAnswer({ continuation, value: accessorInput })).toBeUndefined();
+    expect(
+      parsePiAskUserQuestionAnswer({ continuation, value: { answers: accessorAnswers } }),
+    ).toBeUndefined();
+    expect(getter).not.toHaveBeenCalled();
+    expect(answerGetter).not.toHaveBeenCalled();
   });
 });

@@ -78,7 +78,7 @@ async function createFakeModelBinding(baseUrl, onDispose = () => {}) {
   return { model, modelRuntime, dispose: onDispose };
 }
 
-async function createConcurrentFakeProvider() {
+async function createConcurrentFakeProvider(expectedInitialRequestCount = 2) {
   const firstRequestsArrived = deferred();
   const releaseFirstResponses = deferred();
   const requestCountByAgent = new Map();
@@ -215,7 +215,7 @@ async function createConcurrentFakeProvider() {
           maxConcurrentInitialRequests,
           initialRequestsInFlight.size,
         );
-        if (initialRequestsInFlight.size === 2) {
+        if (initialRequestsInFlight.size === expectedInitialRequestCount) {
           firstRequestsArrived.resolve();
         }
         void releaseFirstResponses.promise.then(() => {
@@ -342,7 +342,7 @@ function generationInput({
       await GenerationJobManager.emitChunk(
         streamId,
         { event: event.event, data: event.data },
-        job.createdAt,
+        { expectedCreatedAt: job.createdAt },
       );
     },
   };
@@ -617,6 +617,202 @@ test('concurrent Pi generations keep host tools, usage, aborts, and terminal eve
       subscription?.unsubscribe();
     }
     provider.releaseFirstResponses();
+    await GenerationJobManager.destroy();
+    await provider.close();
+  }
+});
+
+test('same-conversation Pi replacement cancels the old owner and fences late events', async () => {
+  const streamId = `pi-concurrency-replacement-${Date.now()}`;
+  const responseMessageIds = {
+    old: `response-old-${streamId}`,
+    current: `response-current-${streamId}`,
+  };
+  const agentId = 'generation-agent-alpha';
+  const provider = await createConcurrentFakeProvider(1);
+  const streamEvents = [];
+  const hostToolCalls = [];
+  const oldHostEvents = [];
+  const currentHostEvents = [];
+  let subscription;
+  let oldGeneration;
+  let currentGeneration;
+
+  try {
+    await GenerationJobManager.destroy();
+    GenerationJobManager.configure({
+      ...createStreamServices({ useRedis: false }),
+      cleanupOnComplete: false,
+    });
+    GenerationJobManager.initialize();
+
+    const oldJob = await GenerationJobManager.createJob(streamId, 'user-alpha', streamId, {
+      initialMetadata: {
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
+        agent_id: agentId,
+        responseMessageId: responseMessageIds.old,
+      },
+    });
+    const oldProviderExecutionId = oldJob.metadata.providerExecutionId;
+    assert.equal(
+      await GenerationJobManager.beginProviderExecution(
+        streamId,
+        oldJob.createdAt,
+        oldProviderExecutionId,
+      ),
+      true,
+    );
+
+    oldGeneration = executePiGeneration(
+      generationInput({
+        agentId,
+        streamId,
+        responseMessageId: responseMessageIds.old,
+        job: oldJob,
+        providerBaseUrl: provider.baseUrl,
+        hostToolCalls,
+        hostEvents: oldHostEvents,
+      }),
+    ).finally(() =>
+      GenerationJobManager.markProviderExecutionDrained(
+        streamId,
+        oldJob.createdAt,
+        oldProviderExecutionId,
+      ),
+    );
+    await withTimeout(
+      provider.firstRequestsArrived,
+      5_000,
+      'the original same-conversation Pi generation did not reach the provider',
+    );
+
+    const currentJob = await GenerationJobManager.createJob(streamId, 'user-alpha', streamId, {
+      initialMetadata: {
+        agentRuntime: PINNED_PI_AGENT_RUNTIME,
+        agent_id: agentId,
+        responseMessageId: responseMessageIds.current,
+      },
+    });
+    const currentProviderExecutionId = currentJob.metadata.providerExecutionId;
+    assert.ok(currentJob.createdAt > oldJob.createdAt);
+    assert.equal(oldJob.abortController.signal.aborted, true);
+
+    subscription = await GenerationJobManager.subscribe(
+      streamId,
+      (event) => streamEvents.push(event),
+      (event) => streamEvents.push(event),
+    );
+    assert.ok(subscription, 'the replacement generation is available to subscribers');
+
+    const lateEvent = {
+      event: 'on_message_delta',
+      data: {
+        id: `late-${responseMessageIds.old}`,
+        delta: { content: { type: 'text', text: 'late old generation data' } },
+      },
+    };
+    await GenerationJobManager.emitChunk(streamId, lateEvent, {
+      expectedCreatedAt: oldJob.createdAt,
+    });
+    assert.equal(
+      await GenerationJobManager.emitChunkFromAnyReplica(streamId, lateEvent, oldJob.createdAt),
+      false,
+      'the durable append path rejects an event from the replaced Pi owner',
+    );
+    assert.equal(
+      JSON.stringify(streamEvents).includes('late old generation data'),
+      false,
+      'late events are not delivered to the replacement subscriber',
+    );
+
+    assert.equal(
+      await GenerationJobManager.beginProviderExecution(
+        streamId,
+        currentJob.createdAt,
+        currentProviderExecutionId,
+      ),
+      true,
+    );
+    provider.releaseFirstResponses();
+
+    const oldOutcome = await withTimeout(
+      oldGeneration,
+      10_000,
+      'the replaced Pi generation did not drain after its owner was fenced',
+    );
+    assert.equal(oldOutcome.status, 'cancelled');
+
+    currentGeneration = executePiGeneration(
+      generationInput({
+        agentId,
+        streamId,
+        responseMessageId: responseMessageIds.current,
+        job: currentJob,
+        providerBaseUrl: provider.baseUrl,
+        hostToolCalls,
+        hostEvents: currentHostEvents,
+      }),
+    ).finally(() =>
+      GenerationJobManager.markProviderExecutionDrained(
+        streamId,
+        currentJob.createdAt,
+        currentProviderExecutionId,
+      ),
+    );
+    const currentOutcome = await withTimeout(
+      currentGeneration,
+      10_000,
+      'the replacement Pi generation did not settle',
+    );
+    assert.equal(currentOutcome.status, 'completed');
+
+    const terminalClaim = await GenerationJobManager.claimTerminalJob(
+      streamId,
+      'complete',
+      undefined,
+      currentJob.createdAt,
+      { persistencePending: true },
+    );
+    assert.ok(terminalClaim, 'the current Pi owner wins the terminal claim');
+    await GenerationJobManager.publishTerminalClaim(terminalClaim, {
+      final: true,
+      generationCreatedAt: currentJob.createdAt,
+      conversation: { conversationId: streamId },
+      responseMessage: {
+        messageId: responseMessageIds.current,
+        text: 'Only the current generation is published.',
+        unfinished: false,
+      },
+    });
+    await GenerationJobManager.finishTerminalJob(terminalClaim);
+
+    assert.equal(provider.getCancelledAgents().length, 1);
+    assert.ok(
+      currentHostEvents.every(
+        ({ responseMessageId }) => responseMessageId === responseMessageIds.current,
+      ),
+    );
+    assert.equal(
+      JSON.stringify(streamEvents).includes(responseMessageIds.old),
+      false,
+      'replacement stream events do not contain old-generation run identity',
+    );
+    assert.equal(
+      streamEvents.filter(
+        (event) => event.final === true && event.generationCreatedAt === currentJob.createdAt,
+      ).length,
+      1,
+      'the current owner publishes exactly one terminal event',
+    );
+    assert.equal(
+      streamEvents.find((event) => event.final === true)?.generationCreatedAt,
+      currentJob.createdAt,
+    );
+    assert.equal(await GenerationJobManager.getJobStatus(streamId), 'complete');
+  } finally {
+    subscription?.unsubscribe();
+    provider.releaseFirstResponses();
+    await Promise.allSettled([oldGeneration, currentGeneration].filter(Boolean));
     await GenerationJobManager.destroy();
     await provider.close();
   }

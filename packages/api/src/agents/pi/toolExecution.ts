@@ -1,6 +1,7 @@
 import { StepEvents, StepTypes, Tools } from 'librechat-data-provider';
 import { GraphEvents, type ToolExecuteResult } from '@librechat/agents';
 import type { AgentToolResult } from '@earendil-works/pi-coding-agent';
+import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import type { Agents } from 'librechat-data-provider';
 import type {
   PiBashArguments,
@@ -13,6 +14,7 @@ import type {
   PiSkillArguments,
   PiWebSearchArguments,
   PiToolArguments,
+  PiToolValidationContext,
 } from './tools';
 import type {
   PiActionSchemaFingerprint,
@@ -20,6 +22,12 @@ import type {
   PiActionToolName,
   PiActionToolSchemaRegistry,
 } from './actionSchema';
+import type {
+  PiApprovalDecision,
+  PiAskUserQuestionAnswer,
+  PiAskUserQuestionContinuation,
+  PiApprovalContinuation,
+} from './resume';
 import type {
   PiMcpToolArguments,
   PiMcpSchemaFingerprint,
@@ -46,6 +54,7 @@ import {
   validatePiAskUserQuestionArguments,
   validatePiToolExecutionInput,
 } from './tools';
+import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { isPiActionToolName } from './actionSchema';
 import { isPiMcpToolName } from './mcpSchema';
 
@@ -748,6 +757,143 @@ export async function settlePiHostToolResult(options: {
     ],
     details: { status },
     ...(status === 'error' ? { isError: true } : {}),
+  };
+}
+
+export type PiResumedToolResultResolution =
+  | {
+      readonly kind: 'ask_user_question';
+      readonly continuation: PiAskUserQuestionContinuation;
+      readonly answer: PiAskUserQuestionAnswer;
+    }
+  | {
+      readonly kind: 'approval';
+      readonly continuation: PiApprovalContinuation;
+      readonly decision: PiApprovalDecision;
+    };
+
+export interface PiResumedToolResultInput {
+  readonly resolution: PiResumedToolResultResolution;
+  /** The caller injects the existing authorized host tool handler. */
+  readonly executeHostToolCall?: (
+    call: PiHostToolCall,
+    signal?: AbortSignal,
+  ) => Promise<ToolExecuteResult>;
+  readonly mcpToolSchemas?: PiMcpToolSchemaRegistry;
+  readonly actionToolSchemas?: PiActionToolSchemaRegistry;
+  readonly signal: AbortSignal;
+  readonly now?: () => number;
+  readonly handleHostEvent: (event: PiHostEvent) => void | Promise<void>;
+}
+
+function createPiResumedToolExecutionContext(
+  input: PiResumedToolResultInput,
+): PiToolExecutionContext {
+  const { continuation } = input.resolution;
+  const toolArguments =
+    input.resolution.kind === 'approval' && input.resolution.decision.kind === 'execute'
+      ? input.resolution.decision.args
+      : continuation.args;
+  let validationContext: PiToolValidationContext = {};
+  if (continuation.kind === 'mcp') {
+    validationContext = {
+      mcpToolSchemas: input.mcpToolSchemas,
+      expectedSchemaFingerprint: continuation.schemaFingerprint,
+    };
+  } else if (continuation.kind === 'action') {
+    validationContext = {
+      actionToolSchemas: input.actionToolSchemas,
+      expectedSchemaFingerprint: continuation.schemaFingerprint,
+    };
+  }
+  const hostExecutionInput = validatePiToolExecutionInput(
+    continuation.toolName,
+    continuation.piToolCallId,
+    toolArguments,
+    validationContext,
+  );
+  return { ...hostExecutionInput, turn: continuation.toolTurn };
+}
+
+/** Resolve a Pi pause through the host handler, then settle its original host step once. */
+export async function executePiResumedToolResult(
+  input: PiResumedToolResultInput,
+): Promise<Pick<ToolResultMessage, 'content' | 'isError'>> {
+  const { continuation } = input.resolution;
+  const executionContext = createPiResumedToolExecutionContext(input);
+  let hostResult: ToolExecuteResult;
+
+  if (input.resolution.kind === 'ask_user_question') {
+    hostResult = {
+      toolCallId: continuation.hostToolCallId,
+      status: 'success',
+      content: JSON.stringify(input.resolution.answer),
+    };
+  } else {
+    const { decision } = input.resolution;
+    switch (decision.kind) {
+      case 'execute': {
+        if (input.executeHostToolCall == null) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        try {
+          hostResult = await input.executeHostToolCall(
+            toHostToolCall(
+              executionContext,
+              continuation.hostToolCallId,
+              continuation.stepIdentity.id,
+            ),
+            input.signal,
+          );
+        } catch (error) {
+          const cancelled = input.signal.aborted;
+          await settlePiHostToolStep({
+            identity: continuation.stepIdentity,
+            toolCallId: continuation.hostToolCallId,
+            input: executionContext,
+            output: cancelled ? 'Tool execution was cancelled.' : 'Tool execution failed.',
+            status: cancelled ? 'cancelled' : 'error',
+            createdAt: continuation.stepCreatedAt,
+            ...(input.now == null ? {} : { now: input.now }),
+            handleHostEvent: input.handleHostEvent,
+          });
+          throw error;
+        }
+        break;
+      }
+      case 'reject':
+        hostResult = {
+          toolCallId: continuation.hostToolCallId,
+          status: 'error',
+          content: 'This tool call was rejected by the user.',
+        };
+        break;
+      case 'respond':
+        hostResult = {
+          toolCallId: continuation.hostToolCallId,
+          status: 'success',
+          content: decision.text,
+        };
+        break;
+      default: {
+        const _exhaustive: never = decision;
+        return _exhaustive;
+      }
+    }
+  }
+
+  const settled = await settlePiHostToolResult({
+    identity: continuation.stepIdentity,
+    toolCallId: continuation.hostToolCallId,
+    input: executionContext,
+    hostResult,
+    createdAt: continuation.stepCreatedAt,
+    ...(input.now == null ? {} : { now: input.now }),
+    handleHostEvent: input.handleHostEvent,
+  });
+  return {
+    content: settled.content,
+    isError: settled.isError === true,
   };
 }
 

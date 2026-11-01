@@ -4,8 +4,14 @@ import type {
   AnthropicConfigOptions,
   ProviderInitializeParams,
 } from '~/types';
+import { setInitializeResultPiModelBindingFactory } from '~/agents/pi/modelBindingFactory';
 import { loadAnthropicVertexCredentials, getVertexCredentialOptions } from './vertex';
+import { createPiAnthropicModelBinding } from '~/agents/pi/anthropicModel';
 import { checkUserKeyExpiry, isEnabled, mergeHeaders } from '~/utils';
+import { createAuthorizedPiAnthropicModelCandidate } from './piModel';
+import { getProxyDispatcher, getProxyUrlForUrl } from '~/utils/proxy';
+import { ANTHROPIC_BASE_URL } from '~/agents/pi/anthropicModel';
+import { resolveModelTransportTimeouts } from '~/agents/config';
 import { resolveEndpointRuntime } from '~/types';
 import { getLLMConfig } from './llm';
 
@@ -22,7 +28,6 @@ export async function initializeAnthropic(
 ): Promise<InitializeResultBase> {
   const { endpoint, model_parameters, db } = params;
   const { appConfig, user, requestBody } = resolveEndpointRuntime(params);
-  void endpoint;
   const { ANTHROPIC_API_KEY, ANTHROPIC_REVERSE_PROXY, PROXY } = process.env;
   const { key: expiresAt } = requestBody;
 
@@ -96,5 +101,39 @@ export async function initializeAnthropic(
     result.llmConfig._lc_stream_delay = allConfig.streamRate;
   }
 
+  const effectiveProxyUrl = getProxyUrlForUrl(ANTHROPIC_BASE_URL);
+  const expectedProxyDispatcher = getProxyDispatcher(PROXY);
+  const piModelCandidate = createAuthorizedPiAnthropicModelCandidate({
+    endpoint,
+    adminApiKey: ANTHROPIC_API_KEY,
+    resolvedApiKey: credentials[AuthKeys.ANTHROPIC_API_KEY],
+    userProvidedApiKey: isUserProvidedAnthropicKey(ANTHROPIC_API_KEY),
+    useVertex: useVertexAI,
+    configuredBaseURL: anthropicConfig?.baseURL,
+    reverseProxyURL: ANTHROPIC_REVERSE_PROXY,
+    anthropicConfig,
+    allConfig,
+    modelParameters: model_parameters,
+    requestUserId: typeof user?.id === 'string' ? user.id : undefined,
+    expectedProxyDispatcher,
+    transport: {
+      ...resolveModelTransportTimeouts(appConfig?.endpoints?.agents),
+      proxy:
+        effectiveProxyUrl === undefined
+          ? { kind: 'direct' }
+          : { kind: 'proxy', url: effectiveProxyUrl },
+    },
+    initializeResult: result,
+  });
+  if (piModelCandidate !== undefined) {
+    setInitializeResultPiModelBindingFactory(result, () =>
+      createPiAnthropicModelBinding(piModelCandidate),
+    );
+  }
+
   return result;
+}
+
+function isUserProvidedAnthropicKey(apiKey: string | undefined): boolean {
+  return apiKey === 'user_provided';
 }

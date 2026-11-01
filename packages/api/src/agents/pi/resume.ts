@@ -43,6 +43,7 @@ import { ASK_USER_QUESTION_TOOL_NAME } from '../hitl/askUserQuestionTool';
 import { parsePiCodeSessionSnapshot } from './codeSession';
 
 export const PI_RESUME_CONTINUATION_VERSION = 1 as const;
+const MAX_PI_ASK_USER_ANSWER_LENGTH = 16_000;
 export const PI_RESUMABLE_TOOL_DECISIONS: readonly Agents.ToolApprovalDecisionType[] = [
   'approve',
   'reject',
@@ -96,6 +97,10 @@ export interface PiAskUserQuestionContinuation {
   readonly args: PiAskUserQuestionArguments;
   readonly stepIdentity: PiMessageStepIdentity;
   readonly stepCreatedAt: number;
+}
+
+export interface PiAskUserQuestionAnswer {
+  readonly answers: Readonly<Record<string, string>>;
 }
 
 export type PiToolResultContinuation = PiApprovalContinuation | PiAskUserQuestionContinuation;
@@ -563,6 +568,64 @@ export function resolvePiAskUserQuestionContinuation(input: {
     stepIdentity,
     stepCreatedAt: value.stepCreatedAt,
   };
+}
+
+/** Parse an answer only when it contains one non-empty value for every question ID. */
+export function parsePiAskUserQuestionAnswer(input: {
+  continuation: PiAskUserQuestionContinuation;
+  value: unknown;
+}): PiAskUserQuestionAnswer | undefined {
+  const isPlainRecord = (value: unknown): value is object => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  };
+  const hasExactKeys = (value: object, expectedKeys: readonly string[]): boolean => {
+    const actualKeys = Reflect.ownKeys(value);
+    return (
+      actualKeys.length === expectedKeys.length &&
+      actualKeys.every((key) => typeof key === 'string' && expectedKeys.includes(key))
+    );
+  };
+  const readEnumerableDataProperty = (value: object, key: string): unknown | undefined => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor?.enumerable === true && 'value' in descriptor ? descriptor.value : undefined;
+  };
+
+  try {
+    if (!isPlainRecord(input.value) || !hasExactKeys(input.value, ['answers'])) {
+      return undefined;
+    }
+    const rawAnswers = readEnumerableDataProperty(input.value, 'answers');
+    if (!isPlainRecord(rawAnswers)) {
+      return undefined;
+    }
+
+    const questionIds = input.continuation.args.questions.map(({ id }) => id);
+    if (!hasExactKeys(rawAnswers, questionIds)) {
+      return undefined;
+    }
+
+    const answerEntries: [string, string][] = [];
+    for (const questionId of questionIds) {
+      const answer = readEnumerableDataProperty(rawAnswers, questionId);
+      if (
+        typeof answer !== 'string' ||
+        answer.length === 0 ||
+        answer.length > MAX_PI_ASK_USER_ANSWER_LENGTH
+      ) {
+        return undefined;
+      }
+      answerEntries.push([questionId, answer]);
+    }
+
+    return { answers: Object.fromEntries(answerEntries) };
+  } catch {
+    // Unknown input may be a proxy whose reflection traps throw. Treat it as malformed.
+    return undefined;
+  }
 }
 
 function decodeArguments(value: unknown): Record<string, unknown> | undefined {

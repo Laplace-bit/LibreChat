@@ -32,7 +32,7 @@ export default {
   coverageReporters: ['text', 'cobertura'],
   testResultsProcessor: 'jest-junit',
   transform: {
-    '^.+/src/agents/pi/(model|session)\\.ts$': [
+    '^.+/src/agents/pi/(model|session|anthropicModel)\\.ts$': [
       'babel-jest',
       {
         presets: [

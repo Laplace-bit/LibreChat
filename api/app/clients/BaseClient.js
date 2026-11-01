@@ -40,6 +40,7 @@ const {
   bindPrivateTextPersistenceAbort,
   persistedReasoningOverrideFields,
   isTemporaryTurn,
+  resolvePiRegenerationUser,
 } = require('@librechat/api');
 const {
   Constants,
@@ -456,7 +457,7 @@ class BaseClient {
 
     const [overrideConvoId, overrideUserMessageId] = this.processOverideIds();
     const { isEdited, isContinued } = opts;
-    if (opts.isCompaction === true) {
+    if (opts.isCompaction === true || opts.isPiRegenerate === true) {
       /** The leaf stands in for the user message and is already persisted. */
       this.skipSaveUserMessage = true;
     }
@@ -475,6 +476,9 @@ class BaseClient {
     let responseMessageId =
       opts.responseMessageId ?? opts.preallocatedResponseMessageId ?? crypto.randomUUID();
     let head = isEdited ? responseMessageId : parentMessageId;
+    if (opts.isPiRegenerate === true) {
+      head = userMessageId;
+    }
     this.currentMessages = (await this.loadHistory(conversationId, head)) ?? [];
     this.conversationId = conversationId;
 
@@ -563,6 +567,9 @@ class BaseClient {
    * @returns {TMessage}
    */
   resolveStartUserMessage({ opts, message, userMessageId, parentMessageId, conversationId }) {
+    if (opts.isPiRegenerate === true) {
+      return resolvePiRegenerationUser(this.currentMessages, userMessageId, parentMessageId);
+    }
     if (opts.isCompaction) {
       return this.getCompactionAnchor(parentMessageId);
     }
@@ -609,7 +616,7 @@ class BaseClient {
      * merged into the model-facing text later, per message, in `buildMessages`,
      * keeping the stored `text` clean while the count stays consistent.
      */
-    if (!opts.isEdited && !opts.isCompaction) {
+    if (!opts.isEdited && !opts.isCompaction && !opts.isPiRegenerate) {
       const referencedQuotes = getReferencedQuotes(this.options.req?.body?.quotes);
       if (referencedQuotes != null) {
         userMessage.quotes = referencedQuotes;
@@ -835,7 +842,7 @@ class BaseClient {
         }
       }
       this.continued = true;
-    } else if (opts.isCompaction !== true) {
+    } else if (opts.isCompaction !== true && opts.isPiRegenerate !== true) {
       this.currentMessages.push(userMessage);
     }
 
@@ -1216,6 +1223,7 @@ class BaseClient {
 
     if (
       opts.isCompaction !== true &&
+      opts.isPiRegenerate !== true &&
       this.contextMeta?.calibrationRatio > 0 &&
       this.contextMeta.calibrationRatio !== 1 &&
       userMessage.tokenCount > 0

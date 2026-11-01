@@ -113,6 +113,118 @@ describe('BaseClient', () => {
     },
   };
 
+  it('regenerates from the stored user branch without saving the user or replaying the old answer', async () => {
+    const { HumanMessage, AIMessage } = require('@librechat/agents/langchain/messages');
+    const { createPiGenerationDispatcher } = require('@librechat/api');
+    const priorUser = {
+      messageId: 'original-user',
+      parentMessageId: Constants.NO_PARENT,
+      conversationId: 'conversation-1',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'original input',
+      files: [{ file_id: 'original-file' }],
+    };
+    const priorAnswer = {
+      messageId: 'old-answer',
+      parentMessageId: priorUser.messageId,
+      conversationId: 'conversation-1',
+      role: 'assistant',
+      isCreatedByUser: false,
+      text: 'old answer',
+    };
+    getFiles.mockResolvedValueOnce([
+      { file_id: 'original-file', filename: 'original.txt', user: 'user-1', tenantId: 'tenant-1' },
+    ]);
+    const client = initializeFakeClient(
+      apiKey,
+      { ...options, req: { user: { id: 'user-1', tenantId: 'tenant-1' }, body: {}, config: {} } },
+      [priorUser, priorAnswer],
+    );
+    client.clientName = EModelEndpoint.agents;
+    client.saveMessageToDatabase = jest.fn(async (message) => message);
+    client.skipSaveConvo = true;
+    const execute = jest.fn(async () => ({ status: 'completed' }));
+    const dispatch = createPiGenerationDispatcher({ execute });
+    client.sendCompletion = jest.fn(async (payload) => {
+      await dispatch({
+        messages: payload.map(({ role, content }) =>
+          role === 'user' ? new HumanMessage(content) : new AIMessage(content),
+        ),
+        createModelBinding: async () => ({
+          model: { api: 'openai-responses', provider: 'librechat-openai', id: 'gpt-4o-mini' },
+          modelRuntime: {},
+          dispose: jest.fn(),
+        }),
+        createStepIdentity: () => ({
+          id: 'step-1',
+          index: 0,
+          messageId: 'new-answer',
+          runId: 'new-answer',
+          agentId: 'agent-1',
+        }),
+        handleHostEvent: async () => {},
+      });
+      return { completion: 'new answer' };
+    });
+    const response = await client.sendMessage('untrusted replacement', {
+      user: 'user-1',
+      conversationId: 'conversation-1',
+      parentMessageId: Constants.NO_PARENT,
+      overrideParentMessageId: priorUser.messageId,
+      preallocatedUserMessageId: priorUser.messageId,
+      preallocatedResponseMessageId: 'new-answer',
+      isRegenerate: true,
+      isPiRegenerate: true,
+    });
+    expect(client.loadHistory).toHaveBeenCalledWith('conversation-1', priorUser.messageId);
+    expect(client.buildMessages.mock.calls[0][0]).toEqual([priorUser]);
+    expect(getFiles).toHaveBeenCalledWith(
+      { file_id: { $in: ['original-file'] }, user: 'user-1', tenantId: 'tenant-1' },
+      {},
+      {},
+    );
+    expect(client.sendCompletion.mock.calls[0][0]).toEqual([
+      { role: 'user', content: 'original input' },
+    ]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute.mock.calls[0][0]).toMatchObject({
+      history: [],
+      operation: { kind: 'ordered_prompt', content: [{ type: 'text', text: 'original input' }] },
+    });
+    expect(response).toMatchObject({ messageId: 'new-answer', parentMessageId: 'original-user' });
+    await response.databasePromise;
+    expect(client.saveMessageToDatabase).toHaveBeenCalledTimes(1);
+    expect(client.saveMessageToDatabase.mock.calls[0][0].messageId).toBe('new-answer');
+  });
+
+  it('does not persist a regenerated response when the terminal owner has changed', async () => {
+    const user = {
+      messageId: 'original-user',
+      parentMessageId: Constants.NO_PARENT,
+      conversationId: 'conversation-1',
+      role: 'user',
+      isCreatedByUser: true,
+      text: 'original input',
+    };
+    const client = initializeFakeClient(apiKey, options, [user]);
+    client.clientName = EModelEndpoint.agents;
+    client.saveMessageToDatabase = jest.fn(async (message) => message);
+    client.skipSaveConvo = true;
+    const response = await client.sendMessage('original input', {
+      user: 'user-1',
+      conversationId: 'conversation-1',
+      parentMessageId: Constants.NO_PARENT,
+      preallocatedUserMessageId: user.messageId,
+      preallocatedResponseMessageId: 'new-answer',
+      isRegenerate: true,
+      isPiRegenerate: true,
+      beforeResponsePersistence: async () => false,
+    });
+    await expect(response.databasePromise).resolves.toEqual({ persistenceSkipped: true });
+    expect(client.saveMessageToDatabase).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     TestClient = initializeFakeClient(apiKey, options, fakeMessages);
     TestClient.summarizeMessages = jest.fn().mockResolvedValue({

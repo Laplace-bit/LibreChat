@@ -10526,6 +10526,24 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
+  it('dispatches a server-admitted regeneration through Pi and rejects an unadmitted one', async () => {
+    const { HumanMessage } = require('@librechat/agents/langchain/messages');
+    const client = createPiClient({ req: { body: { isRegenerate: true } } });
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [new HumanMessage('stored input')],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
+    await client.sendCompletion([], { isPiRegenerate: true });
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+
+    mockExecutePiGeneration.mockClear();
+    const unadmitted = createPiClient({ req: { body: { isRegenerate: true } } });
+    await unadmitted.sendCompletion([], {});
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+  });
+
   it('projects ACL-resolved manual skill primes into the Pi transcript', async () => {
     const { HumanMessage } = require('@librechat/agents/langchain/messages');
     const skillBody = 'Inspect the pump isolation log before proposing maintenance.';
@@ -12361,6 +12379,32 @@ describe('AgentClient - resumeCompletion content protection', () => {
         body: { source: 'message', field: 'text' },
       },
     );
+  });
+
+  it('rebuilds a regenerated turn from its original user branch when resuming approval', async () => {
+    require('~/models').getMessages.mockResolvedValue([
+      {
+        messageId: 'parent-123',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'original input',
+      },
+      {
+        messageId: 'old-answer',
+        parentMessageId: 'parent-123',
+        isCreatedByUser: false,
+        role: 'assistant',
+        text: 'old answer must not be replayed',
+      },
+    ]);
+    const context = makeContext(undefined);
+    await resumeWithPi(context);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    const input = mockExecutePiGeneration.mock.calls[0][0];
+    expect(JSON.stringify(input.messages)).toContain('original input');
+    expect(JSON.stringify(input.messages)).not.toContain('old answer must not be replayed');
+    expect(input.resumeToolResult.continuation.actionId).toBe('resume-action');
   });
 
   it('resumes a Pi tool with a lazy foreground target even when subagent task context exists', async () => {

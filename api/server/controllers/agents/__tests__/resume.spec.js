@@ -3083,6 +3083,42 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.finishTerminalJob).toHaveBeenCalledTimes(1);
     });
 
+    it('resumes a Pi regeneration approval on the original user branch and new response', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob({
+        metadata: {
+          isRegenerate: true,
+          userMessage: {
+            messageId: USER_MSG_ID,
+            parentMessageId: THREAD_PARENT_ID,
+            text: 'original input',
+            files: [{ file_id: 'original-file' }],
+          },
+        },
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
+      const resumedClient = makeClient();
+      mockInitializeClient.mockResolvedValue({ client: resumedClient, userMCPAuthMap: {} });
+
+      const res = await post(approveBody());
+      expect(res.status).toBe(200);
+      await settled;
+      await flush();
+      expect(resumedClient.parentMessageId).toBe(USER_MSG_ID);
+      expect(resumedClient.responseMessageId).toBe(RESPONSE_MSG_ID);
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({
+          piApprovalContinuation: continuation,
+          piApprovalDecision: { kind: 'execute', args },
+        }),
+      );
+      const initReq = mockInitializeClient.mock.calls[0][0].req;
+      expect(initReq.body.files).toEqual([{ file_id: 'original-file' }]);
+      expect(initReq.body.isRegenerate).not.toBe(true);
+    });
+
     it('rejects stale Pi host state before claiming the approval or rebuilding a client', async () => {
       const { job, continuation, args } = makePiToolApprovalJob();
       const resumeState = makePiApprovalResumeState({

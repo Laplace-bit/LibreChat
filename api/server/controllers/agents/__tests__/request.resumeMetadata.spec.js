@@ -1862,6 +1862,7 @@ describe('ResumableAgentController resume metadata', () => {
         text: 'Regenerate the edited response.',
         messageId: 'user-message',
         parentMessageId: 'parent-message',
+        overrideParentMessageId: 'user-message',
         responseMessageId: 'edited-response',
         isRegenerate: true,
         conversationId,
@@ -1888,11 +1889,71 @@ describe('ResumableAgentController resume metadata', () => {
       conversationId,
       expect.objectContaining({
         initialMetadata: expect.objectContaining({
-          responseMessageId: 'edited-response',
+          responseMessageId: expect.not.stringMatching(/^edited-response$/),
           isRegenerate: true,
         }),
       }),
     );
+  });
+
+  it('starts an admitted Pi regeneration with a fresh response identity and preserves it on failure', async () => {
+    const client = {
+      options: { agent: { id: 'agent-pi' } },
+      sendMessage: jest.fn(async (_text, options) => {
+        options.onStart(
+          {
+            messageId: 'original-user',
+            parentMessageId: 'parent-message',
+            conversationId: 'conversation-123',
+            text: 'stored input',
+          },
+          options.preallocatedResponseMessageId,
+        );
+        throw new Error('provider failed');
+      }),
+    };
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'untrusted client text',
+        messageId: 'submitted-placeholder',
+        parentMessageId: 'parent-message',
+        overrideParentMessageId: 'original-user',
+        responseMessageId: 'old-answer',
+        isRegenerate: true,
+        conversationId: 'conversation-123',
+        endpointOption: { endpoint: 'agents', modelOptions: { model: 'gpt-4.1' } },
+      },
+      config: {},
+    };
+    await AgentController(
+      req,
+      createResumableResponse(),
+      jest.fn(),
+      jest.fn().mockResolvedValue({ client }),
+      null,
+    );
+    for (let index = 0; index < 10; index++) await nextTick();
+
+    expect(client.sendMessage).toHaveBeenCalledTimes(1);
+    const options = client.sendMessage.mock.calls[0][1];
+    expect(options).toMatchObject({
+      isPiRegenerate: true,
+      preallocatedUserMessageId: 'original-user',
+    });
+    expect(options.preallocatedResponseMessageId).not.toBe('old-answer');
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        messageId: options.preallocatedResponseMessageId,
+        parentMessageId: 'original-user',
+        error: true,
+      }),
+      expect.anything(),
+    );
+    expect(
+      mockSaveMessage.mock.calls.some(([, message]) => message.messageId === 'old-answer'),
+    ).toBe(false);
   });
 
   it('falls back to the model spec preset endpoint when no icon URL is configured', async () => {

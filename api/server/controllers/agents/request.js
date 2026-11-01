@@ -392,8 +392,7 @@ async function saveErrorTurn(
   },
 ) {
   try {
-    const { isContinued, isRegenerate, editedContent, responseMessageId, overrideParentMessageId } =
-      req.body ?? {};
+    const { isContinued, isRegenerate, editedContent, responseMessageId } = req.body ?? {};
     if (
       isContinued ||
       editedContent != null ||
@@ -421,11 +420,11 @@ async function saveErrorTurn(
       });
       errorParentMessageId = liveUserMessage.messageId;
     } else if (isRegenerate) {
-      errorMessageId =
-        typeof responseMessageId === 'string' && responseMessageId.length > 0
-          ? responseMessageId
-          : null;
-      errorParentMessageId = liveUserMessage?.messageId ?? overrideParentMessageId ?? null;
+      if (liveUserMessage?.messageId == null) {
+        return;
+      }
+      errorMessageId = liveResponseMessageId ?? null;
+      errorParentMessageId = liveUserMessage.messageId;
     } else {
       userMessage =
         liveUserMessage != null
@@ -797,6 +796,16 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   const userId = req.user.id;
   const tenantId = req.user.tenantId;
   const isCompaction = req.body?.compact === true;
+  const isPiRegenerate =
+    isRegenerate === true &&
+    !isCompaction &&
+    isContinued !== true &&
+    req.body?.isEdited !== true &&
+    editedContent == null &&
+    req.body?.overrideUserMessageId == null &&
+    req.body?.overrideConvoId == null &&
+    typeof overrideParentMessageId === 'string' &&
+    overrideParentMessageId.length > 0;
   if (isCompaction) {
     const rejection = getCompactionRejection(req, {
       conversationId: reqConversationId,
@@ -1581,6 +1590,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       ? (editedResponseMessageId ?? crypto.randomUUID())
       : `${eventTaskId}:assistant`;
   if (
+    isPiRegenerate ||
     (editedContent != null && !isContinued) ||
     (isRegenerate && preallocatedResponseMessageId.endsWith('_'))
   ) {
@@ -1665,7 +1675,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     const selectedAgentRuntime = selectAgentRuntimeForAgent();
     if (
       selectedAgentRuntime.engine === 'pi' &&
-      (isRegenerate ||
+      ((isRegenerate && !isPiRegenerate) ||
         req.body?.isContinued === true ||
         ((isTriggerContinuation ||
           req._isAgentTrigger === true ||
@@ -2531,6 +2541,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           getReqData,
           isContinued,
           isRegenerate,
+          isPiRegenerate,
           isCompaction,
           editedContent,
           conversationId,

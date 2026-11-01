@@ -4015,6 +4015,7 @@ class AgentClient extends BaseClient {
       onProgress: opts.onProgress,
       userMCPAuthMap: opts.userMCPAuthMap,
       abortController: opts.abortController,
+      isPiRegenerate: opts.isPiRegenerate,
     });
 
     const completion = filterMalformedContentParts(this.contentParts);
@@ -5499,7 +5500,7 @@ class AgentClient extends BaseClient {
     }
   }
 
-  async chatCompletion({ payload, abortController = null }) {
+  async chatCompletion({ payload, abortController = null, isPiRegenerate = false }) {
     /** The inherited state is on the job before any abortable setup begins; a
      * publish already started while loading history is simply awaited. */
     await this.publishRunContextMeta?.();
@@ -5818,7 +5819,10 @@ class AgentClient extends BaseClient {
         ) {
           unsupportedModes.push('background');
         }
-        if (request?.body?.isRegenerate === true || request?.body?.isContinued === true) {
+        if (
+          (request?.body?.isRegenerate === true && !isPiRegenerate) ||
+          request?.body?.isContinued === true
+        ) {
           unsupportedModes.push('regenerate');
         }
         if (

@@ -106,6 +106,7 @@ async function createFakeChatServer({
   siblingToolCallId = 'call_sibling',
   toolCallName = 'safe_query',
   toolCallArguments = '{"query":"authorized"}',
+  overflowOnFirst = false,
   responseDelayMs = 0,
   onRequest,
 } = {}) {
@@ -132,6 +133,18 @@ async function createFakeChatServer({
       requestBodies.push(JSON.parse(body));
       authorization = request.headers.authorization;
       onRequest?.();
+      if (overflowOnFirst && requestCount === 1) {
+        response.writeHead(400, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            error: {
+              message: "exceeds the model's maximum context length of 8192 tokens",
+              type: 'invalid_request_error',
+            },
+          }),
+        );
+        return;
+      }
       const sendResponse = () => {
         response.writeHead(200, {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -291,6 +304,100 @@ test('Pi host sessions expose only host tools, keep state in memory, and dispose
   await session.dispose();
   await session.dispose();
   assert.equal(bindingDisposals, 1, 'the model binding is disposed exactly once');
+});
+
+test('Pi host session does not run private automatic compaction at the SDK threshold', async () => {
+  const fakeProvider = await createFakeChatServer();
+  let session;
+  try {
+    const binding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {});
+    const largeTurn = 'factory-context '.repeat(4000);
+    const conversion = convertLibreChatHistoryToPi({
+      model: binding.model,
+      messages: [
+        new HumanMessage(largeTurn),
+        new AIMessage('First response.'),
+        new HumanMessage(largeTurn),
+        new AIMessage('Second response.'),
+        new HumanMessage(largeTurn),
+        new AIMessage('Third response.'),
+        new HumanMessage('Continue with the retained context.'),
+      ],
+    });
+    session = await createHostPiSession({
+      createModelBinding: async () => binding,
+      systemPrompt: conversion.systemPrompt,
+      history: conversion.history,
+      tools: [],
+    });
+    const events = [];
+    session.subscribe((event) => events.push(event));
+    await session.promptContent(conversion.prompt.content);
+
+    assert.equal(fakeProvider.getRequestCount(), 1, 'only the user generation reaches the model');
+    assert.equal(
+      events.some(({ type }) => type === 'compaction_start'),
+      false,
+    );
+    assert.equal(
+      events.some(({ type }) => type === 'compaction_end'),
+      false,
+    );
+    assert.equal(
+      events.some(({ type, entry }) => type === 'entry_appended' && entry.type === 'compaction'),
+      false,
+      'the temporary Pi session does not create an unpersisted summary',
+    );
+  } finally {
+    await session?.dispose();
+    await fakeProvider.close();
+  }
+});
+
+test('Pi host session does not compact or retry privately after provider context overflow', async () => {
+  const fakeProvider = await createFakeChatServer({ overflowOnFirst: true });
+  let session;
+  try {
+    const binding = await createFakeOpenAIModelBinding(fakeProvider.baseUrl, () => {});
+    const largeTurn = 'factory-context '.repeat(4000);
+    const conversion = convertLibreChatHistoryToPi({
+      model: binding.model,
+      messages: [
+        new HumanMessage(largeTurn),
+        new AIMessage('First response.'),
+        new HumanMessage(largeTurn),
+        new AIMessage('Second response.'),
+        new HumanMessage(largeTurn),
+        new AIMessage('Third response.'),
+        new HumanMessage('Continue with the retained context.'),
+      ],
+    });
+    session = await createHostPiSession({
+      createModelBinding: async () => binding,
+      systemPrompt: conversion.systemPrompt,
+      history: conversion.history,
+      tools: [],
+    });
+    const events = [];
+    session.subscribe((event) => events.push(event));
+    await session.promptContent(conversion.prompt.content);
+
+    assert.equal(fakeProvider.getRequestCount(), 1, 'overflow does not start a summary or retry');
+    assert.equal(
+      events.some(({ type }) => type === 'compaction_start'),
+      false,
+    );
+    assert.equal(
+      events.some(({ type, entry }) => type === 'entry_appended' && entry.type === 'compaction'),
+      false,
+    );
+    assert.ok(
+      events.some(({ type, message }) => type === 'message_end' && message.stopReason === 'error'),
+    );
+  } finally {
+    await session?.dispose();
+    await fakeProvider.close();
+  }
 });
 
 test('Pi host session refuses prompts after the host generation is aborted', async () => {

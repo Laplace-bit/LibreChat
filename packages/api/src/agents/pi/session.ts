@@ -235,6 +235,9 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       sessionManager,
       settingsManager: SettingsManager.inMemory({
         defaultTools: options.tools.map(({ name }) => name),
+        // Pi's private compaction is not a durable LibreChat checkpoint and
+        // its summarization usage is not reported through the host lifecycle.
+        compaction: { enabled: false },
       }),
       customTools: options.tools,
     });

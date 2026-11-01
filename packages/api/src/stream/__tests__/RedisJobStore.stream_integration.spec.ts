@@ -4633,6 +4633,138 @@ describe('RedisJobStore Integration Tests', () => {
       await store.destroy();
     });
 
+    test('renews terminal persistence across replicas and fences late finalize after recovery', async () => {
+      if (!ioredisClient) {
+        return;
+      }
+
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const owner = new RedisJobStore(ioredisClient, { completedTtl: 0 });
+      const replica = new RedisJobStore(ioredisClient, { completedTtl: 0 });
+      await Promise.all([owner.initialize(), replica.initialize()]);
+      const streamId = `terminal-persistence-lease-${Date.now()}`;
+      const job = await owner.createJob(streamId, 'terminal-user', streamId);
+      const ownerToken = `owner-${job.createdAt}`;
+      const terminalPublicationId = `terminal:${job.createdAt}`;
+
+      try {
+        await expect(
+          owner.transitionStatus(streamId, {
+            from: 'running',
+            to: 'complete',
+            expectCreatedAt: job.createdAt,
+            terminalPersistenceLeaseMs: 500,
+            patch: {
+              completedAt: Date.now(),
+              terminalPersistencePending: true,
+              // A refreshed lease must supersede the original stale-owner basis.
+              terminalPersistenceStartedAt: Date.now() - 60_000,
+              terminalPersistenceOwnerToken: ownerToken,
+            },
+          }),
+        ).resolves.toBe(true);
+
+        await expect(replica.getJob(streamId)).resolves.toMatchObject({
+          terminalPersistencePending: true,
+          terminalPersistenceOwnerToken: ownerToken,
+          terminalPersistenceLeaseExpiresAt: expect.any(Number),
+        });
+        await expect(
+          owner.renewTerminalPersistenceLease(streamId, job.createdAt, ownerToken, 500),
+        ).resolves.toBe(true);
+        await expect(
+          replica.recoverExpiredTerminalPersistence(
+            streamId,
+            job.createdAt,
+            '{"event":"reconcile"}',
+            terminalPublicationId,
+            30_000,
+          ),
+        ).resolves.toBe(false);
+        await expect(
+          owner.finalizeTerminalPersistence(
+            streamId,
+            job.createdAt,
+            '{"event":"normal"}',
+            undefined,
+            terminalPublicationId,
+          ),
+        ).resolves.toBe(false);
+
+        await new Promise((resolve) => setTimeout(resolve, 550));
+        await expect(
+          replica.recoverExpiredTerminalPersistence(
+            streamId,
+            job.createdAt,
+            '{"event":"reconcile"}',
+            terminalPublicationId,
+            30_000,
+          ),
+        ).resolves.toBe(true);
+        await expect(replica.getJob(streamId)).resolves.toMatchObject({
+          terminalPersistencePending: false,
+          finalEvent: '{"event":"reconcile"}',
+          terminalPublicationId,
+        });
+        const recovered = await replica.getJob(streamId);
+        expect(recovered?.terminalPersistenceOwnerToken).toBeUndefined();
+        expect(recovered?.terminalPersistenceLeaseExpiresAt).toBeUndefined();
+
+        await expect(
+          owner.finalizeTerminalPersistence(
+            streamId,
+            job.createdAt,
+            '{"event":"late-normal"}',
+            undefined,
+            terminalPublicationId,
+            ownerToken,
+          ),
+        ).resolves.toBe(false);
+        await expect(
+          owner.renewTerminalPersistenceLease(streamId, job.createdAt, ownerToken, 500),
+        ).resolves.toBe(false);
+        await expect(
+          owner.recoverExpiredTerminalPersistence(
+            streamId,
+            job.createdAt,
+            '{"event":"second-reconcile"}',
+            terminalPublicationId,
+            30_000,
+          ),
+        ).resolves.toBe(false);
+
+        const legacyStreamId = `${streamId}-legacy`;
+        const legacyJob = await owner.createJob(legacyStreamId, 'terminal-user', legacyStreamId);
+        await expect(
+          owner.transitionStatus(legacyStreamId, {
+            from: 'running',
+            to: 'aborted',
+            expectCreatedAt: legacyJob.createdAt,
+            patch: {
+              completedAt: Date.now(),
+              terminalPersistencePending: true,
+              terminalPersistenceStartedAt: Date.now() - 60_000,
+            },
+          }),
+        ).resolves.toBe(true);
+        await expect(
+          replica.recoverExpiredTerminalPersistence(
+            legacyStreamId,
+            legacyJob.createdAt,
+            '{"event":"legacy-reconcile"}',
+            `terminal:${legacyJob.createdAt}`,
+            30_000,
+          ),
+        ).resolves.toBe(true);
+        await expect(replica.getJob(legacyStreamId)).resolves.toMatchObject({
+          terminalPersistencePending: false,
+          finalEvent: '{"event":"legacy-reconcile"}',
+        });
+      } finally {
+        await Promise.all([owner.destroy(), replica.destroy()]);
+      }
+    });
+
     test('terminal CAS fails closed without deleting malformed recovery state', async () => {
       if (!ioredisClient) {
         return;

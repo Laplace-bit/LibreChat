@@ -1337,6 +1337,53 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         },
       });
 
+    it('resumes a scheduled Pi approval under the same durable occurrence lease', async () => {
+      const { job, continuation, args } = makePiToolApprovalJob({
+        metadata: {
+          scheduleId: 'schedule-1',
+          scheduledFor,
+          scheduleConfigRevision: 4,
+          checkpointNamespace: '1000',
+        },
+      });
+      const resumeState = makePiApprovalResumeState({
+        args,
+        stepIdentity: continuation.stepIdentity,
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
+      const resumedClient = makeClient();
+      mockInitializeClient.mockImplementation(async ({ req }) => {
+        capturedInit = { isScheduledFire: req._isScheduledFire };
+        return { client: resumedClient, userMCPAuthMap: {} };
+      });
+
+      const res = await post(approveBody());
+
+      expect(res.status).toBe(200);
+      await settled;
+      await flush();
+      expect(capturedInit.isScheduledFire).toBe(true);
+      expect(mockClaimScheduleResume).toHaveBeenCalledWith('schedule-1', scheduledFor, {
+        expectedConfigRevision: 4,
+        automatic: true,
+      });
+      expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({
+          piApprovalContinuation: continuation,
+          piApprovalDecision: { kind: 'execute', args },
+        }),
+      );
+      expect(mockRecordScheduleOutcome).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scheduleId: 'schedule-1',
+          scheduledFor,
+          status: 'success',
+          conversationId: CONVO_ID,
+        }),
+      );
+    });
+
     it('persists the server namespace when a scheduled approval pauses again', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(makeScheduledJob());
       mockInitializeClient.mockResolvedValue({

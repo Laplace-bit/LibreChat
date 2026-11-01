@@ -11,6 +11,8 @@ export const PI_SKILL_TOOL_NAME: typeof Constants.SKILL_TOOL = Constants.SKILL_T
 export const PI_SET_MEMORY_TOOL_NAME: typeof SET_MEMORY_TOOL_NAME = SET_MEMORY_TOOL_NAME;
 export const PI_DELETE_MEMORY_TOOL_NAME: typeof DELETE_MEMORY_TOOL_NAME = DELETE_MEMORY_TOOL_NAME;
 export const PI_WEB_SEARCH_TOOL_NAME: typeof Tools.web_search = Tools.web_search;
+/** Foreground nested execution is dispatched by AgentClient, never the generic host batch. */
+export const PI_SUBAGENT_TOOL_NAME: typeof Constants.SUBAGENT = Constants.SUBAGENT;
 
 export type PiSupportedHostTool =
   | typeof Tools.file_search
@@ -21,6 +23,7 @@ export type PiSupportedHostTool =
   | typeof PI_SKILL_TOOL_NAME
   | typeof PI_SET_MEMORY_TOOL_NAME
   | typeof PI_DELETE_MEMORY_TOOL_NAME
+  | typeof PI_SUBAGENT_TOOL_NAME
   | typeof ASK_USER_QUESTION_TOOL_NAME;
 export const PI_SUPPORTED_HOST_TOOLS: readonly PiSupportedHostTool[] = [
   Tools.file_search,
@@ -31,6 +34,7 @@ export const PI_SUPPORTED_HOST_TOOLS: readonly PiSupportedHostTool[] = [
   PI_SKILL_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
   PI_DELETE_MEMORY_TOOL_NAME,
+  PI_SUBAGENT_TOOL_NAME,
   ASK_USER_QUESTION_TOOL_NAME,
 ];
 

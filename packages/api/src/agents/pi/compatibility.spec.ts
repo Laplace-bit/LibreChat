@@ -1,7 +1,7 @@
 import { actionDelimiter, Constants } from 'librechat-data-provider';
 import { assertPiCompatible, isPiManagedCodeExecutionCompatible } from './compatibility';
+import { PI_SUBAGENT_TOOL_NAME, PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 
 describe('assertPiCompatible', () => {
   const supported = {
@@ -20,10 +20,39 @@ describe('assertPiCompatible', () => {
     expect(() =>
       assertPiCompatible({
         ...supported,
-        callableToolNames: [...PI_SUPPORTED_HOST_TOOLS],
-        supportedToolNames: [...PI_SUPPORTED_HOST_TOOLS],
+        callableToolNames: PI_SUPPORTED_HOST_TOOLS.filter((name) => name !== PI_SUBAGENT_TOOL_NAME),
+        supportedToolNames: PI_SUPPORTED_HOST_TOOLS.filter(
+          (name) => name !== PI_SUBAGENT_TOOL_NAME,
+        ),
       }),
     ).not.toThrow();
+  });
+
+  it('allows the generated subagent capability only when the caller has a validated plan', () => {
+    const subagent = {
+      ...supported,
+      callableToolNames: [PI_SUBAGENT_TOOL_NAME],
+      supportedToolNames: [PI_SUBAGENT_TOOL_NAME],
+    };
+    expect(() => assertPiCompatible(subagent)).toThrow(AgentRuntimeUnavailableError);
+    expect(() => assertPiCompatible({ ...subagent, allowPiSubagent: true })).not.toThrow();
+    expect(() =>
+      assertPiCompatible({
+        ...subagent,
+        supportedToolNames: ['invented_tool'],
+        allowPiSubagent: true,
+      }),
+    ).toThrow(AgentRuntimeUnavailableError);
+  });
+
+  it('does not admit background task tools into the Pi callable set', () => {
+    expect(() =>
+      assertPiCompatible({
+        ...supported,
+        callableToolNames: ['check_background_task', 'run_in_background'],
+        supportedToolNames: ['check_background_task', 'run_in_background'],
+      }),
+    ).toThrow(AgentRuntimeUnavailableError);
   });
 
   it('allows only server-loaded MCP names present in the authorized tool-definition set', () => {
@@ -94,10 +123,6 @@ describe('assertPiCompatible', () => {
       ...supported,
       callableToolNames: ['file_search'],
       supportedToolNames: [],
-    },
-    {
-      ...supported,
-      unsupportedModes: ['scheduled'] as const,
     },
     {
       ...supported,

@@ -332,6 +332,10 @@ export interface SerializableJobData {
   terminalPersistencePending?: boolean;
   /** Crash-recovery deadline basis for `terminalPersistencePending`. */
   terminalPersistenceStartedAt?: number;
+  /** Opaque server-side owner for a terminal message-persistence lease. */
+  terminalPersistenceOwnerToken?: string;
+  /** Store-clock expiry for the active terminal persistence owner lease. */
+  terminalPersistenceLeaseExpiresAt?: number;
 
   /** Serialized title event for replay during active-stream resume */
   titleEvent?: string;
@@ -764,6 +768,9 @@ export interface JobStatusTransition {
    * transition. Used by running→requires_action so no enqueue can land between
    * a pre-pause TTL pass and the status CAS. */
   steerReceiptTtlSeconds?: number;
+  /** Store-clock owner lease duration, atomically materialized only when this
+   * transition enters a terminal status with terminalPersistencePending=true. */
+  terminalPersistenceLeaseMs?: number;
   /** Current Pi provider capability. Checked atomically with the transition. */
   expectProviderOwner?: ProviderOwnerContext;
   /** Recovery-only CAS: the exact owner fence must have expired by Redis TIME. */
@@ -1266,6 +1273,28 @@ export interface IJobStoreV2 extends IJobStore {
     finalEvent: string,
     providerOwner?: ProviderOwnerContext,
     terminalPublicationId?: string,
+    terminalPersistenceOwnerToken?: string,
+  ): Promise<boolean>;
+
+  /** Renew an unexpired terminal message-persistence lease owned by the exact
+   * generation and opaque token. False means the claim was fenced or expired. */
+  renewTerminalPersistenceLease(
+    streamId: string,
+    expectedCreatedAt: number,
+    terminalPersistenceOwnerToken: string,
+    leaseMs: number,
+  ): Promise<boolean>;
+
+  /** Atomically replace an expired terminal persistence owner with a
+   * conservative replayable final. Tokenless historical pending records use
+   * `terminalPersistenceStartedAt` (or the existing completedAt/createdAt
+   * fallback) plus the supplied legacy timeout. */
+  recoverExpiredTerminalPersistence(
+    streamId: string,
+    expectedCreatedAt: number,
+    finalEvent: string,
+    terminalPublicationId: string,
+    legacyTimeoutMs: number,
   ): Promise<boolean>;
 
   /**

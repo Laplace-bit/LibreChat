@@ -11,6 +11,7 @@ import type {
   PiDeleteMemoryArguments,
   PiReadFileArguments,
   PiSetMemoryArguments,
+  PiSubagentArguments,
   PiSkillArguments,
   PiWebSearchArguments,
   PiToolArguments,
@@ -45,6 +46,7 @@ import {
   PI_DELETE_MEMORY_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
+  PI_SUBAGENT_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
   isPiSupportedHostToolName,
@@ -137,6 +139,13 @@ export type PiHostToolCall =
       id: string;
       name: typeof PI_DELETE_MEMORY_TOOL_NAME;
       args: PiDeleteMemoryArguments;
+      stepId: string;
+      turn?: number;
+    }
+  | {
+      id: string;
+      name: typeof PI_SUBAGENT_TOOL_NAME;
+      args: PiSubagentArguments;
       stepId: string;
       turn?: number;
     }
@@ -461,6 +470,14 @@ function toPauseToolCall(
         hostExecution,
         review,
       };
+    case PI_SUBAGENT_TOOL_NAME:
+      return {
+        toolCallId: input.toolCallId,
+        name: PI_SUBAGENT_TOOL_NAME,
+        args: input.args,
+        hostExecution,
+        review,
+      };
     case ASK_USER_QUESTION_TOOL_NAME:
       return {
         toolCallId: input.toolCallId,
@@ -558,6 +575,14 @@ function toHostToolCall(input: PiToolExecutionContext, id: string, stepId: strin
       return {
         id,
         name: PI_DELETE_MEMORY_TOOL_NAME,
+        args: input.args,
+        stepId,
+        turn: input.turn,
+      };
+    case PI_SUBAGENT_TOOL_NAME:
+      return {
+        id,
+        name: PI_SUBAGENT_TOOL_NAME,
         args: input.args,
         stepId,
         turn: input.turn,

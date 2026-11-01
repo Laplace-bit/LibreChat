@@ -30,6 +30,16 @@ export interface PiContentEventTranslatorOptions {
   usageAttribution?: { provider?: string; agentId?: string; runId?: string };
   /** Tags terminal provider errors for the host's safe failure observer. */
   onModelProviderError?(error: unknown): void;
+  /** Manual compaction uses one Pi turn as a tool-free summary operation. */
+  summaryOnly?: {
+    agentId: string;
+    provider: string;
+    model: string;
+    messagesToRefineCount: number;
+    summaryVersion: number;
+    streamDeltas: boolean;
+    countSummaryTokens(text: string): number;
+  };
   now?: () => number;
 }
 
@@ -37,6 +47,9 @@ export type PiHostContentEvent =
   | { event: GraphEvents.ON_RUN_STEP; data: Agents.RunStep }
   | { event: GraphEvents.ON_MESSAGE_DELTA; data: Agents.MessageDeltaEvent }
   | { event: GraphEvents.ON_REASONING_DELTA; data: Agents.ReasoningDeltaEvent }
+  | { event: GraphEvents.ON_SUMMARIZE_START; data: Agents.SummarizeStartEvent }
+  | { event: GraphEvents.ON_SUMMARIZE_DELTA; data: Agents.SummarizeDeltaEvent }
+  | { event: GraphEvents.ON_SUMMARIZE_COMPLETE; data: Agents.SummarizeCompleteEvent }
   | { event: GraphEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent };
 
 export type PiHostToolEvent =
@@ -108,6 +121,13 @@ interface PiContentStep {
 interface AssistantMessageState {
   sequence: number;
   contentSteps: Map<string, PiContentStep>;
+  summaryStep?: PiManualSummaryStep;
+  summaryText?: string;
+}
+
+interface PiManualSummaryStep {
+  identity: PiMessageStepIdentity;
+  createdAt: number;
 }
 
 function stepKey(contentIndex: number, contentType: PiContentType): string {
@@ -148,6 +168,7 @@ function asTokenCount(value: number): number {
 function translateAssistantUsage(
   message: AssistantMessage,
   attribution: PiContentEventTranslatorOptions['usageAttribution'],
+  summaryOnly = false,
 ): PiHostUsageEvent {
   const { input, output, cacheRead, cacheWrite, totalTokens, reasoning } = message.usage;
   const inputTokens = asTokenCount(input);
@@ -165,6 +186,7 @@ function translateAssistantUsage(
   return {
     event: UsageEvents.ON_TOKEN_USAGE,
     data: {
+      ...(summaryOnly ? { usage_type: 'summarization' as const } : {}),
       input_tokens: inputTokens + cacheReadTokens + cacheWriteTokens,
       output_tokens: outputTokens,
       total_tokens: total,
@@ -199,17 +221,23 @@ function translateAgentEnd(
     const hasUnsupportedToolCall =
       message.stopReason === 'toolUse' &&
       (toolCalls.length === 0 || toolCalls.some(({ name }) => !supportedToolNames.has(name)));
-    if (event.willRetry !== true && message.stopReason === 'error') {
+    if (event.willRetry !== true && message.stopReason === 'error' && options.summaryOnly == null) {
       const providerError = new PiProviderResponseError(message.errorMessage);
       options.onModelProviderError?.(providerError);
       throw providerError;
     }
     const hasUnsupportedStopReason =
       message.stopReason === 'length' || message.stopReason === 'deferred';
-    if (event.willRetry !== true && (hasUnsupportedStopReason || hasUnsupportedToolCall)) {
+    if (
+      event.willRetry !== true &&
+      (hasUnsupportedStopReason || hasUnsupportedToolCall) &&
+      options.summaryOnly == null
+    ) {
       throw new PiRuntimeResponseError();
     }
-    translated.push(translateAssistantUsage(message, options.usageAttribution));
+    translated.push(
+      translateAssistantUsage(message, options.usageAttribution, options.summaryOnly != null),
+    );
   }
   return translated;
 }
@@ -288,6 +316,193 @@ function translateContentDelta(
   return events;
 }
 
+function createSummaryRunStep(
+  step: PiManualSummaryStep,
+  options: NonNullable<PiContentEventTranslatorOptions['summaryOnly']>,
+): Agents.RunStep {
+  const { identity, createdAt } = step;
+  return {
+    id: identity.id,
+    runId: identity.runId,
+    agentId: identity.agentId,
+    type: StepTypes.MESSAGE_CREATION,
+    index: identity.index,
+    stepDetails: {
+      type: StepTypes.MESSAGE_CREATION,
+      message_creation: { message_id: identity.id },
+    },
+    summary: {
+      type: ContentTypes.SUMMARY,
+      provider: options.provider,
+      model: options.model,
+    },
+    created_at: createdAt,
+    status: 'in_progress',
+  };
+}
+
+function createSummaryStartEvents(
+  step: PiManualSummaryStep,
+  options: NonNullable<PiContentEventTranslatorOptions['summaryOnly']>,
+): PiHostContentEvent[] {
+  return [
+    { event: GraphEvents.ON_RUN_STEP, data: createSummaryRunStep(step, options) },
+    {
+      event: GraphEvents.ON_SUMMARIZE_START,
+      data: {
+        agentId: options.agentId,
+        provider: options.provider,
+        model: options.model,
+        messagesToRefineCount: options.messagesToRefineCount,
+        summaryVersion: options.summaryVersion,
+      },
+    },
+  ];
+}
+
+function closeSummaryStep(
+  step: PiManualSummaryStep,
+  status: Agents.RunStepClosedStatus,
+  closedAt: number,
+): PiHostContentEvent {
+  return {
+    event: GraphEvents.ON_RUN_STEP_CLOSED,
+    data: {
+      id: step.identity.id,
+      index: step.identity.index,
+      type: StepTypes.MESSAGE_CREATION,
+      status,
+      created_at: step.createdAt,
+      closed_at: closedAt,
+      runId: step.identity.runId,
+      agentId: step.identity.agentId,
+    },
+  };
+}
+
+function translateSummaryDelta(
+  message: AssistantMessageState,
+  delta: string,
+  options: NonNullable<PiContentEventTranslatorOptions['summaryOnly']>,
+): PiHostContentEvent[] {
+  if (delta.length === 0) {
+    return [];
+  }
+  message.summaryText = (message.summaryText ?? '') + delta;
+  if (!options.streamDeltas) {
+    return [];
+  }
+  const step = message.summaryStep;
+  if (step == null) {
+    throw new PiRuntimeResponseError();
+  }
+  return [
+    {
+      event: GraphEvents.ON_SUMMARIZE_DELTA,
+      data: {
+        id: step.identity.id,
+        delta: {
+          summary: {
+            type: ContentTypes.SUMMARY,
+            provider: options.provider,
+            model: options.model,
+            content: [{ type: ContentTypes.TEXT, text: delta }],
+          },
+        },
+      },
+    },
+  ];
+}
+
+function translateSummaryAgentEnd(
+  event: Extract<AgentSessionEvent, { type: 'agent_end' }>,
+  message: AssistantMessageState | undefined,
+  options: PiContentEventTranslatorOptions,
+  now: () => number,
+): PiHostEvent[] {
+  const summaryOptions = options.summaryOnly;
+  if (summaryOptions == null) {
+    return translateAgentEnd(event, options);
+  }
+
+  const assistantMessages = event.messages.filter(
+    (candidate): candidate is AssistantMessage => candidate.role === 'assistant',
+  );
+  const usage = assistantMessages.map((candidate) => {
+    if (event.willRetry !== true && candidate.stopReason === 'error') {
+      options.onModelProviderError?.(new PiProviderResponseError(candidate.errorMessage));
+    }
+    return translateAssistantUsage(candidate, options.usageAttribution, true);
+  });
+  if (event.willRetry) {
+    const retryingStep = message?.summaryStep;
+    if (retryingStep == null) {
+      return usage;
+    }
+    return [
+      ...usage,
+      {
+        event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+        data: {
+          id: retryingStep.identity.id,
+          agentId: summaryOptions.agentId,
+          error: 'Summarization attempt failed and is being retried',
+        },
+      },
+      closeSummaryStep(retryingStep, 'failed', now()),
+    ];
+  }
+
+  const assistant = assistantMessages[assistantMessages.length - 1];
+  const step = message?.summaryStep;
+  if (message == null || step == null || assistant == null) {
+    return usage;
+  }
+  if (assistant.stopReason === 'aborted') {
+    return [...usage, closeSummaryStep(step, 'cancelled', now())];
+  }
+
+  const text = (message.summaryText ?? '').trim();
+  if (assistant.stopReason === 'stop' && text.length > 0) {
+    const summary: NonNullable<Agents.SummarizeCompleteEvent['summary']> = {
+      type: ContentTypes.SUMMARY,
+      provider: summaryOptions.provider,
+      model: summaryOptions.model,
+      content: [{ type: ContentTypes.TEXT, text }],
+      tokenCount: summaryOptions.countSummaryTokens(text),
+      summaryVersion: summaryOptions.summaryVersion,
+      boundary: {
+        messageId: step.identity.id,
+        contentIndex: step.identity.index,
+      },
+      createdAt: new Date(now()).toISOString(),
+    };
+    return [
+      {
+        event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+        data: { id: step.identity.id, agentId: summaryOptions.agentId, summary },
+      },
+      closeSummaryStep(step, 'completed', now()),
+      ...usage,
+    ];
+  }
+
+  let failure = 'Summarization failed before producing a complete checkpoint';
+  if (assistant.stopReason === 'stop') {
+    failure = 'Summarization produced empty output';
+  } else if (assistant.stopReason === 'toolUse') {
+    failure = 'Summarization returned a tool call';
+  }
+  return [
+    {
+      event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+      data: { id: step.identity.id, agentId: summaryOptions.agentId, error: failure },
+    },
+    closeSummaryStep(step, 'failed', now()),
+    ...usage,
+  ];
+}
+
 /**
  * Translate Pi's streamed text and reasoning blocks into the host event contract.
  * Tool calls use the authorized host tool adapter; citations, attachments, and
@@ -302,6 +517,30 @@ export function createPiContentEventTranslator(
 
   return (event) => {
     if (event.type === 'message_start') {
+      if (options.summaryOnly != null && event.message.role === 'assistant') {
+        const existingSummaryStep = currentMessage?.summaryStep;
+        const summaryStep =
+          existingSummaryStep ??
+          ({
+            identity: options.createStepIdentity({
+              assistantMessageSequence,
+              piContentIndex: 0,
+              contentType: ContentTypes.TEXT,
+            }),
+            createdAt: now(),
+          } satisfies PiManualSummaryStep);
+        const startEvents =
+          existingSummaryStep == null
+            ? createSummaryStartEvents(summaryStep, options.summaryOnly)
+            : [];
+        currentMessage = {
+          sequence: assistantMessageSequence++,
+          contentSteps: new Map(),
+          summaryStep,
+          summaryText: currentMessage?.summaryText ?? '',
+        };
+        return startEvents;
+      }
       const previousEvents = currentMessage
         ? closeContentSteps(currentMessage, 'completed', now())
         : [];
@@ -314,6 +553,9 @@ export function createPiContentEventTranslator(
 
     if (event.type === 'message_end' && event.message.role === 'assistant') {
       if (!currentMessage) {
+        return [];
+      }
+      if (options.summaryOnly != null) {
         return [];
       }
       let status: Agents.RunStepClosedStatus;
@@ -338,12 +580,26 @@ export function createPiContentEventTranslator(
     }
 
     if (event.type === 'agent_end') {
+      if (options.summaryOnly != null) {
+        const translated = translateSummaryAgentEnd(event, currentMessage, options, now);
+        currentMessage = undefined;
+        return translated;
+      }
       return translateAgentEnd(event, options);
     }
 
     if (event.type === 'agent_settled') {
       if (!currentMessage) {
         return [];
+      }
+      if (options.summaryOnly != null && currentMessage.summaryStep != null) {
+        const closed = closeSummaryStep(
+          currentMessage.summaryStep,
+          event.aborted ? 'cancelled' : 'failed',
+          now(),
+        );
+        currentMessage = undefined;
+        return [closed];
       }
       const status = event.aborted ? 'cancelled' : 'completed';
       const closed = closeContentSteps(currentMessage, status, now());
@@ -357,6 +613,9 @@ export function createPiContentEventTranslator(
 
     const messageEvent = event.assistantMessageEvent;
     if (messageEvent.type === 'text_delta') {
+      if (options.summaryOnly != null) {
+        return translateSummaryDelta(currentMessage, messageEvent.delta, options.summaryOnly);
+      }
       return translateContentDelta(
         currentMessage,
         messageEvent.contentIndex,
@@ -367,6 +626,9 @@ export function createPiContentEventTranslator(
       );
     }
     if (messageEvent.type === 'thinking_delta') {
+      if (options.summaryOnly != null) {
+        return [];
+      }
       return translateContentDelta(
         currentMessage,
         messageEvent.contentIndex,

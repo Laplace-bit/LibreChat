@@ -62,11 +62,15 @@ describe('RedisJobStore', () => {
         '{"final":true}',
         undefined,
         'terminal:123456',
+        'owner-token',
       ),
     ).resolves.toBe(true);
     expect(evalScript.mock.calls[0]?.[0]).toContain('"terminalPublicationId", ARGV[6]');
+    expect(evalScript.mock.calls[0]?.[0]).toContain('terminalPersistenceOwnerToken');
+    expect(evalScript.mock.calls[0]?.[0]).toContain('ARGV[7]');
     const finalizeCall = evalScript.mock.calls[0];
-    expect(finalizeCall?.[finalizeCall.length - 1]).toBe('terminal:123456');
+    expect(finalizeCall?.[finalizeCall.length - 2]).toBe('terminal:123456');
+    expect(finalizeCall?.[finalizeCall.length - 1]).toBe('owner-token');
     expect(srem).not.toHaveBeenCalled();
 
     await expect(
@@ -77,6 +81,60 @@ describe('RedisJobStore', () => {
       'stream:terminal_persistence:v1',
       '["stream-terminal-outbox",123456]',
     );
+  });
+
+  test('renews a terminal persistence lease with one same-slot owner CAS', async () => {
+    const evalScript = jest.fn().mockResolvedValue(1);
+    const redis = { isCluster: true, eval: evalScript } as unknown as Cluster;
+    const store = new RedisJobStore(redis);
+
+    await expect(
+      store.renewTerminalPersistenceLease('stream-terminal-renew', 789, 'owner-token', 45_000),
+    ).resolves.toBe(true);
+
+    const [script, keyCount, jobKey, createdAt, ownerToken, leaseMs] = evalScript.mock.calls[0];
+    expect(script).toContain('terminalPersistenceOwnerToken');
+    expect(script).toContain('terminalPersistenceLeaseExpiresAt');
+    expect(script).toContain('redis.call("TIME")');
+    expect([keyCount, jobKey, createdAt, ownerToken, leaseMs]).toEqual([
+      1,
+      'stream:{stream-terminal-renew}:job',
+      '789',
+      'owner-token',
+      '45000',
+    ]);
+  });
+
+  test('recovers an expired terminal lease atomically and clears its owner', async () => {
+    const evalScript = jest.fn().mockResolvedValue(1);
+    const redis = { isCluster: true, eval: evalScript } as unknown as Cluster;
+    const store = new RedisJobStore(redis);
+
+    await expect(
+      store.recoverExpiredTerminalPersistence(
+        'stream-terminal-recover',
+        987,
+        '{"event":"reconcile"}',
+        'terminal:987',
+        30_000,
+      ),
+    ).resolves.toBe(true);
+
+    const [script, keyCount, jobKey, createdAt, finalEvent, publicationId, legacyTimeout] =
+      evalScript.mock.calls[0];
+    expect(script).toContain('terminalPersistenceLeaseExpiresAt');
+    expect(script).toContain('terminalPersistenceStartedAt');
+    expect(script).toContain('terminalPersistenceOwnerToken');
+    expect(script).toContain('"terminalPersistenceOwnerToken",');
+    expect(script).toContain('redis.call("TIME")');
+    expect([keyCount, jobKey, createdAt, finalEvent, publicationId, legacyTimeout]).toEqual([
+      1,
+      'stream:{stream-terminal-recover}:job',
+      '987',
+      '{"event":"reconcile"}',
+      'terminal:987',
+      '30000',
+    ]);
   });
 
   test('marks only the exact provider segment drained', async () => {

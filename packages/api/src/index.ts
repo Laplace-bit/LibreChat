@@ -148,6 +148,8 @@ export * from './agents/pi/hostToolBatch';
 export * from './agents/pi/dispatch';
 export * from './agents/pi/contextUsage';
 export * from './agents/pi/prompt';
+export * from './agents/pi/compaction';
+export * from './agents/pi/subagents';
 export * from './agents/pi/compatibility';
 export * from './agents/pi/toolNames';
 export * from './agents/pi/mcpSchema';

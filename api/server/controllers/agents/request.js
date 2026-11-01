@@ -1641,22 +1641,41 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       : undefined;
   req._agentEventTriggerProjection = getAgentEventTriggerProjection(agentEventDelivery);
 
+  /** A Pi Event Actor may use the ordinary durable-history path only when the
+   * authenticated delivery is bound to this conversation. Checkpoint turns
+   * need a Pi-owned durable continuation and are rejected after their resolved
+   * turn plan is available below. Internal detached completions are resumes,
+   * not new Event Actor invocations. */
+  const isPiBoundHistoryEventActorCandidate =
+    req._isAgentTrigger === true &&
+    isTriggerContinuation &&
+    isBoundEventContinuation &&
+    typeof boundEventBindingId === 'string' &&
+    boundEventBindingId.length > 0 &&
+    req._agentEventBindingParentConversationId != null &&
+    agentEventDelivery?.event != null &&
+    agentEventDelivery.deliveryKey === clientRequestId &&
+    !isInternalDetachedCompletion &&
+    !isRegenerate &&
+    req.body?.isContinued !== true &&
+    req._recoveredSteerId == null &&
+    req.body?.steerId == null &&
+    req.body?.steer == null;
   try {
     const selectedAgentRuntime = selectAgentRuntimeForAgent();
     if (
       selectedAgentRuntime.engine === 'pi' &&
       (isRegenerate ||
-        isCompaction ||
-        isTriggerContinuation ||
         req.body?.isContinued === true ||
-        scheduleId != null ||
-        req._isScheduledFire === true ||
-        req._isAgentTrigger === true ||
-        req._agentEventBindingParentConversationId != null ||
-        agentEventDelivery != null)
+        ((isTriggerContinuation ||
+          req._isAgentTrigger === true ||
+          req._agentEventBindingParentConversationId != null ||
+          agentEventDelivery != null) &&
+          !isPiBoundHistoryEventActorCandidate))
     ) {
-      // The initial Pi dispatcher is a normal foreground turn. Durable continuations,
-      // schedules, Event Actors, and regeneration still require their own recovery adapter.
+      // Compaction and scheduling use the existing GenerationJobManager lifecycle.
+      // Only authenticated bound Event Actor history turns are considered below;
+      // checkpoint continuations and regeneration still need Pi adapters.
       throw new AgentRuntimeUnavailableError();
     }
 
@@ -2198,6 +2217,21 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       durableEventActorSuspensions: generationProtocolVersion >= GENERATION_PROTOCOL_V2,
       checkpointerType: agentsConfig?.checkpointer?.type,
     });
+
+    if (selectedAgentRuntime.engine === 'pi' && isPiBoundHistoryEventActorCandidate) {
+      if (turnExecutionPlan.strategy !== 'history') {
+        throw new AgentRuntimeUnavailableError();
+      }
+      /** This marker is written only after authenticated binding/delivery checks
+       * and the resolved turn plan. AgentClient treats it as the sole permission
+       * to run a Pi history Event Actor; request data cannot set it. */
+      Object.defineProperty(req, '_piEventActorHistoryInvocationEligible', {
+        configurable: false,
+        enumerable: false,
+        value: true,
+        writable: false,
+      });
+    }
 
     // Resolve title timing from the public agents endpoint first, then fall
     // back to the agent's actual backing provider/custom endpoint.

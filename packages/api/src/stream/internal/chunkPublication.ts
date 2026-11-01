@@ -60,7 +60,9 @@ export function emitChunkWithReceipt(
       : capability(streamId, event, generationId, options);
   }
   return Promise.resolve(
-    transport.emitChunk(streamId, event, generationId, options?.providerOwner),
+    options?.providerOwner == null
+      ? transport.emitChunk(streamId, event, generationId)
+      : transport.emitChunk(streamId, event, generationId, options.providerOwner),
   );
 }
 

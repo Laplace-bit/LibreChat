@@ -382,3 +382,110 @@ describe('createPiGenerationDispatcher caller tool handoff', () => {
     ).resolves.toMatchObject({ status: 'completed' });
   });
 });
+
+describe('createPiGenerationDispatcher summarize-only mode', () => {
+  const createModelBinding = async (): Promise<PiModelBinding> => ({
+    model: {
+      api: 'openai-responses',
+      provider: 'librechat-openai',
+      id: 'gpt-4o-mini',
+      maxTokens: 4096,
+    } as PiModelBinding['model'],
+    modelRuntime: {} as PiModelBinding['modelRuntime'],
+    dispose: jest.fn(),
+  });
+  const summaryOnly: NonNullable<PiGenerationDispatchInput['summaryOnly']> = {
+    settings: {
+      provider: 'openAI',
+      model: 'gpt-4o-mini',
+      prompt: 'Checkpoint everything.',
+      updatePrompt: 'Update the checkpoint.',
+      maxSummaryTokens: 256,
+      streamDeltas: true,
+    },
+    agentId: 'agent-1',
+    messagesToRefineCount: 3,
+    summaryVersion: 2,
+    countSummaryTokens: () => 44,
+  };
+
+  it('rejects every executable capability before creating a model binding', async () => {
+    const execute = jest.fn(async (_value: PiGenerationExecutorInput) => ({
+      status: 'completed' as const,
+    }));
+    const createBinding = jest.fn(createModelBinding);
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          summaryOnly,
+          askUserQuestionEnabled: true,
+          createModelBinding: createBinding,
+        }),
+      ),
+    ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
+    expect(createBinding).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('runs only the summary prompt and applies the configured output token ceiling', async () => {
+    let disposed = false;
+    const bindingFactory = async (): Promise<PiModelBinding> => ({
+      ...(await createModelBinding()),
+      dispose: () => {
+        disposed = true;
+      },
+    });
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const binding = await value.createModelBinding();
+      expect(binding.model.maxTokens).toBe(256);
+      expect(value.tools).toEqual([]);
+      expect(value.systemPrompt).toBe('');
+      expect(value.operation).toEqual({
+        kind: 'ordered_prompt',
+        content: [{ type: 'text', text: 'Checkpoint everything.' }],
+      });
+      expect(
+        value.translateEvent({
+          type: 'message_start',
+          message: {
+            role: 'assistant',
+            content: [],
+            api: 'openai-responses',
+            provider: 'librechat-openai',
+            model: 'gpt-4o-mini',
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: 'stop',
+            timestamp: 1,
+          },
+        }),
+      ).toHaveLength(2);
+      await binding.dispose();
+      return { status: 'completed' as const };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages: [
+            new HumanMessage('The conversation history.'),
+            new HumanMessage('Checkpoint everything.'),
+          ],
+          createModelBinding: bindingFactory,
+          summaryOnly,
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
+    expect(disposed).toBe(true);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+});

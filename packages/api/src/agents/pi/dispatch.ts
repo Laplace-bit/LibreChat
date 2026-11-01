@@ -7,6 +7,7 @@ import type { PiContentEventTranslatorOptions, PiHostEvent } from './events';
 import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiActionToolSchemaRegistry } from './actionSchema';
+import type { PiManualCompactionSettings } from './compaction';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
@@ -26,6 +27,7 @@ import {
 } from './tools';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiCallerToolDefinitions } from './callerTools';
+import { PiCompactionConfigurationError } from './compaction';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
 import { appendPiToolResultContinuation } from './resume';
@@ -70,6 +72,14 @@ export interface PiGenerationDispatchInput {
   toolExecutionGate?: PiToolExecutionGate;
   /** Must be derived from the existing Agent capability and administrator gates. */
   askUserQuestionEnabled?: boolean;
+  /** Uses the model turn only to create one durable manual-compaction summary. */
+  summaryOnly?: {
+    settings: PiManualCompactionSettings;
+    agentId: string;
+    messagesToRefineCount: number;
+    summaryVersion: number;
+    countSummaryTokens(text: string): number;
+  };
   /** Host-generated identities for LibreChat tool call steps. */
   createToolStepIdentity?(): PiMessageStepIdentity;
   createToolCallId?(): string;
@@ -120,6 +130,16 @@ export function createPiGenerationDispatcher(
 
     const usage: UsageMetadata[] = [];
     const toolDefinitions = input.toolDefinitions ?? [];
+    if (
+      input.summaryOnly != null &&
+      (toolDefinitions.length > 0 ||
+        (input.clientToolDefinitions?.length ?? 0) > 0 ||
+        input.executeHostToolCall != null ||
+        input.toolExecutionGate != null ||
+        input.askUserQuestionEnabled === true)
+    ) {
+      throw new AgentRuntimeUnavailableError();
+    }
     let mcpToolSchemas: PiMcpToolSchemaRegistry;
     let actionToolSchemas: PiActionToolSchemaRegistry;
     try {
@@ -205,7 +225,7 @@ export function createPiGenerationDispatcher(
       tools = tools.map((tool) => ({ ...tool, executionMode: 'sequential' }));
     }
 
-    const modelBinding = await input.createModelBinding();
+    let modelBinding = await input.createModelBinding();
     let bindingTransferred = false;
     let bindingDisposed = false;
     const disposeUntransferredBinding = async () => {
@@ -216,6 +236,25 @@ export function createPiGenerationDispatcher(
       await modelBinding.dispose();
     };
     try {
+      if (input.summaryOnly?.settings.maxSummaryTokens !== undefined) {
+        const configuredLimit = Math.floor(input.summaryOnly.settings.maxSummaryTokens);
+        const modelLimit = modelBinding.model.maxTokens;
+        if (
+          !Number.isSafeInteger(configuredLimit) ||
+          configuredLimit < 1 ||
+          !Number.isSafeInteger(modelLimit) ||
+          modelLimit < 1
+        ) {
+          throw new PiCompactionConfigurationError();
+        }
+        modelBinding = {
+          ...modelBinding,
+          model: {
+            ...modelBinding.model,
+            maxTokens: Math.min(modelLimit, configuredLimit),
+          },
+        };
+      }
       if (input.signal?.aborted) {
         await disposeUntransferredBinding();
         return { status: 'cancelled', usage };
@@ -235,6 +274,19 @@ export function createPiGenerationDispatcher(
         ...(input.onModelProviderError == null
           ? {}
           : { onModelProviderError: input.onModelProviderError }),
+        ...(input.summaryOnly == null
+          ? {}
+          : {
+              summaryOnly: {
+                agentId: input.summaryOnly.agentId,
+                provider: input.summaryOnly.settings.provider,
+                model: input.summaryOnly.settings.model,
+                messagesToRefineCount: input.summaryOnly.messagesToRefineCount,
+                summaryVersion: input.summaryOnly.summaryVersion,
+                streamDeltas: input.summaryOnly.settings.streamDeltas,
+                countSummaryTokens: input.summaryOnly.countSummaryTokens,
+              },
+            }),
       });
       if (input.contextUsage != null) {
         const contextUsage = projectPiContextUsage({

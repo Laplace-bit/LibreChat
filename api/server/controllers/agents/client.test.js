@@ -37,8 +37,11 @@ const {
 } = require('librechat-data-provider');
 const {
   GenerationJobManager,
+  PI_SUPPORTED_HOST_TOOLS,
   PINNED_PI_AGENT_RUNTIME,
   PI_SET_MEMORY_TOOL_NAME,
+  isPiActionToolName,
+  isPiMcpToolName,
   createStreamServices,
   createToolExecuteHandler,
   registerToolApprovalHook,
@@ -793,6 +796,44 @@ describe('AgentClient - final model-bound content protection', () => {
 });
 
 describe('AgentClient - detached subagent usage', () => {
+  it('uses one monotonic usage sequence across child emitters and usage events', async () => {
+    const client = Object.create(AgentClient.prototype);
+    client.options = {
+      req: { _resumableStreamId: 'pi-stream' },
+      res: null,
+      endpointTokenConfig: {},
+    };
+    client.responseMessageId = 'response-123';
+    client.jobCreatedAt = 1234;
+    client.usageEmitSink = [];
+    client.pendingSubagentEmits = [];
+    client.subagentUsageSeq = 8;
+    const emitChunk = jest.spyOn(GenerationJobManager, 'emitChunk').mockResolvedValue(undefined);
+
+    try {
+      const firstChildEmitter = client.buildSubagentUsageEmitter();
+      const secondChildEmitter = client.buildSubagentUsageEmitter();
+      const usage = (agentId) => ({
+        input_tokens: 2,
+        output_tokens: 1,
+        total_tokens: 3,
+        model: 'gpt-4o-mini',
+        provider: 'openai',
+        agentId,
+      });
+
+      firstChildEmitter(usage('agent-child-a'));
+      firstChildEmitter(usage('agent-child-a'));
+      secondChildEmitter(usage('agent-child-b'));
+      await Promise.all(client.pendingSubagentEmits);
+
+      expect(emitChunk.mock.calls.map(([, event]) => event.data.seq)).toEqual([9, 10, 11]);
+      expect(client.usageEmitSink.map((event) => event.seq)).toEqual([9, 10, 11]);
+    } finally {
+      emitChunk.mockRestore();
+    }
+  });
+
   it('records each detached call from an immutable snapshot after parent disposal', async () => {
     mockRecordCollectedUsage.mockClear();
     mockCreateDetachedSubagentUsageRecorder.mockClear();
@@ -1017,11 +1058,66 @@ describe('AgentClient - reasoning label accounting', () => {
 });
 
 describe('AgentClient - interrupt discovery persistence', () => {
+  const resumeToolDefinition = {
+    name: Tools.file_search,
+    description: 'Search the agent files.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  };
+
   beforeEach(async () => {
     mockHasDurableAgentInterruptCheckpoint.mockClear();
+    mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
+    mockExecutePiGeneration.mockResolvedValue({ status: 'completed', usage: [] });
+    mockFormatAgentMessages.mockReturnValue({
+      messages: [],
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    });
     await GenerationJobManager.destroy();
     GenerationJobManager.configure({ ...createStreamServices(), cleanupOnComplete: false });
     GenerationJobManager.initialize();
+  });
+
+  const configurePiResume = (client) => {
+    client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
+    client.options.agent.tools = [{ name: Tools.file_search }];
+    client.options.agent.toolDefinitions = [resumeToolDefinition];
+    client.loadHistory = jest.fn().mockResolvedValue([
+      {
+        messageId: 'parent-pi-resume',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'Continue the file search.',
+      },
+    ]);
+    client.buildMessages = jest.fn().mockResolvedValue({ prompt: [] });
+    client.getBuildMessagesOptions = jest.fn(() => ({}));
+    client.isCompactionTurn = jest.fn(() => false);
+  };
+
+  const makeFileSearchContinuation = (client, id) => ({
+    version: 1,
+    actionId: `action-${id}`,
+    piToolCallId: `pi-tool-${id}`,
+    hostToolCallId: `host-tool-${id}`,
+    toolTurn: 0,
+    allowedDecisions: ['approve', 'reject'],
+    stepIdentity: {
+      id: `step-${id}`,
+      index: 0,
+      messageId: client.responseMessageId,
+      runId: client.responseMessageId,
+      agentId: client.options.agent.id,
+    },
+    stepCreatedAt: 100,
+    toolName: Tools.file_search,
+    args: { query: 'resume files' },
   });
 
   afterEach(async () => {
@@ -1661,7 +1757,7 @@ describe('AgentClient - interrupt discovery persistence', () => {
     updateMetadata.mockRestore();
   });
 
-  it('publishes the inherited context meta before the resumed run continues', async () => {
+  it('publishes inherited context meta before Pi resumes a tool continuation', async () => {
     const streamId = 'conversation-context-meta-resume-seed';
     const job = await GenerationJobManager.createJob(streamId, 'user-123', streamId);
     const client = new AgentClient({
@@ -1672,6 +1768,7 @@ describe('AgentClient - interrupt discovery persistence', () => {
         _resumableStreamId: streamId,
       },
       res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       agent: {
         id: 'agent-123',
         endpoint: EModelEndpoint.openAI,
@@ -1683,56 +1780,51 @@ describe('AgentClient - interrupt discovery persistence', () => {
       artifactPromises: [],
       jobCreatedAt: job.createdAt,
     });
+    configurePiResume(client);
     const seed = {
       calibrationRatio: 1.15,
       encoding: client.getEncoding(),
       fading: { v: 1, budgetTokens: 30_000, masked: true },
     };
     client.seedContextMeta(seed);
-    let metaWhenResumed;
-    let metaWhenCreated;
-    const resume = jest.fn(async () => {
-      metaWhenResumed = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
-    });
-    mockCreateRun.mockImplementationOnce(async () => {
-      metaWhenCreated = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
-      return {
-        Graph: null,
-        resume,
-        processStream: jest.fn().mockResolvedValue(),
-        getCalibrationRatio: jest.fn(() => 0),
-        getInterrupt: jest.fn(() => undefined),
-      };
+    let metaWhenDispatched;
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      metaWhenDispatched = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
+      onSessionCreated?.();
+      return { status: 'completed', usage: [] };
     });
     client.conversationId = streamId;
     client.responseMessageId = 'response-context-meta-resume-seed';
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
+    const continuation = makeFileSearchContinuation(client, 'resume-context-meta');
 
     await client.resumeCompletion({
-      resumeValue: { decisions: [] },
+      piApprovalContinuation: continuation,
+      piApprovalDecision: { kind: 'reject' },
       streamId,
       checkpointNamespace: 'resume-seed',
     });
 
-    expect(resume).toHaveBeenCalledTimes(1);
-    expect(metaWhenCreated).toEqual(seed);
-    expect(metaWhenResumed).toEqual(seed);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0].resumeToolResult).toEqual(
+      expect.objectContaining({ continuation }),
+    );
+    expect(metaWhenDispatched).toEqual(seed);
   });
 
-  it('records collected usage as an abort when a resumed run is stopped', async () => {
+  it('records collected usage as an abort when a resumed Pi generation is stopped', async () => {
     jest.clearAllMocks();
     const streamId = 'conversation-resume-stopped';
     const job = await GenerationJobManager.createJob(streamId, 'user-123', streamId);
     const abortController = new AbortController();
-    mockCreateRun.mockImplementationOnce(async () => ({
-      Graph: null,
-      resume: jest.fn(async () => {
-        abortController.abort();
-      }),
-      processStream: jest.fn().mockResolvedValue(),
-      getCalibrationRatio: jest.fn(() => 0),
-      getInterrupt: jest.fn(() => undefined),
-    }));
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      abortController.abort();
+      return {
+        status: 'cancelled',
+        usage: [{ input_tokens: 10, output_tokens: 5 }],
+      };
+    });
     const client = new AgentClient({
       req: {
         user: { id: 'user-123' },
@@ -1741,6 +1833,7 @@ describe('AgentClient - interrupt discovery persistence', () => {
         _resumableStreamId: streamId,
       },
       res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       agent: {
         id: 'agent-123',
         endpoint: EModelEndpoint.openAI,
@@ -1752,24 +1845,27 @@ describe('AgentClient - interrupt discovery persistence', () => {
       artifactPromises: [],
       jobCreatedAt: job.createdAt,
     });
+    configurePiResume(client);
     client.conversationId = streamId;
     client.responseMessageId = 'response-resume-stopped';
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
     await client.resumeCompletion({
-      resumeValue: { decisions: [] },
+      piApprovalContinuation: makeFileSearchContinuation(client, 'resume-stopped'),
+      piApprovalDecision: { kind: 'reject' },
       streamId,
       checkpointNamespace: 'resume-stopped',
       abortController,
     });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
     expect(client.recordCollectedUsage).toHaveBeenCalledTimes(1);
     expect(client.recordCollectedUsage).toHaveBeenCalledWith(
       expect.objectContaining({ context: 'abort' }),
     );
   });
 
-  it('publishes the inherited context meta before a fresh run streams', async () => {
+  it('publishes inherited context meta before fresh Pi generation dispatch', async () => {
     const streamId = 'conversation-context-meta-stream-seed';
     const job = await GenerationJobManager.createJob(streamId, 'user-123', streamId);
     const client = new AgentClient({
@@ -1780,6 +1876,7 @@ describe('AgentClient - interrupt discovery persistence', () => {
         _resumableStreamId: streamId,
       },
       res: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       agent: {
         id: 'agent-123',
         endpoint: EModelEndpoint.openAI,
@@ -1791,26 +1888,19 @@ describe('AgentClient - interrupt discovery persistence', () => {
       artifactPromises: [],
       jobCreatedAt: job.createdAt,
     });
+    client.options.agent.tools = [];
+    client.options.agent.toolDefinitions = [];
     const seed = {
       calibrationRatio: 1.15,
       encoding: client.getEncoding(),
       fading: { v: 1, budgetTokens: 30_000, masked: true },
     };
     client.contextMeta = seed;
-    let metaWhenStreamed;
-    let metaWhenCreated;
-    const processStream = jest.fn(async () => {
-      metaWhenStreamed = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
-    });
-    /** Run creation is the first abortable setup stage; the seed must precede it. */
-    mockCreateRun.mockImplementationOnce(async () => {
-      metaWhenCreated = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
-      return {
-        Graph: null,
-        processStream,
-        getCalibrationRatio: jest.fn(() => 0),
-        getInterrupt: jest.fn(() => undefined),
-      };
+    let metaWhenDispatched;
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      metaWhenDispatched = (await GenerationJobManager.getJob(streamId))?.metadata.contextMeta;
+      onSessionCreated?.();
+      return { status: 'completed', usage: [] };
     });
     client.conversationId = streamId;
     client.responseMessageId = 'response-context-meta-stream-seed';
@@ -1819,9 +1909,8 @@ describe('AgentClient - interrupt discovery persistence', () => {
 
     await client.chatCompletion({ payload: [] });
 
-    expect(processStream).toHaveBeenCalledTimes(1);
-    expect(metaWhenCreated).toEqual(seed);
-    expect(metaWhenStreamed).toEqual(seed);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(metaWhenDispatched).toEqual(seed);
   });
 
   it('keeps the inherited context meta when a fresh run fails before it exists', async () => {
@@ -2364,6 +2453,49 @@ describe('AgentClient - activity phase completion', () => {
 });
 
 describe('AgentClient - startup telemetry', () => {
+  const createPiStartupClient = (options) => {
+    const agent = options.agent;
+    if (agent == null) {
+      return new AgentClient({ ...options, agentRuntime: PINNED_PI_AGENT_RUNTIME });
+    }
+    const definitions = Array.isArray(agent.toolDefinitions) ? [...agent.toolDefinitions] : [];
+    const definedNames = new Set(definitions.map(({ name }) => name));
+    const generatedDefinitions = (agent.tools ?? [])
+      .map((tool) => tool?.name)
+      .filter(
+        (name) =>
+          typeof name === 'string' &&
+          !definedNames.has(name) &&
+          (PI_SUPPORTED_HOST_TOOLS.includes(name) ||
+            isPiMcpToolName(name) ||
+            isPiActionToolName(name)),
+      )
+      .map((name) => ({
+        name,
+        description: `Startup telemetry fixture for ${name}.`,
+        parameters: { type: 'object', properties: {} },
+      }));
+    return new AgentClient({
+      ...options,
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
+      agent: {
+        ...agent,
+        toolDefinitions: [...definitions, ...generatedDefinitions],
+      },
+    });
+  };
+
+  beforeEach(() => {
+    mockCreateRun.mockReset();
+    mockGetAgentPiModelBindingFactory.mockReset().mockReturnValue(jest.fn());
+    mockExecutePiGeneration.mockReset().mockImplementation(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      return { status: 'completed', usage: [] };
+    });
+    jest.spyOn(GenerationJobManager, 'admitPiToolInvocation').mockResolvedValue(true);
+    jest.spyOn(GenerationJobManager, 'assertPiProviderOwner').mockResolvedValue(true);
+  });
+
   afterEach(() => {
     clearToolApprovalHooks();
     mockIsHITLEnabled.mockReturnValue(false);
@@ -2373,7 +2505,7 @@ describe('AgentClient - startup telemetry', () => {
   it.each([false, true])(
     'bounds ordinary-chat admission before provider startup (legacy=%s)',
     async (legacy) => {
-      const createRunBefore = mockCreateRun.mock.calls.length;
+      const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
       const name = 'q' + '_mcp_z'.repeat(legacy ? 4000 : 80);
       const tool_options = Object.fromEntries(
         Array.from({ length: legacy ? 1 : 100 }, (_, i) => [
@@ -2381,7 +2513,7 @@ describe('AgentClient - startup telemetry', () => {
           { approval_mode: 'ask' },
         ]),
       );
-      const client = new AgentClient({
+      const client = createPiStartupClient({
         req: {
           user: { id: 'user-123' },
           body: {},
@@ -2412,7 +2544,8 @@ describe('AgentClient - startup telemetry', () => {
 
       await client.chatCompletion({ payload: [] });
 
-      expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+      expect(mockCreateRun).not.toHaveBeenCalled();
       expect(client.contentParts).toEqual(
         expect.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
       );
@@ -2421,8 +2554,8 @@ describe('AgentClient - startup telemetry', () => {
 
   it('refuses scheduled pause-capable runs before provider startup without Redis', async () => {
     mockIsHITLEnabled.mockReturnValue(false);
-    const createRunBefore = mockCreateRun.mock.calls.length;
-    const client = new AgentClient({
+    const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -2450,14 +2583,15 @@ describe('AgentClient - startup telemetry', () => {
 
     await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
       code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
-      message: expect.stringContaining('USE_REDIS_STREAMS=true'),
+      message: expect.stringContaining('shared run state is unavailable'),
     });
-    expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
   it('includes host-generated background tools in scheduled pause admission', async () => {
-    const createRunBefore = mockCreateRun.mock.calls.length;
-    const client = new AgentClient({
+    const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -2481,7 +2615,7 @@ describe('AgentClient - startup telemetry', () => {
         endpoint: EModelEndpoint.openAI,
         provider: EModelEndpoint.openAI,
         model_parameters: { model: 'gpt-4' },
-        tools: [{ name: 'read_file' }],
+        tools: [{ name: Tools.web_search }],
       },
       subagentTasks: {},
       endpointTokenConfig: {},
@@ -2497,7 +2631,8 @@ describe('AgentClient - startup telemetry', () => {
     await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
       code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
     });
-    expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -2522,7 +2657,7 @@ describe('AgentClient - startup telemetry', () => {
     {
       name: 'dontAsk denied attached-code lazy graph member',
       toolApproval: { enabled: true, mode: 'dontAsk', allow: ['read_file'] },
-      primaryTools: [{ name: 'read_file' }],
+      primaryTools: [{ name: Tools.web_search }],
       subagentAgentConfigs: [
         {
           id: 'lazy-parent',
@@ -2577,15 +2712,8 @@ describe('AgentClient - startup telemetry', () => {
     'does not reject scheduled runs for $name',
     async ({ toolApproval, primaryTools, subagentAgentConfigs, tool_options }) => {
       mockDeleteAgentCheckpoint.mockReset().mockResolvedValue(undefined);
-      const processStream = jest.fn().mockResolvedValue();
-      mockCreateRun.mockResolvedValueOnce({
-        Graph: null,
-        processStream,
-        getCalibrationRatio: jest.fn(() => 0),
-        getInterrupt: jest.fn(() => undefined),
-      });
-      const createRunBefore = mockCreateRun.mock.calls.length;
-      const client = new AgentClient({
+      const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+      const client = createPiStartupClient({
         req: {
           user: { id: 'user-123' },
           body: {},
@@ -2600,7 +2728,7 @@ describe('AgentClient - startup telemetry', () => {
           provider: EModelEndpoint.openAI,
           model_parameters: { model: 'gpt-4' },
           hide_sequential_outputs: false,
-          tools: primaryTools ?? [{ name: 'read_file' }],
+          tools: primaryTools ?? [{ name: Tools.web_search }],
           subagentAgentConfigs,
           tool_options,
         },
@@ -2617,20 +2745,37 @@ describe('AgentClient - startup telemetry', () => {
       client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
       await expect(client.chatCompletion({ payload: [] })).resolves.toBeUndefined();
-      expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore + 1);
-      expect(processStream).toHaveBeenCalledTimes(1);
-      if (toolApproval?.enabled === true) {
-        expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith(
-          'scheduled-non-pausing-policy',
-          undefined,
-          undefined,
-          {
-            throwOnError: true,
-            checkpointNamespace: 'scheduled-non-pausing-generation',
-          },
-        );
-      } else {
-        expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore + 1);
+      const piInput = mockExecutePiGeneration.mock.calls.at(-1)[0];
+      expect(piInput).toEqual(
+        expect.objectContaining({
+          toolExecutionGate: expect.any(Function),
+          createModelBinding: expect.any(Function),
+        }),
+      );
+      expect(mockCreateRun).not.toHaveBeenCalled();
+      /** Pi owns no LangGraph checkpoint, so the Pi turn must never prune one. */
+      expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
+      if (toolApproval?.mode === 'dontAsk') {
+        await expect(
+          piInput.toolExecutionGate({
+            toolCallId: 'scheduled-policy-probe',
+            name: 'query_mcp_db',
+            args: {},
+            turn: 0,
+          }),
+        ).resolves.toEqual({ kind: 'deny' });
+        await expect(
+          piInput.toolExecutionGate({
+            toolCallId: 'scheduled-allowed-probe',
+            name: 'safe_mcp_db',
+            args: {},
+            turn: 0,
+          }),
+        ).resolves.toEqual({ kind: 'execute' });
+      }
+      if (primaryTools?.some(({ name }) => name === 'ask_user_question')) {
+        expect(piInput.askUserQuestionEnabled).toBe(false);
       }
     },
   );
@@ -2657,8 +2802,8 @@ describe('AgentClient - startup telemetry', () => {
   ])(
     'rejects scheduled memory-store runs with a $name before provider execution',
     async (surface) => {
-      const createRunBefore = mockCreateRun.mock.calls.length;
-      const client = new AgentClient({
+      const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+      const client = createPiStartupClient({
         req: {
           user: { id: 'user-123' },
           body: {},
@@ -2692,7 +2837,8 @@ describe('AgentClient - startup telemetry', () => {
       await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
         code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
       });
-      expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+      expect(mockCreateRun).not.toHaveBeenCalled();
     },
   );
 
@@ -2704,8 +2850,8 @@ describe('AgentClient - startup telemetry', () => {
       const unregister = registerToolApprovalHook(() => hook, {
         matcher: `^${prefix}_query_mcp_db$`,
       });
-      const createRunBefore = mockCreateRun.mock.calls.length;
-      const client = new AgentClient({
+      const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+      const client = createPiStartupClient({
         req: {
           user: { id: 'user-123' },
           body: {},
@@ -2745,7 +2891,8 @@ describe('AgentClient - startup telemetry', () => {
         await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
           code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
         });
-        expect(mockCreateRun).toHaveBeenCalledTimes(createRunBefore);
+        expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+        expect(mockCreateRun).not.toHaveBeenCalled();
         expect(hook).not.toHaveBeenCalled();
       } finally {
         unregister();
@@ -2758,7 +2905,7 @@ describe('AgentClient - startup telemetry', () => {
     registerToolApprovalHook((context) =>
       context.userId === 'different-user' ? async () => ({ decision: 'ask' }) : undefined,
     );
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -2810,7 +2957,7 @@ describe('AgentClient - startup telemetry', () => {
       hasToolApprovalHooks: () => true,
       register: () => 1,
     });
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -2830,7 +2977,7 @@ describe('AgentClient - startup telemetry', () => {
         endpoint: EModelEndpoint.openAI,
         provider: EModelEndpoint.openAI,
         model_parameters: { model: 'gpt-4' },
-        tools: [{ name: 'write_file' }],
+        tools: [{ name: Tools.web_search }],
       },
       endpointTokenConfig: {},
       eventHandlers: {},
@@ -2851,36 +2998,26 @@ describe('AgentClient - startup telemetry', () => {
     }
   });
 
-  it('overlaps run creation with checkpoint pruning and joins both before stream processing', async () => {
-    let releaseCheckpoint;
-    let checkpointStarted;
-    const runCreation = deferred();
-    const checkpointStartedPromise = new Promise((resolve) => {
-      checkpointStarted = resolve;
+  it('prepares the Pi session after run input and waits for provider completion', async () => {
+    let providerStarted;
+    const providerStartedPromise = new Promise((resolve) => {
+      providerStarted = resolve;
     });
-    const checkpointPromise = new Promise((resolve) => {
-      releaseCheckpoint = resolve;
-    });
-    const processStream = jest.fn().mockResolvedValue();
-    const run = {
-      Graph: null,
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-    };
+    const piExecution = deferred();
     const startupTelemetry = {
       mark: jest.fn(),
       setStreamId: jest.fn(),
       recordGenerationEvent: jest.fn(),
       end: jest.fn(),
     };
-    mockCreateRun.mockReturnValue(runCreation.promise);
-    mockIsHITLEnabled.mockReturnValue(true);
-    mockDeleteAgentCheckpoint.mockImplementation(() => {
-      checkpointStarted();
-      return checkpointPromise;
+    mockExecutePiGeneration.mockImplementation(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      providerStarted();
+      return piExecution.promise;
     });
+    mockIsHITLEnabled.mockReturnValue(true);
 
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         tenantId: 'request-tenant',
         user: { id: 'user-123', tenantId: 'stale-user-tenant' },
@@ -2897,7 +3034,7 @@ describe('AgentClient - startup telemetry', () => {
         provider: EModelEndpoint.openAI,
         model_parameters: { model: 'gpt-4' },
         hide_sequential_outputs: false,
-        tools: [{ name: 'write_file' }],
+        tools: [{ name: Tools.web_search }],
       },
       endpointTokenConfig: {},
       eventHandlers: {},
@@ -2913,62 +3050,35 @@ describe('AgentClient - startup telemetry', () => {
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
     const completionPromise = client.chatCompletion({ payload: [] });
-    await checkpointStartedPromise;
+    await providerStartedPromise;
 
-    expect(mockCreateRun).toHaveBeenCalledTimes(1);
-    expect(mockCreateRun.mock.calls[0][0]).toEqual(
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0]).toEqual(
       expect.objectContaining({
-        tenantId: 'request-tenant',
-        modelCallbacks: expect.arrayContaining([
-          expect.objectContaining({
-            name: 'librechat-model-bound-content-filter',
-            raiseError: true,
-          }),
-          expect.objectContaining({
-            name: 'librechat-agent-attachment-memory',
-          }),
-        ]),
+        createModelBinding: expect.any(Function),
+        toolExecutionGate: expect.any(Function),
+        usageAttribution: expect.objectContaining({
+          agentId: 'agent-123',
+          runId: 'response-123',
+        }),
       }),
     );
-    expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith(
-      'conversation-123',
-      undefined,
-      undefined,
-      { throwOnError: true, checkpointNamespace: '1000' },
-    );
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
     expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
       'run_input_prepared',
+      'pi_session_started',
     ]);
-    expect(processStream).not.toHaveBeenCalled();
 
-    runCreation.resolve(run);
-    await Promise.resolve();
-
-    expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
-      'run_input_prepared',
-      'run_created',
-    ]);
-    expect(processStream).not.toHaveBeenCalled();
-
-    releaseCheckpoint();
+    piExecution.resolve({ status: 'completed', usage: [] });
     await completionPromise;
 
     expect(startupTelemetry.mark.mock.calls.map(([milestone]) => milestone)).toEqual([
       'run_input_prepared',
-      'run_created',
-      'stream_processing_started',
+      'pi_session_started',
+      'pi_session_settled',
     ]);
-    expect(processStream).toHaveBeenCalledTimes(1);
-    expect(processStream.mock.calls[0][1]).toEqual(
-      expect.objectContaining({
-        configurable: expect.objectContaining({
-          thread_id: 'conversation-123',
-          checkpoint_ns: '',
-          __librechat_checkpoint_ns: '1000',
-        }),
-      }),
-    );
-    expect(processStream.mock.calls[0][1]).not.toHaveProperty('callbacks');
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
   it('derives and forwards compaction guidance without stripping activity labels', async () => {
@@ -3007,7 +3117,7 @@ describe('AgentClient - startup telemetry', () => {
         providedEntryCount: compactionSemanticIndex.length,
       },
     });
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3219,14 +3329,9 @@ describe('AgentClient - startup telemetry', () => {
     }
     expect(policyError).toEqual(expect.objectContaining({ code: 'content_filter_block' }));
 
-    const processStream = jest.fn().mockRejectedValue(policyError);
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-    });
+    mockExecutePiGeneration.mockRejectedValueOnce(policyError);
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3253,6 +3358,8 @@ describe('AgentClient - startup telemetry', () => {
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
     await expect(client.chatCompletion({ payload: [] })).rejects.toBe(policyError);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.contentParts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
     );
@@ -3261,19 +3368,15 @@ describe('AgentClient - startup telemetry', () => {
   it('ends a step-limit turn as incomplete rather than as an error part', async () => {
     jest.clearAllMocks();
     const { GraphRecursionError } = require('@langchain/langgraph');
-    /** The exact error LangGraph throws once the graph runs out of supersteps. */
+    /** The host step-limit marker remains the same at the Pi adapter boundary. */
     const stepLimitError = new GraphRecursionError(
       'Recursion limit of 50 reached without hitting a stop condition.',
       { lc_error_code: 'GRAPH_RECURSION_LIMIT' },
     );
 
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn().mockRejectedValue(stepLimitError),
-      getCalibrationRatio: jest.fn(() => 0),
-    });
+    mockExecutePiGeneration.mockRejectedValueOnce(stepLimitError);
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3302,6 +3405,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.stepLimitReached).toBe(true);
     expect(client.contentParts).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
@@ -3315,13 +3420,9 @@ describe('AgentClient - startup telemetry', () => {
 
   it('still surfaces an error part for an ordinary run failure', async () => {
     jest.clearAllMocks();
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn().mockRejectedValue(new Error('provider exploded')),
-      getCalibrationRatio: jest.fn(() => 0),
-    });
+    mockExecutePiGeneration.mockRejectedValueOnce(new Error('provider exploded'));
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3349,6 +3450,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.stepLimitReached).toBe(false);
     expect(client.contentParts).toEqual(
       expect.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
@@ -3358,15 +3461,16 @@ describe('AgentClient - startup telemetry', () => {
   it('records collected usage as an abort when the run is stopped', async () => {
     jest.clearAllMocks();
     const abortController = new AbortController();
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn(async () => {
-        abortController.abort();
-      }),
-      getCalibrationRatio: jest.fn(() => 0),
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      abortController.abort();
+      return {
+        status: 'cancelled',
+        usage: [{ input_tokens: 10, output_tokens: 5 }],
+      };
     });
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3394,6 +3498,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [], abortController });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.recordCollectedUsage).toHaveBeenCalledTimes(1);
     expect(client.recordCollectedUsage).toHaveBeenCalledWith(
       expect.objectContaining({ context: 'abort' }),
@@ -3402,13 +3508,8 @@ describe('AgentClient - startup telemetry', () => {
 
   it('records collected usage as a message when the run completes', async () => {
     jest.clearAllMocks();
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn().mockResolvedValue(),
-      getCalibrationRatio: jest.fn(() => 0),
-    });
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3436,6 +3537,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [], abortController: new AbortController() });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.recordCollectedUsage).toHaveBeenCalledTimes(1);
     expect(client.recordCollectedUsage).toHaveBeenCalledWith(
       expect.objectContaining({ context: 'message' }),
@@ -3469,22 +3572,16 @@ describe('AgentClient - startup telemetry', () => {
     });
     const abortController = new AbortController();
     const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-    mockCreateRun.mockImplementation(async (options) => {
-      const tracker = options.modelCallbacks.find(
-        (callback) => callback.name === 'librechat-upstream-model-error-tracker',
-      );
-      return {
-        Graph: null,
-        processStream: jest.fn(async () => {
-          tracker.handleLLMError(providerError, 'model-run');
-          abortController.abort();
-          throw providerError;
-        }),
-        getCalibrationRatio: jest.fn(() => 0),
-      };
-    });
+    mockExecutePiGeneration.mockImplementationOnce(
+      async ({ onModelProviderError, onSessionCreated }) => {
+        onSessionCreated?.();
+        onModelProviderError?.(providerError, 'model-run');
+        abortController.abort();
+        throw providerError;
+      },
+    );
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3566,22 +3663,9 @@ describe('AgentClient - startup telemetry', () => {
       const cause = new undiciErrors[causeName](privateValue);
       const providerError = new TypeError('terminated', { cause });
       const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-      mockCreateRun.mockImplementation(async (options) => {
-        const tracker = options.modelCallbacks.find(
-          (callback) => callback.name === 'librechat-upstream-model-error-tracker',
-        );
-        return {
-          Graph: null,
-          processStream: jest.fn(async () => {
-            tracker.handleLLMError(providerError);
-            throw new Error('graph failed', { cause: providerError });
-          }),
-          getCalibrationRatio: jest.fn(() => 0),
-        };
-      });
       mockIsHITLEnabled.mockReturnValue(false);
       const partial = { type: ContentTypes.TEXT, [ContentTypes.TEXT]: 'Partial findings' };
-      const client = new AgentClient({
+      const client = createPiStartupClient({
         req: {
           user: { id: 'user-123' },
           body: {},
@@ -3611,6 +3695,13 @@ describe('AgentClient - startup telemetry', () => {
       client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
       try {
+        mockExecutePiGeneration.mockImplementationOnce(
+          async ({ onModelProviderError, onSessionCreated }) => {
+            onSessionCreated?.();
+            onModelProviderError?.(providerError);
+            throw new Error('Pi generation failed', { cause: providerError });
+          },
+        );
         await client.chatCompletion({ payload: [] });
 
         expect(client.contentParts).toEqual(
@@ -3643,15 +3734,9 @@ describe('AgentClient - startup telemetry', () => {
    *  Regenerate that answers that user message instead of redoing the run. */
   it('marks the failure a compaction turn persists instead of a summary', async () => {
     jest.clearAllMocks();
-    mockCreateRun.mockImplementation(async () => ({
-      Graph: null,
-      processStream: jest.fn(async () => {
-        throw new Error('summarizer unavailable');
-      }),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
+    mockExecutePiGeneration.mockRejectedValueOnce(new Error('summarizer unavailable'));
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: { compact: true },
@@ -3679,6 +3764,8 @@ describe('AgentClient - startup telemetry', () => {
 
     const { completion } = await client.sendCompletion([]);
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(completion).toEqual([
       expect.objectContaining({ type: ContentTypes.ERROR, initiatedBy: 'user' }),
     ]);
@@ -3690,13 +3777,9 @@ describe('AgentClient - startup telemetry', () => {
    *  apart from an answer to the message it hangs off. */
   it('records a marked typed failure when a compaction run produces nothing', async () => {
     jest.clearAllMocks();
-    mockCreateRun.mockImplementation(async () => ({
-      Graph: null,
-      processStream: jest.fn(async () => {}),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
+    mockExecutePiGeneration.mockResolvedValueOnce({ status: 'completed', usage: [] });
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: { compact: true },
@@ -3724,6 +3807,8 @@ describe('AgentClient - startup telemetry', () => {
 
     const { completion } = await client.sendCompletion([]);
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(completion).toEqual([
       {
         type: ContentTypes.ERROR,
@@ -3739,21 +3824,15 @@ describe('AgentClient - startup telemetry', () => {
     const recoveredProviderError = new Error('recovered provider failure');
     const checkpointError = new Error('checkpoint failed');
     const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-    mockCreateRun.mockImplementation(async (options) => {
-      const tracker = options.modelCallbacks.find(
-        (callback) => callback.name === 'librechat-upstream-model-error-tracker',
-      );
-      return {
-        Graph: null,
-        processStream: jest.fn(async () => {
-          tracker.handleLLMError(recoveredProviderError, 'recovered-model-run');
-          throw checkpointError;
-        }),
-        getCalibrationRatio: jest.fn(() => 0),
-      };
-    });
+    mockExecutePiGeneration.mockImplementationOnce(
+      async ({ onModelProviderError, onSessionCreated }) => {
+        onSessionCreated?.();
+        onModelProviderError?.(recoveredProviderError, 'recovered-model-run');
+        throw checkpointError;
+      },
+    );
     mockIsHITLEnabled.mockReturnValue(false);
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -3781,6 +3860,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(errorSpy).toHaveBeenCalledWith(
       '[api/server/controllers/agents/client.js #sendCompletion] Unhandled error',
       { type: 'Error' },
@@ -3792,36 +3873,38 @@ describe('AgentClient - startup telemetry', () => {
     errorSpy.mockRestore();
   });
 
-  it('cancels current attachment persistence after combined admission rejects the run', async () => {
+  it('cancels current attachment persistence when combined admission rejects before Pi dispatch', async () => {
     jest.clearAllMocks();
-    let attachmentLimitError;
-    try {
-      require('@librechat/api').assertAgentAttachmentLimits({
-        attachments: [{ file_id: 'too-large', bytes: 2_000_000 }],
-        fileConfig: { fileContextSizeLimit: 1 },
-      });
-    } catch (error) {
-      attachmentLimitError = error;
-    }
-    expect(attachmentLimitError).toEqual(
-      expect.objectContaining({ code: 'AGENT_ATTACHMENT_LIMIT_EXCEEDED' }),
-    );
-    expect(require('@librechat/api').isAgentAttachmentLimitError(attachmentLimitError)).toBe(true);
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn().mockRejectedValue(attachmentLimitError),
-      getCalibrationRatio: jest.fn(() => 0),
-    });
     mockIsHITLEnabled.mockReturnValue(false);
     const currentFile = { file_id: 'rejected-current', bytes: 600_000 };
+    const scopedFile = { file_id: 'rejected-scoped', bytes: 600_000 };
     const cancel = jest.fn();
-    const client = new AgentClient({
-      req: {
-        user: { id: 'user-123' },
-        body: { files: [{ file_id: currentFile.file_id }] },
-        config: { endpoints: { [EModelEndpoint.agents]: {} } },
-        _resumableStreamId: 'conversation-attachment-limit',
+    const req = {
+      user: { id: 'user-123' },
+      body: { files: [{ file_id: currentFile.file_id }] },
+      config: {
+        endpoints: { [EModelEndpoint.agents]: {} },
+        fileConfig: { fileContextSizeLimit: 1 },
       },
+      _resumableStreamId: 'conversation-attachment-limit',
+    };
+    const assertAgentAttachmentLimits = require('@librechat/api').assertAgentAttachmentLimits;
+    const assertWithinFileLimit = (attachments) =>
+      assertAgentAttachmentLimits({
+        attachments,
+        req,
+        endpoint: EModelEndpoint.openAI,
+        countRepeatedExtractedText: true,
+        enforceAttachmentCount: false,
+        useGlobalContextSizeLimit: true,
+      });
+    expect(() => assertWithinFileLimit([currentFile])).not.toThrow();
+    expect(() => assertWithinFileLimit([scopedFile])).not.toThrow();
+    expect(() => assertWithinFileLimit([currentFile, scopedFile])).toThrow(
+      expect.objectContaining({ code: 'AGENT_ATTACHMENT_LIMIT_EXCEEDED' }),
+    );
+    const client = createPiStartupClient({
+      req,
       res: {},
       agent: {
         id: 'agent-123',
@@ -3841,6 +3924,8 @@ describe('AgentClient - startup telemetry', () => {
     client.responseMessageId = 'response-attachment-limit';
     client.parentMessageId = 'parent-attachment-limit';
     client.modelBoundCurrentFiles = [currentFile];
+    client.turnSharedAttachmentFiles = [currentFile];
+    client.turnScopedAttachmentsByAgentId = new Map([['agent-worker', [scopedFile]]]);
     client.modelBoundUserMessagePersistence = {
       cancel,
       isPending: jest.fn(() => true),
@@ -3850,6 +3935,8 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(cancel).toHaveBeenCalledTimes(1);
     expect(client.options.attachments).toEqual([]);
     expect(client.modelBoundCurrentFiles).toEqual([]);
@@ -3868,15 +3955,15 @@ describe('AgentClient - startup telemetry', () => {
     const attachmentError = new (require('@librechat/api').AttachmentObjectNotFoundError)(
       'missing-current',
     );
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream: jest.fn().mockRejectedValue(attachmentError),
-      getCalibrationRatio: jest.fn(() => 0),
-    });
+    const inspectPiInput = jest
+      .spyOn(AgentClient.prototype, 'assertBuiltModelBoundContent')
+      .mockImplementation(() => {
+        throw attachmentError;
+      });
     mockIsHITLEnabled.mockReturnValue(false);
     const currentFile = { file_id: 'missing-current', bytes: 600_000 };
     const cancel = jest.fn();
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: { files: [{ file_id: currentFile.file_id }] },
@@ -3911,7 +3998,10 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
-    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(inspectPiInput).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(cancel).toHaveBeenCalled();
     expect(client.options.attachments).toEqual([]);
     expect(client.modelBoundCurrentFiles).toEqual([]);
     expect(client.contentParts).toEqual(
@@ -3924,7 +4014,7 @@ describe('AgentClient - startup telemetry', () => {
     );
   });
 
-  it('evolves warm compaction guidance while injecting only the new event message', async () => {
+  it('fails closed for warm checkpoint Event Actor turns before Pi dispatch', async () => {
     jest.clearAllMocks();
     const history = { _getType: () => 'human', content: 'old turn' };
     const currentEvent = { _getType: () => 'human', content: 'new event' };
@@ -3963,23 +4053,18 @@ describe('AgentClient - startup telemetry', () => {
       compactionSemanticIndexSnapshot: evolvedCompactionSemanticIndexSnapshot,
     });
     let client;
-    const processStream = jest.fn(async () => {
-      client.contentParts.push(
-        {
-          type: ContentTypes.SUMMARY,
-          content: [{ type: ContentTypes.TEXT, text: 'Fresh compacted context.' }],
-          tokenCount: 18,
-          boundary: { messageId: 'step_summary', contentIndex: 0 },
-        },
-        { type: ContentTypes.TEXT, text: 'Done.' },
-      );
+    const piSummary = {
+      type: ContentTypes.SUMMARY,
+      content: [{ type: ContentTypes.TEXT, text: 'Fresh compacted context.' }],
+      tokenCount: 18,
+      boundary: { messageId: 'step_summary', contentIndex: 0 },
+    };
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      client.contentParts.push(piSummary, { type: ContentTypes.TEXT, text: 'Done.' });
+      return { status: 'completed', usage: [] };
     });
-    mockCreateRun.mockResolvedValue({
-      Graph: null,
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-    });
-    client = new AgentClient({
+    client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -4023,85 +4108,62 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
-    expect(mockCreateRun).toHaveBeenCalledWith(
-      expect.objectContaining({
-        messages: [history, currentEvent],
-        discoveredToolNames: ['deferred_tool'],
-        eventActorCheckpointing: true,
-        /** The DB-derived token map is positional over full history, which a
-         * checkpoint-restored graph state no longer matches. It must be blank
-         * so the pruner recounts against the messages actually in state. The
-         * cross-run summary stays: it summarizes pre-boundary turns that were
-         * excluded from the history the committed checkpoint was built from. */
-        indexTokenCountMap: {},
-        initialSummary: { text: 'summary of earlier turns', tokenCount: 40 },
-        calibrationRatio: 1.25,
-        fadingTier: { v: 2, budgetTokens: 20_000, masked: true },
-        fadingTiers: {
-          'agent-123': { v: 2, budgetTokens: 20_000, masked: true },
-        },
-        compactionSemanticIndex: evolvedCompactionSemanticIndexSnapshot.entries,
-      }),
-    );
-    /** The seeded map must be prototype-safe: a null-prototype record built from own keys. */
-    const seededTiers = mockCreateRun.mock.calls.at(-1)[0].fadingTiers;
-    expect(Object.getPrototypeOf(seededTiers)).toBeNull();
-    expect(mockFormatAgentMessages.mock.calls[0][4]).toEqual(
-      expect.objectContaining({
-        compactionSemanticIndex: expect.objectContaining({
-          baseSnapshot: baseCompactionSemanticIndexSnapshot,
-        }),
-      }),
-    );
-    expect(mockFormatAgentMessages).toHaveBeenCalledTimes(1);
-    expect(mockStripActivityLabelParts).not.toHaveBeenCalled();
-    expect(client.compactionSemanticIndexSnapshot).toBe(evolvedCompactionSemanticIndexSnapshot);
-    expect(processStream).toHaveBeenCalledWith(
-      { messages: [currentEvent] },
-      expect.objectContaining({
-        configurable: expect.objectContaining({
-          thread_id: 'conversation-123',
-          checkpoint_id: 'checkpoint-base',
-          __librechat_checkpoint_ns: 'event-actor/fork',
-          __librechat_event_actor_invocation_id: 'event-2',
-          event_actor_invocation_id: 'event-2',
-          event_actor_depth: 1,
-        }),
-      }),
-      expect.anything(),
-    );
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
-    expect(client.eventActorSummary).toEqual({
-      text: 'Fresh compacted context.',
-      tokenCount: 18,
-      version: 1,
-    });
-    expect(client.contentParts).not.toEqual(
-      expect.arrayContaining([expect.objectContaining({ type: ContentTypes.SUMMARY })]),
+    expect(client.contentParts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          [ContentTypes.ERROR]: expect.stringContaining('AGENT_RUNTIME_UNAVAILABLE'),
+        }),
+      ]),
     );
   });
 
-  it('does not expose or process a fresh graph when strict checkpoint pruning fails', async () => {
+  it('dispatches an internally admitted history Event Actor turn through Pi', async () => {
     jest.clearAllMocks();
-    const checkpointGeneration = {
-      threadId: 'conversation-123',
-      checkpointIds: ['legacy-root', 'legacy-child'],
+    const req = {
+      user: { id: 'user-123' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+      _isAgentTrigger: true,
+      _agentEventBindingId: 'binding-1',
+      _agentEventBindingParentConversationId: 'parent-conversation',
+      _piEventActorHistoryInvocationEligible: true,
+      _resumableStreamId: 'conversation-pi-event-history',
     };
-    const processStream = jest.fn().mockResolvedValue();
-    const run = {
-      Graph: { id: 'must-not-be-exposed' },
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-    };
-    mockCreateRun.mockResolvedValue(run);
-    mockIsHITLEnabled.mockReturnValue(true);
-    mockCaptureAgentCheckpointGeneration.mockResolvedValue(checkpointGeneration);
-    mockDeleteAgentCheckpoint.mockRejectedValue(new Error('checkpoint prune failed'));
-    jest.spyOn(GenerationJobManager, 'getJobStore').mockReturnValue({
-      getJob: jest.fn().mockResolvedValue({ createdAt: 1000, status: 'running' }),
+    const client = createPiStartupClient({
+      req,
+      res: {},
+      agent: {
+        id: 'agent-pi-event-history',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        toolDefinitions: [],
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
     });
+    client.conversationId = 'conversation-pi-event-history';
+    client.responseMessageId = 'response-pi-event-history';
+    client.parentMessageId = 'parent-pi-event-history';
 
-    const client = new AgentClient({
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before Pi dispatch when its model binding is unavailable', async () => {
+    jest.clearAllMocks();
+    mockGetAgentPiModelBindingFactory.mockReturnValueOnce(undefined);
+    mockIsHITLEnabled.mockReturnValue(true);
+
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
@@ -4139,53 +4201,41 @@ describe('AgentClient - startup telemetry', () => {
 
     await client.chatCompletion({ payload: [] });
 
-    expect(mockDeleteAgentCheckpoint).toHaveBeenCalledWith(
-      'conversation-123',
-      undefined,
-      checkpointGeneration,
-      { throwOnError: true },
-    );
-    expect(processStream).not.toHaveBeenCalled();
-    expect(client.run).not.toBe(run);
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockCaptureAgentCheckpointGeneration).not.toHaveBeenCalled();
+    expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
     expect(client.contentParts).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          [ContentTypes.ERROR]: expect.stringContaining('checkpoint prune failed'),
+          [ContentTypes.ERROR]: expect.stringContaining('AGENT_RUNTIME_UNAVAILABLE'),
         }),
       ]),
     );
   });
 
-  it('does not let a stale v1 fresh prune delete a paused v2 replacement generation', async () => {
+  it('fences tool side effects from a replaced Pi generation', async () => {
     jest.clearAllMocks();
-    const checkpointGeneration = {
-      threadId: 'conversation-123',
-      checkpointIds: ['legacy-root', 'legacy-child'],
-    };
-    const processStream = jest.fn().mockResolvedValue();
-    const run = {
-      Graph: { id: 'stale-v1-graph' },
-      processStream,
-      getCalibrationRatio: jest.fn(() => 0),
-    };
-    mockCreateRun.mockResolvedValue(run);
-    mockIsHITLEnabled.mockReturnValue(true);
-    mockCaptureAgentCheckpointGeneration.mockResolvedValue(checkpointGeneration);
-    const getJob = jest.fn().mockResolvedValue({
-      createdAt: 2000,
-      status: 'requires_action',
-      checkpointNamespace: '2000',
+    const streamId = 'conversation-123';
+    const jobCreatedAt = 1000;
+    const sideEffect = jest.fn();
+    const piToolHandler = { handle: sideEffect };
+    GenerationJobManager.admitPiToolInvocation.mockResolvedValueOnce(false);
+    mockExecutePiGeneration.mockImplementationOnce(async (input) => {
+      await expect(input.executeHostToolCall({ id: 'stale-pi-call' })).rejects.toMatchObject({
+        code: 'PROVIDER_OWNER_FENCED',
+      });
+      return { status: 'completed', usage: [] };
     });
-    jest.spyOn(GenerationJobManager, 'getJobStore').mockReturnValue({ getJob });
 
-    const client = new AgentClient({
+    const client = createPiStartupClient({
       req: {
         user: { id: 'user-123' },
         body: {},
         config: {
           endpoints: { [EModelEndpoint.agents]: { toolApproval: { enabled: true } } },
         },
-        _resumableStreamId: 'conversation-123',
+        _resumableStreamId: streamId,
       },
       res: {},
       agent: {
@@ -4194,46 +4244,51 @@ describe('AgentClient - startup telemetry', () => {
         provider: EModelEndpoint.openAI,
         model_parameters: { model: 'gpt-4' },
         hide_sequential_outputs: false,
-        tools: [{ name: 'write_file' }],
+        tools: [{ name: Tools.file_search }],
+        toolDefinitions: [
+          {
+            name: Tools.file_search,
+            description: 'Search agent files.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query'],
+            },
+          },
+        ],
       },
       endpointTokenConfig: {},
-      eventHandlers: {},
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: piToolHandler },
       contentParts: [],
       collectedUsage: [],
       artifactPromises: [],
     });
-    client.conversationId = 'conversation-123';
-    client.jobCreatedAt = 1000;
+    client.conversationId = streamId;
+    client.jobCreatedAt = jobCreatedAt;
     client.responseMessageId = 'response-123';
     client.parentMessageId = 'parent-123';
     client.recordCollectedUsage = jest.fn().mockResolvedValue();
 
     await client.chatCompletion({ payload: [] });
 
-    expect(mockCaptureAgentCheckpointGeneration).toHaveBeenCalledWith(
-      'conversation-123',
-      undefined,
-      { throwOnError: true },
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(GenerationJobManager.admitPiToolInvocation).toHaveBeenCalledWith(
+      streamId,
+      jobCreatedAt,
+      'stale-pi-call',
     );
-    expect(getJob).toHaveBeenCalledTimes(1);
+    expect(sideEffect).not.toHaveBeenCalled();
     expect(mockDeleteAgentCheckpoint).not.toHaveBeenCalled();
-    expect(processStream).not.toHaveBeenCalled();
-    expect(client.run).not.toBe(run);
+    expect(mockCaptureAgentCheckpointGeneration).not.toHaveBeenCalled();
+    expect(mockCreateRun).not.toHaveBeenCalled();
     expect(client.contentParts).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          [ContentTypes.ERROR]: expect.stringContaining(
-            'Generation replaced before legacy checkpoint cleanup',
-          ),
-        }),
-      ]),
+      expect.not.arrayContaining([expect.objectContaining({ type: ContentTypes.ERROR })]),
     );
   });
 });
 
 describe('AgentClient - titleConvo', () => {
   let client;
-  let mockRun;
   let mockReq;
   let mockRes;
   let mockAgent;
@@ -4243,12 +4298,9 @@ describe('AgentClient - titleConvo', () => {
     // Reset all mocks
     jest.clearAllMocks();
 
-    // Mock run object
-    mockRun = {
-      generateTitle: jest.fn().mockResolvedValue({
-        title: 'Generated Title',
-      }),
-    };
+    mockGenerateAgentConversationTitle.mockReset().mockResolvedValue({
+      title: 'Generated Pi Title',
+    });
 
     // Mock agent - with both endpoint and provider
     mockAgent = {
@@ -4291,11 +4343,11 @@ describe('AgentClient - titleConvo', () => {
       res: mockRes,
       agent: mockAgent,
       endpointTokenConfig: {},
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
     };
 
     // Create client instance
     client = new AgentClient(mockOptions);
-    client.run = mockRun;
     client.responseMessageId = 'response-123';
     client.conversationId = 'convo-123';
     client.contentParts = [{ type: 'text', text: 'Test content' }];
@@ -4303,26 +4355,26 @@ describe('AgentClient - titleConvo', () => {
   });
 
   describe('titleConvo method', () => {
-    it('should throw error if run is not initialized', async () => {
-      client.run = null;
-
+    it('fails closed when no pinned Pi runtime is available for title generation', async () => {
+      client.options.agentRuntime = undefined;
       await expect(
         client.titleConvo({ text: 'Test', abortController: new AbortController() }),
-      ).rejects.toThrow('Run not initialized');
+      ).rejects.toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
+      expect(mockCreateRun).not.toHaveBeenCalled();
     });
 
-    it('waits for the run in immediate mode instead of throwing', async () => {
-      client.run = null;
-      const abortController = new AbortController();
+    it('generates immediate titles through Pi without an AgentRun', async () => {
+      await client.titleConvo({
+        text: 'Test',
+        abortController: new AbortController(),
+        immediate: true,
+      });
 
-      const titlePromise = client.titleConvo({ text: 'Test', abortController, immediate: true });
-
-      // Simulate `chatCompletion` assigning the run (client.js: `this.run = run`).
-      client.run = mockRun;
-      client._resolveRun(mockRun);
-
-      await titlePromise;
-      expect(mockRun.generateTitle).toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
+        expect.objectContaining({ inputText: 'Test', contentParts: [], runId: 'response-123' }),
+      );
+      expect(mockCreateRun).not.toHaveBeenCalled();
     });
 
     it.each(['success', 'write-failure', 'policy-rejection', 'abort'])(
@@ -4360,7 +4412,7 @@ describe('AgentClient - titleConvo', () => {
         const abortController = new AbortController();
         const title = client.titleConvo({ text: message.text, abortController, immediate: true });
         await new Promise((resolve) => setImmediate(resolve));
-        expect(mockRun.generateTitle).not.toHaveBeenCalled();
+        expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
         expect(client.recordCollectedUsage).not.toHaveBeenCalled();
         if (outcome === 'abort') {
           abortController.abort();
@@ -4374,12 +4426,14 @@ describe('AgentClient - titleConvo', () => {
           const write = deferred();
           const admission = api.requirePrivateTextPersistence(mockReq, () => write.promise);
           await Promise.resolve();
-          expect(mockRun.generateTitle).not.toHaveBeenCalled();
+          expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
           write.resolve({ message });
           await admission;
         }
         await title;
-        expect(mockRun.generateTitle).toHaveBeenCalledTimes(outcome === 'success' ? 1 : 0);
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledTimes(
+          outcome === 'success' ? 1 : 0,
+        );
         expect(client.recordCollectedUsage).toHaveBeenCalledTimes(outcome === 'success' ? 1 : 0);
       },
     );
@@ -4390,7 +4444,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text: 'Hello there', abortController, immediate: true });
 
-      const call = mockRun.generateTitle.mock.calls[0][0];
+      const call = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(call.contentParts).toEqual([]);
       expect(call.inputText).toBe('Hello there');
     });
@@ -4401,16 +4455,11 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text: 'Hello there', abortController });
 
-      const call = mockRun.generateTitle.mock.calls[0][0];
+      const call = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(call.contentParts).toEqual([{ type: 'text', text: 'Full response' }]);
     });
 
     it('generates immediate and final Pi titles without creating or waiting for an AgentRun', async () => {
-      client.run = null;
-      client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
-      client._waitForRun = jest.fn(() => {
-        throw new Error('Pi title generation must not wait for an AgentRun');
-      });
       client.contentParts = [{ type: 'text', text: 'The line is back online.' }];
 
       await client.titleConvo({
@@ -4438,8 +4487,7 @@ describe('AgentClient - titleConvo', () => {
           runId: 'response-123',
         }),
       );
-      expect(client._waitForRun).not.toHaveBeenCalled();
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockCreateRun).not.toHaveBeenCalled();
       expect(client.recordCollectedUsage).toHaveBeenCalledTimes(2);
       expect(client.recordCollectedUsage).toHaveBeenCalledWith(
         expect.objectContaining({ context: 'title' }),
@@ -4460,8 +4508,6 @@ describe('AgentClient - titleConvo', () => {
           },
         },
       };
-      client.run = null;
-      client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
       mockReq.path = '/';
       mockReq.body.text = 'alice@example.com';
       mockReq.body.clientRequestId = 'pi-protected-title';
@@ -4500,15 +4546,18 @@ describe('AgentClient - titleConvo', () => {
       expect(client.recordCollectedUsage).toHaveBeenCalledTimes(1);
     });
 
-    it('rejects promptly when aborted before the run initializes in immediate mode', async () => {
-      client.run = null;
+    it('passes an already-aborted signal to the Pi title adapter', async () => {
       const abortController = new AbortController();
       abortController.abort();
 
-      await expect(
-        client.titleConvo({ text: 'Test', abortController, immediate: true }),
-      ).rejects.toThrow('Aborted before run initialization');
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      await client.titleConvo({ text: 'Test', abortController, immediate: true });
+
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chainOptions: expect.objectContaining({ signal: abortController.signal }),
+        }),
+      );
+      expect(mockCreateRun).not.toHaveBeenCalled();
     });
 
     it('should use titlePrompt from endpoint config', async () => {
@@ -4517,7 +4566,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titlePrompt: 'Custom title prompt',
         }),
@@ -4530,7 +4579,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titlePromptTemplate: 'Template: {{content}}',
         }),
@@ -4543,7 +4592,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           provider: Providers.OPENAI,
           titleMethod: 'structured',
@@ -4558,7 +4607,7 @@ describe('AgentClient - titleConvo', () => {
       await client.titleConvo({ text, abortController });
 
       // Check that generateTitle was called with correct clientOptions
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
     });
 
@@ -4617,7 +4666,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titlePrompt: undefined,
           titlePromptTemplate: undefined,
@@ -4644,7 +4693,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-4'); // Should use agent's model
     });
 
@@ -4665,7 +4714,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-4'); // Should use agent's model
     });
 
@@ -4675,20 +4724,23 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text, abortController });
 
-      expect(mockRun.generateTitle).toHaveBeenCalledWith({
-        provider: expect.any(String),
-        inputText: text,
-        contentParts: client.contentParts,
-        clientOptions: expect.objectContaining({
-          model: 'gpt-3.5-turbo',
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: expect.any(String),
+          runId: 'response-123',
+          inputText: text,
+          contentParts: client.contentParts,
+          clientOptions: expect.objectContaining({
+            model: 'gpt-3.5-turbo',
+          }),
+          titlePrompt: 'Custom title prompt',
+          titlePromptTemplate: 'Template: {{content}}',
+          titleMethod: 'structured',
+          chainOptions: expect.objectContaining({
+            signal: abortController.signal,
+          }),
         }),
-        titlePrompt: 'Custom title prompt',
-        titlePromptTemplate: 'Template: {{content}}',
-        titleMethod: 'structured',
-        chainOptions: expect.objectContaining({
-          signal: abortController.signal,
-        }),
-      });
+      );
     });
 
     it('should record collected usage after title generation', async () => {
@@ -4717,12 +4769,12 @@ describe('AgentClient - titleConvo', () => {
 
       const result = await client.titleConvo({ text, abortController });
 
-      expect(result).toBe('Generated Title');
+      expect(result).toBe('Generated Pi Title');
     });
 
     it('should sanitize the generated title by removing think blocks', async () => {
       const titleWithThinkBlock = '<think>reasoning about the title</think> User Hi Greeting';
-      mockRun.generateTitle.mockResolvedValue({
+      mockGenerateAgentConversationTitle.mockResolvedValue({
         title: titleWithThinkBlock,
       });
 
@@ -4739,7 +4791,7 @@ describe('AgentClient - titleConvo', () => {
 
     it('should return fallback title when sanitization results in empty string', async () => {
       const titleOnlyThinkBlock = '<think>only reasoning no actual title</think>';
-      mockRun.generateTitle.mockResolvedValue({
+      mockGenerateAgentConversationTitle.mockResolvedValue({
         title: titleOnlyThinkBlock,
       });
 
@@ -4756,7 +4808,7 @@ describe('AgentClient - titleConvo', () => {
       const { logger } = require('@librechat/data-schemas');
       const privateValue = 'PRIVATE-TITLE-PROMPT';
       const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-      mockRun.generateTitle.mockRejectedValue(
+      mockGenerateAgentConversationTitle.mockRejectedValue(
         Object.assign(new Error(`Provider echoed ${privateValue}`), {
           code: 'ERR_REMOTE',
           response: { status: 422, data: { prompt: privateValue } },
@@ -4800,7 +4852,7 @@ describe('AgentClient - titleConvo', () => {
       expect(result).toBeUndefined();
 
       // generateTitle should NOT have been called
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
 
       // recordCollectedUsage should NOT have been called
       expect(client.recordCollectedUsage).not.toHaveBeenCalled();
@@ -4819,7 +4871,7 @@ describe('AgentClient - titleConvo', () => {
       expect(result).toBeUndefined();
 
       // generateTitle should NOT have been called
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
 
       // recordCollectedUsage should NOT have been called
       expect(client.recordCollectedUsage).not.toHaveBeenCalled();
@@ -4848,7 +4900,7 @@ describe('AgentClient - titleConvo', () => {
       expect(result).toBeUndefined();
 
       // generateTitle should NOT have been called
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
 
       // recordCollectedUsage should NOT have been called
       expect(client.recordCollectedUsage).not.toHaveBeenCalled();
@@ -4909,7 +4961,7 @@ describe('AgentClient - titleConvo', () => {
       expect(result).toBeUndefined();
 
       // generateTitle should NOT have been called
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
 
       // recordCollectedUsage should NOT have been called
       expect(client.recordCollectedUsage).not.toHaveBeenCalled();
@@ -4939,7 +4991,7 @@ describe('AgentClient - titleConvo', () => {
       await client.titleConvo({ text, abortController });
 
       // Verify generateTitle was called with the custom configuration
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titleMethod: 'structured',
           provider: Providers.ANTHROPIC,
@@ -4975,7 +5027,7 @@ describe('AgentClient - titleConvo', () => {
       await client.titleConvo({ text, abortController });
 
       // Verify generateTitle was called with 'all' config values
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titleMethod: 'completion',
           titlePrompt: 'All config title prompt',
@@ -4984,7 +5036,7 @@ describe('AgentClient - titleConvo', () => {
       );
 
       // Check that the model was set from 'all' config
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-4o-mini');
     });
 
@@ -5013,7 +5065,7 @@ describe('AgentClient - titleConvo', () => {
       await client.titleConvo({ text, abortController });
 
       // Verify 'all' config takes precedence over endpoint config
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           titleMethod: 'completion',
           titlePrompt: 'All config title prompt',
@@ -5022,7 +5074,7 @@ describe('AgentClient - titleConvo', () => {
       );
 
       // Check that the model was set from 'all' config
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-4o-mini');
     });
 
@@ -5040,7 +5092,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text: 'Test', abortController: new AbortController() });
 
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
       expect(generateTitleCall).toEqual(
         expect.objectContaining({
@@ -5064,7 +5116,7 @@ describe('AgentClient - titleConvo', () => {
 
       await client.titleConvo({ text: 'Test', abortController: new AbortController() });
 
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('gpt-3.5-turbo');
       expect(generateTitleCall).toEqual(
         expect.objectContaining({
@@ -5088,7 +5140,7 @@ describe('AgentClient - titleConvo', () => {
       });
 
       expect(result).toBeUndefined();
-      expect(mockRun.generateTitle).not.toHaveBeenCalled();
+      expect(mockGenerateAgentConversationTitle).not.toHaveBeenCalled();
     });
 
     it('does not run the endpoint titleModel on a titleEndpoint the all block names', async () => {
@@ -5111,7 +5163,7 @@ describe('AgentClient - titleConvo', () => {
         }
       }
 
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.provider).toBe(Providers.ANTHROPIC);
       expect(generateTitleCall.clientOptions.model).not.toBe('gpt-3.5-turbo');
     });
@@ -5141,7 +5193,7 @@ describe('AgentClient - titleConvo', () => {
       await client.titleConvo({ text, abortController });
 
       // Verify all config values were used
-      expect(mockRun.generateTitle).toHaveBeenCalledWith(
+      expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
         expect.objectContaining({
           provider: Providers.ANTHROPIC, // Critical: Verify provider switched to Anthropic
           titleMethod: 'completion',
@@ -5153,7 +5205,7 @@ describe('AgentClient - titleConvo', () => {
       );
 
       // Verify the model was set from 'all' config
-      const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+      const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
       expect(generateTitleCall.clientOptions.model).toBe('claude-3-haiku-20240307');
 
       // Verify other client options are set correctly
@@ -5176,7 +5228,7 @@ describe('AgentClient - titleConvo', () => {
 
       for (const method of titleMethods) {
         // Clear previous calls
-        mockRun.generateTitle.mockClear();
+        mockGenerateAgentConversationTitle.mockClear();
 
         // Set 'all' config with specific titleMethod
         mockReq.config = {
@@ -5196,7 +5248,7 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify the correct titleMethod was used
-        expect(mockRun.generateTitle).toHaveBeenCalledWith(
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
           expect.objectContaining({
             titleMethod: method,
             titlePrompt: `Testing ${method} method`,
@@ -5271,7 +5323,7 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify provider was switched to OPENAI for serverless
-        expect(mockRun.generateTitle).toHaveBeenCalledWith(
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
           expect.objectContaining({
             provider: Providers.OPENAI, // Should be OPENAI for serverless
             titleMethod: 'completion',
@@ -5322,7 +5374,7 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify provider remains AZURE with instanceName
-        expect(mockRun.generateTitle).toHaveBeenCalledWith(
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
           expect.objectContaining({
             provider: Providers.AZURE,
             titleMethod: 'structured',
@@ -5375,7 +5427,7 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify it uses the correct model when titleModel is CURRENT_MODEL
-        const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+        const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
         // When CURRENT_MODEL is used with Azure, the model gets mapped to the deployment name
         // In this case, 'gpt-4o-latest' is mapped to 'gpt-4o-mini' deployment
         expect(generateTitleCall.clientOptions.model).toBe('gpt-4o-mini');
@@ -5453,14 +5505,14 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify correct model and provider are used
-        expect(mockRun.generateTitle).toHaveBeenCalledWith(
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
           expect.objectContaining({
             provider: Providers.AZURE,
             titleMethod: 'completion',
           }),
         );
 
-        const generateTitleCall = mockRun.generateTitle.mock.calls[0][0];
+        const generateTitleCall = mockGenerateAgentConversationTitle.mock.calls[0][0];
         expect(generateTitleCall.clientOptions.model).toBe('o1-mini');
         expect(generateTitleCall.clientOptions.maxTokens).toBeUndefined(); // o1 models shouldn't have maxTokens
       });
@@ -5510,7 +5562,7 @@ describe('AgentClient - titleConvo', () => {
         await client.titleConvo({ text, abortController });
 
         // Verify all config is used
-        expect(mockRun.generateTitle).toHaveBeenCalledWith(
+        expect(mockGenerateAgentConversationTitle).toHaveBeenCalledWith(
           expect.objectContaining({
             provider: Providers.OPENAI, // Should be OPENAI when no instanceName
             titleMethod: 'structured',
@@ -10724,6 +10776,427 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(mockExecutePiGeneration.mock.calls[0][0].createToolCallId).toEqual(expect.any(Function));
   });
 
+  it('runs an authorized foreground child with its own Pi model, tools, progress, and usage', async () => {
+    const childAgent = {
+      id: 'agent-child',
+      name: 'Analyst',
+      endpoint: EModelEndpoint.openAI,
+      provider: EModelEndpoint.openAI,
+      model_parameters: { model: 'gpt-4o-mini' },
+      codeEnvAvailable: true,
+      codeExecutionContext: {
+        baseUrl: 'https://code.example/v1',
+        executionProfile: 'default',
+        statefulSessions: false,
+      },
+      tools: [{ name: Tools.file_search }, { name: 'bash_tool' }],
+      toolDefinitions: [fileSearchDefinition, bashDefinition],
+    };
+    const childDescriptor = {
+      id: childAgent.id,
+      name: childAgent.name,
+      description: 'Analyze maintenance evidence.',
+      configId: 'agent-child:v3',
+      resolve: jest.fn().mockResolvedValue(childAgent),
+      settle: jest.fn((_context, resolveInputs) => resolveInputs()),
+    };
+    const toolExecuteHandler = {
+      handle: jest.fn((_event, batch) => {
+        batch.resolve([
+          {
+            toolCallId: batch.toolCalls[0].id,
+            status: 'success',
+            content: 'Found child evidence.',
+          },
+        ]);
+      }),
+    };
+    const subagentUpdateHandler = { handle: jest.fn() };
+    const previousCodeApiUrl = process.env.LIBRECHAT_CODE_BASEURL;
+    process.env.LIBRECHAT_CODE_BASEURL = 'https://code.example/v1';
+    const client = createPiClient({
+      agent: {
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childAgent.id] },
+        subagentAgentConfigs: [],
+        lazySubagentConfigs: [childDescriptor],
+        primedCodeFiles: [
+          {
+            id: 'parent-private-file',
+            resource_id: 'parent-private-file',
+            name: 'parent-secret.txt',
+            storage_session_id: 'parent-code-session',
+            kind: 'user',
+          },
+        ],
+      },
+      eventHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler,
+        [GraphEvents.ON_SUBAGENT_UPDATE]: subagentUpdateHandler,
+      },
+    });
+    /** A scheduler-owned task context may be present while the model chooses
+     *  the supported foreground child tool. Its mere presence is not a
+     *  background execution request. */
+    client.options.subagentTasks = { scopeId: 'scheduled-parent', store: {} };
+    client.options.res = null;
+    let parentToolResult;
+    const usage = {
+      input_tokens: 7,
+      output_tokens: 3,
+      total_tokens: 10,
+      model: 'gpt-4o-mini',
+      provider: 'openai',
+      agentId: childAgent.id,
+      runId: 'child-run',
+    };
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      if (input.usageAttribution.agentId === 'agent-pi') {
+        parentToolResult = await input.executeHostToolCall(
+          {
+            id: 'parent-subagent-call',
+            name: Constants.SUBAGENT,
+            args: { description: 'Find the maintenance evidence.', subagent_type: childAgent.id },
+            stepId: 'parent-subagent-step',
+          },
+          new AbortController().signal,
+        );
+        return { status: 'completed', usage: [] };
+      }
+      expect(input.usageAttribution).toMatchObject({ agentId: childAgent.id });
+      expect(input.toolDefinitions).toEqual(
+        expect.arrayContaining([fileSearchDefinition, bashDefinition]),
+      );
+      expect(input.executeHostToolCall).toEqual(expect.any(Function));
+      expect(input.getCodeSessionContext?.()).toBeUndefined();
+      await input.handleHostEvent({
+        event: GraphEvents.ON_MESSAGE_DELTA,
+        data: {
+          id: 'child-message-step',
+          delta: { content: [{ type: ContentTypes.TEXT, text: 'Child summary.' }] },
+        },
+      });
+      await input.executeHostToolCall(
+        {
+          id: 'child-file-search-call',
+          name: Tools.file_search,
+          args: { query: 'maintenance evidence' },
+          stepId: 'child-file-search-step',
+        },
+        new AbortController().signal,
+      );
+      await input.handleHostEvent({ event: UsageEvents.ON_TOKEN_USAGE, data: usage });
+      return { status: 'completed', usage: [usage] };
+    });
+
+    try {
+      await client.chatCompletion({ payload: [] });
+    } finally {
+      if (previousCodeApiUrl === undefined) {
+        delete process.env.LIBRECHAT_CODE_BASEURL;
+      } else {
+        process.env.LIBRECHAT_CODE_BASEURL = previousCodeApiUrl;
+      }
+    }
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(2);
+    expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledWith(childAgent);
+    const childResolveContext = childDescriptor.resolve.mock.calls[0][0];
+    expect(childDescriptor.settle).toHaveBeenCalledWith(childResolveContext, expect.any(Function));
+    expect(childResolveContext).toMatchObject({
+      descriptor: {
+        type: childAgent.id,
+        configId: childDescriptor.configId,
+      },
+      executionId: expect.stringMatching(/^response-pi:subagent:/),
+      parentRunId: 'response-pi',
+      parentAgentId: 'agent-pi',
+      parentToolCallId: 'parent-subagent-call',
+      threadId: 'conversation-pi',
+      configurable: {
+        requestBody: {
+          conversationId: 'conversation-pi',
+          messageId: 'response-pi',
+          parentMessageId: 'parent-pi',
+        },
+        user_id: 'user-pi',
+      },
+    });
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual([
+      expect.objectContaining({
+        name: Constants.SUBAGENT,
+        parameters: expect.objectContaining({
+          properties: expect.objectContaining({
+            subagent_type: expect.objectContaining({ enum: [childAgent.id] }),
+          }),
+        }),
+      }),
+    ]);
+    expect(mockExecutePiGeneration.mock.calls[1][0].messages.at(-1).content).toBe(
+      'Find the maintenance evidence.',
+    );
+    expect(parentToolResult).toEqual({
+      toolCallId: 'parent-subagent-call',
+      status: 'success',
+      content: 'Child summary.',
+    });
+    expect(toolExecuteHandler.handle).toHaveBeenCalledTimes(1);
+    expect(toolExecuteHandler.handle.mock.calls[0][2]).toMatchObject({ agent_id: childAgent.id });
+    expect(subagentUpdateHandler.handle).toHaveBeenCalledWith(
+      GraphEvents.ON_SUBAGENT_UPDATE,
+      expect.objectContaining({
+        parentToolCallId: 'parent-subagent-call',
+        subagentAgentId: childAgent.id,
+        phase: 'message_delta',
+      }),
+      expect.objectContaining({ agent_id: childAgent.id }),
+    );
+    const subagentPhases = subagentUpdateHandler.handle.mock.calls.map(([, event]) => event.phase);
+    expect(subagentPhases[0]).toBe('start');
+    expect(subagentPhases).toContain('message_delta');
+    expect(subagentPhases.at(-1)).toBe('stop');
+    expect(
+      client.collectedUsage.filter(
+        (item) => item.usage_type === 'subagent' && item.agentId === childAgent.id,
+      ),
+    ).toEqual([
+      expect.objectContaining({ usage_type: 'subagent', agentId: childAgent.id, total_tokens: 10 }),
+    ]);
+  });
+
+  it('keeps event-reported child usage exactly once when a later child provider call fails', async () => {
+    const childAgent = {
+      id: 'agent-child',
+      endpoint: EModelEndpoint.openAI,
+      provider: EModelEndpoint.openAI,
+      model_parameters: { model: 'gpt-4o-mini' },
+    };
+    const childDescriptor = {
+      id: childAgent.id,
+      name: 'Analyst',
+      description: 'Analyze the requested evidence.',
+      configId: 'agent-child:v3',
+      resolve: jest.fn().mockResolvedValue(childAgent),
+      settle: jest.fn((_context, resolveInputs) => resolveInputs()),
+    };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      agent: {
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childAgent.id] },
+        subagentAgentConfigs: [],
+        lazySubagentConfigs: [childDescriptor],
+      },
+      eventHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler,
+        [GraphEvents.ON_SUBAGENT_UPDATE]: { handle: jest.fn() },
+      },
+    });
+    client.options.res = null;
+    const usage = {
+      input_tokens: 9,
+      output_tokens: 4,
+      total_tokens: 13,
+      model: 'gpt-4o-mini',
+      provider: 'openai',
+    };
+    let firstChildResult;
+    let secondChildResult;
+    let childTurns = 0;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      if (input.usageAttribution.agentId === 'agent-pi') {
+        firstChildResult = await input.executeHostToolCall(
+          {
+            id: 'parent-child-call-1',
+            name: Constants.SUBAGENT,
+            args: { description: 'Inspect the first issue.', subagent_type: childAgent.id },
+            stepId: 'parent-child-step-1',
+          },
+          new AbortController().signal,
+        );
+        secondChildResult = await input.executeHostToolCall(
+          {
+            id: 'parent-child-call-2',
+            name: Constants.SUBAGENT,
+            args: { description: 'Inspect the second issue.', subagent_type: childAgent.id },
+            stepId: 'parent-child-step-2',
+          },
+          new AbortController().signal,
+        );
+        return { status: 'completed', usage: [] };
+      }
+
+      childTurns += 1;
+      await input.handleHostEvent({ event: UsageEvents.ON_TOKEN_USAGE, data: usage });
+      if (childTurns === 1) {
+        await input.handleHostEvent({
+          event: GraphEvents.ON_MESSAGE_DELTA,
+          data: { delta: { content: [{ type: ContentTypes.TEXT, text: 'First child done.' }] } },
+        });
+        /** The Pi outcome can also retain aggregate usage. The host event is
+         *  authoritative so this copy must not be counted a second time. */
+        return { status: 'completed', usage: [usage] };
+      }
+      throw new Error('child provider failed after reporting usage');
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(
+      mockExecutePiGeneration.mock.calls.map(([input]) => input.usageAttribution.agentId),
+    ).toEqual(['agent-pi', childAgent.id, childAgent.id]);
+    expect(firstChildResult).toMatchObject({ status: 'success', content: 'First child done.' });
+    expect(secondChildResult).toMatchObject({ status: 'error' });
+    expect(childDescriptor.resolve).toHaveBeenCalledTimes(2);
+    expect(
+      client.collectedUsage.filter(
+        (item) => item.usage_type === 'subagent' && item.agentId === childAgent.id,
+      ),
+    ).toEqual([
+      expect.objectContaining({ total_tokens: 13, model: 'gpt-4o-mini' }),
+      expect.objectContaining({ total_tokens: 13, model: 'gpt-4o-mini' }),
+    ]);
+  });
+
+  it('rejects owner loss before a child host side effect', async () => {
+    const childAgent = {
+      id: 'agent-child',
+      endpoint: EModelEndpoint.openAI,
+      provider: EModelEndpoint.openAI,
+      model_parameters: { model: 'gpt-4o-mini' },
+      tools: [{ name: Tools.file_search }],
+      toolDefinitions: [fileSearchDefinition],
+    };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const subagentUpdateHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      agent: {
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childAgent.id] },
+        subagentAgentConfigs: [childAgent],
+      },
+      eventHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler,
+        [GraphEvents.ON_SUBAGENT_UPDATE]: subagentUpdateHandler,
+      },
+    });
+    let childCallError;
+    GenerationJobManager.assertPiProviderOwner
+      .mockResolvedValueOnce(true)
+      .mockResolvedValueOnce(true)
+      .mockResolvedValue(false);
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      if (input.usageAttribution.agentId === 'agent-pi') {
+        await input.executeHostToolCall(
+          {
+            id: 'parent-subagent-call',
+            name: Constants.SUBAGENT,
+            args: { description: 'Search now.', subagent_type: childAgent.id },
+            stepId: 'parent-subagent-step',
+          },
+          new AbortController().signal,
+        );
+      } else {
+        childCallError = await input
+          .executeHostToolCall(
+            {
+              id: 'child-file-search-call',
+              name: Tools.file_search,
+              args: { query: 'maintenance evidence' },
+              stepId: 'child-file-search-step',
+            },
+            new AbortController().signal,
+          )
+          .catch((error) => error);
+      }
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(2);
+    expect(childCallError).toMatchObject({ code: 'PROVIDER_OWNER_FENCED' });
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+    const subagentPhases = subagentUpdateHandler.handle.mock.calls.map(([, event]) => event.phase);
+    expect(subagentPhases).toEqual(['start']);
+  });
+
+  it('reports a failed foreground child through the existing subagent update lifecycle', async () => {
+    const childAgent = {
+      id: 'agent-child',
+      endpoint: EModelEndpoint.openAI,
+      provider: EModelEndpoint.openAI,
+      model_parameters: { model: 'gpt-4o-mini' },
+    };
+    const subagentUpdateHandler = { handle: jest.fn() };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      agent: {
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childAgent.id] },
+        subagentAgentConfigs: [childAgent],
+      },
+      eventHandlers: {
+        [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler,
+        [GraphEvents.ON_SUBAGENT_UPDATE]: subagentUpdateHandler,
+      },
+    });
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      if (input.usageAttribution.agentId === 'agent-pi') {
+        await input.executeHostToolCall(
+          {
+            id: 'parent-subagent-call',
+            name: Constants.SUBAGENT,
+            args: { description: 'Try this task.', subagent_type: childAgent.id },
+            stepId: 'parent-subagent-step',
+          },
+          new AbortController().signal,
+        );
+        return { status: 'completed', usage: [] };
+      }
+      return { status: 'unsupported', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(2);
+    expect(subagentUpdateHandler.handle.mock.calls.map(([, event]) => event.phase)).toEqual([
+      'start',
+      'error',
+    ]);
+  });
+
+  it('cancels before creating a child Pi session or dispatching child tools', async () => {
+    const childAgent = { id: 'agent-child' };
+    const toolExecuteHandler = { handle: jest.fn() };
+    const client = createPiClient({
+      agent: {
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childAgent.id] },
+        subagentAgentConfigs: [childAgent],
+      },
+      eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    let childCallError;
+    mockExecutePiGeneration.mockImplementation(async (input) => {
+      childCallError = await input
+        .executeHostToolCall(
+          {
+            id: 'parent-subagent-call',
+            name: Constants.SUBAGENT,
+            args: { description: 'Do not run.', subagent_type: childAgent.id },
+            stepId: 'parent-subagent-step',
+          },
+          controller.signal,
+        )
+        .catch((error) => error);
+      return { status: 'completed', usage: [] };
+    });
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(childCallError).toMatchObject({ name: 'AbortError' });
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(toolExecuteHandler.handle).not.toHaveBeenCalled();
+  });
+
   it('routes the host calculator through the current authorized ON_TOOL_EXECUTE handler', async () => {
     const req = {
       user: { id: 'user-pi' },
@@ -11700,8 +12173,19 @@ describe('AgentClient - Pi generation dispatch', () => {
 });
 
 describe('AgentClient - resumeCompletion content protection', () => {
+  const resumeToolDefinition = {
+    name: Tools.file_search,
+    description: 'Search the agent files.',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string' } },
+      required: ['query'],
+    },
+  };
+
   const makeContext = (filters) => ({
     options: {
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
       req: {
         tenantId: 'request-tenant',
         user: { id: 'user-123' },
@@ -11715,14 +12199,25 @@ describe('AgentClient - resumeCompletion content protection', () => {
         id: 'agent-123',
         hide_sequential_outputs: false,
         model_parameters: { model: 'gpt-4' },
-        tools: [],
+        tools: [{ name: Tools.file_search }],
+        toolDefinitions: [resumeToolDefinition],
       },
+      resendFiles: true,
+      attachments: [],
     },
     user: 'user-123',
     conversationId: 'conversation-123',
     responseMessageId: 'response-123',
     parentMessageId: 'parent-123',
     agentConfigs: new Map(),
+    loadHistory: jest.fn(function (conversationId, parentMessageId) {
+      return AgentClient.prototype.loadHistory.call(this, conversationId, parentMessageId);
+    }),
+    buildMessages: jest.fn(function (...args) {
+      return AgentClient.prototype.buildMessages.apply(this, args);
+    }),
+    getBuildMessagesOptions: jest.fn(() => ({})),
+    isCompactionTurn: jest.fn(() => false),
     contentParts: [],
     collectedUsage: [],
     pendingSubagentEmits: [],
@@ -11743,9 +12238,78 @@ describe('AgentClient - resumeCompletion content protection', () => {
     recordCollectedUsage: jest.fn().mockResolvedValue(undefined),
   });
 
+  const resumeWithPi = (context, options = {}) => {
+    Object.setPrototypeOf(context, AgentClient.prototype);
+    const input = { ...options };
+    delete input.resumeValue;
+    return AgentClient.prototype.resumeCompletion.call(context, {
+      piApprovalContinuation: {
+        version: 1,
+        actionId: 'resume-action',
+        piToolCallId: 'pi-resume-file-search',
+        hostToolCallId: 'host-resume-file-search',
+        toolTurn: 0,
+        allowedDecisions: ['approve', 'reject'],
+        stepIdentity: {
+          id: 'step-resume-file-search',
+          index: 0,
+          messageId: 'response-123',
+          runId: 'response-123',
+          agentId: 'agent-123',
+        },
+        stepCreatedAt: 1,
+        toolName: Tools.file_search,
+        args: { query: 'resume files' },
+      },
+      piApprovalDecision: { kind: 'reject' },
+      ...input,
+    });
+  };
+
+  const expectPiResumePolicyError = async (context, options, expected) => {
+    const original = AgentClient.prototype.assertBuiltModelBoundContent;
+    let policyError;
+    const policySpy = jest
+      .spyOn(AgentClient.prototype, 'assertBuiltModelBoundContent')
+      .mockImplementation(function (...args) {
+        try {
+          return original.apply(this, args);
+        } catch (error) {
+          policyError = error;
+          throw error;
+        }
+      });
+
+    try {
+      await resumeWithPi(context, options);
+    } finally {
+      policySpy.mockRestore();
+    }
+
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+    expect(policyError).toMatchObject(expected);
+    expect(context.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+  };
+
+  const expectPiResumeToFailClosed = async (context, options = {}) => {
+    await resumeWithPi(context, options);
+    expect(context.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
+  };
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockCreateRun.mockReset();
+    mockFormatAgentMessages.mockImplementation((messages = []) => ({
+      messages,
+      indexTokenCountMap: {},
+      summary: undefined,
+      boundaryTokenAdjustment: undefined,
+    }));
     mockGetAgentCheckpointer.mockReset();
     require('~/models')
       .getMessages.mockReset()
@@ -11759,18 +12323,20 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       ]);
     require('~/models').getFiles.mockReset().mockResolvedValue([]);
+    mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
+    mockExecutePiGeneration.mockReset().mockResolvedValue({ status: 'completed', usage: [] });
   });
 
-  it('blocks checkpoint user content before rebuilding the run', async () => {
-    mockGetAgentCheckpointer.mockResolvedValue({
-      getTuple: jest.fn().mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [{ _getType: () => 'human', content: 'PRIVATE-RESUME-CONTENT' }],
-          },
-        },
-      }),
-    });
+  it('blocks persisted user content before resuming Pi', async () => {
+    require('~/models').getMessages.mockResolvedValue([
+      {
+        messageId: 'parent-123',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'PRIVATE-RESUME-CONTENT',
+      },
+    ]);
     const context = makeContext({
       messages: {
         pii: {
@@ -11787,13 +12353,50 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'message', field: 'text' },
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_block',
+        body: { source: 'message', field: 'text' },
+      },
+    );
+  });
+
+  it('resumes a Pi tool with a lazy foreground target even when subagent task context exists', async () => {
+    const childDescriptor = {
+      id: 'agent-child',
+      name: 'Analyst',
+      description: 'A foreground child target.',
+      configId: 'agent-child:v3',
+      resolve: jest.fn(),
+      settle: jest.fn(),
+    };
+    const context = makeContext(undefined);
+    context.options.agent = {
+      ...context.options.agent,
+      subagents: { enabled: true, allowSelf: false, agent_ids: [childDescriptor.id] },
+      lazySubagentConfigs: [childDescriptor],
+    };
+    context.options.subagentTasks = { scopeId: 'scheduled-parent', store: {} };
+
+    await resumeWithPi(context);
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0].toolDefinitions).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: Constants.SUBAGENT })]),
+    );
+  });
+
+  it('fails manual compaction resume before constructing Pi tools or invoking the provider', async () => {
+    const context = makeContext(undefined);
+    context.options.req.body.compact = true;
+    context.isCompactionTurn = jest.fn(() => true);
+
+    await expect(resumeWithPi(context)).rejects.toMatchObject({
+      code: 'AGENT_RUNTIME_UNAVAILABLE',
     });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
   });
 
   it('blocks a path-marked assistant fragment restored from the exact persisted branch', async () => {
@@ -11845,16 +12448,17 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'message', field: 'content_part' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_block',
+        body: { source: 'message', field: 'content_part' },
+      },
+    );
   });
 
-  it('fails closed when the persisted resume branch has a missing ancestor', async () => {
+  it('fails closed before Pi dispatch when the persisted resume branch has a missing ancestor', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -11878,13 +12482,14 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_uninspectable',
-      body: { source: 'message', field: 'content_part' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_uninspectable',
+        body: { source: 'message', field: 'content_part' },
+      },
+    );
   });
 
   it('allows unmarked model prose and ignores a marked sibling branch on resume', async () => {
@@ -11906,7 +12511,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
         parentMessageId: 'root',
         isCreatedByUser: false,
         role: 'assistant',
-        text: 'PRIVATE-MODEL-PROSE',
+        text: 'UNMARKED-MODEL-PROSE',
       },
       {
         messageId: 'parent-123',
@@ -11920,7 +12525,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
         parentMessageId: 'root',
         isCreatedByUser: false,
         role: 'assistant',
-        content: [{ type: ContentTypes.TEXT, text: 'PRIVATE-MODEL-PROSE' }],
+        content: [{ type: ContentTypes.TEXT, text: 'PRIVATE-SIBLING-EDIT' }],
         userSubmittedPaths: ['/content/0/text'],
       },
       {
@@ -11931,11 +12536,6 @@ describe('AgentClient - resumeCompletion content protection', () => {
         text: 'continue sibling branch',
       },
     ]);
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({
-      resume,
-      getCalibrationRatio: jest.fn(() => 0),
-    });
     const context = makeContext({
       messages: {
         pii: {
@@ -11945,47 +12545,23 @@ describe('AgentClient - resumeCompletion content protection', () => {
             {
               id: 'private-model-prose',
               label: 'private model prose',
-              regex: 'PRIVATE-MODEL-PROSE',
+              regex: 'PRIVATE-SIBLING-EDIT',
             },
           ],
         },
       },
     });
 
-    const compactionSemanticIndex = {
-      version: 1,
-      entries: [
-        {
-          type: 'activity_phase',
-          sourceMessageId: 'assistant-history',
-          sourceContentIndex: 1,
-          revision: 1,
-          status: 'committed',
-          text: 'Verified the release state',
-        },
-      ],
-    };
-    await AgentClient.prototype.resumeCompletion.call(context, {
-      resumeValue: {},
-      compactionSemanticIndex,
-    });
+    await resumeWithPi(context);
 
-    expect(mockCreateRun).toHaveBeenCalledTimes(1);
-    expect(mockCreateRun.mock.calls[0][0]).toEqual(
-      expect.objectContaining({
-        tenantId: 'request-tenant',
-        modelCallbacks: expect.arrayContaining([
-          expect.objectContaining({ name: 'librechat-model-bound-content-filter' }),
-          expect.objectContaining({ name: 'librechat-agent-attachment-memory' }),
-        ]),
-        compactionSemanticIndex: compactionSemanticIndex.entries,
-      }),
-    );
-    expect(resume).toHaveBeenCalledTimes(1);
-    expect(resume.mock.calls[0][1]).not.toHaveProperty('callbacks');
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    const dispatchedContent = JSON.stringify(mockExecutePiGeneration.mock.calls[0][0].messages);
+    expect(dispatchedContent).toContain('UNMARKED-MODEL-PROSE');
+    expect(dispatchedContent).not.toContain('PRIVATE-SIBLING-EDIT');
+    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
-  it('blocks handoff dynamic tool context before rebuilding a resumed run', async () => {
+  it('fails closed before Pi dispatch for an unsupported handoff context', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12020,16 +12596,10 @@ describe('AgentClient - resumeCompletion content protection', () => {
       ],
     ]);
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'file', field: 'content' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumeToFailClosed(context);
   });
 
-  it('blocks a nested pure subagent tool definition before rebuilding a resumed run', async () => {
+  it('fails closed before Pi dispatch for nested subagent tool definitions', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12070,13 +12640,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     ];
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'agent_instruction', field: 'description' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumeToFailClosed(context);
   });
 
   it('re-inspects current extracted file text when policy tightens while paused', async () => {
@@ -12099,6 +12663,10 @@ describe('AgentClient - resumeCompletion content protection', () => {
       {
         file_id: 'file-paused',
         filename: 'report.txt',
+        source: 'text',
+        type: 'text/plain',
+        bytes: 27,
+        user: 'user-123',
         text: 'PRIVATE-EXTRACTED-TEXT',
       },
     ]);
@@ -12119,12 +12687,14 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'file', field: 'extracted_text' },
-    });
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_block',
+        body: { source: 'file', field: 'extracted_text' },
+      },
+    );
     expect(require('~/models').getFiles).toHaveBeenCalledWith(
       {
         file_id: { $in: ['file-paused'] },
@@ -12133,7 +12703,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
       {},
       {},
     );
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(mockExecutePiGeneration).not.toHaveBeenCalled();
   });
 
   it('freezes owner-hydrated resume files into the final model callback', async () => {
@@ -12165,8 +12735,6 @@ describe('AgentClient - resumeCompletion content protection', () => {
         text: 'Safe extracted text',
       },
     ]);
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext({
       files: {
         pii: {
@@ -12177,35 +12745,24 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await AgentClient.prototype.resumeCompletion.call(context, {
+    await resumeWithPi(context, {
       resumeValue: {},
       storedMessages: [storedMessage],
     });
 
-    const [modelBoundCallback, attachmentMemoryCallback] =
-      mockCreateRun.mock.calls[0][0].modelCallbacks;
-    expect(attachmentMemoryCallback).toEqual(
-      expect.objectContaining({ name: 'librechat-agent-attachment-memory' }),
-    );
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
     expect(context.attachmentMemoryContext).toEqual(
       expect.objectContaining({
         conversationId: 'conversation-123',
-        messageId: 'response-123',
+        messageId: 'parent-123',
         attachments: [expect.objectContaining({ file_id: 'file-paused' })],
         countRepeatedExtractedText: true,
       }),
     );
-    expect(() =>
-      modelBoundCallback.handleChatModelStart(undefined, [
-        [
-          {
-            role: 'human',
-            content: [{ type: 'input_file', file_id: 'file-paused' }],
-            additional_kwargs: { sourceMessageId: 'parent-123' },
-          },
-        ],
-      ]),
-    ).not.toThrow();
+    expect(JSON.stringify(mockExecutePiGeneration.mock.calls[0][0].messages)).toContain(
+      'Safe extracted text',
+    );
+    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
   it('does not reapply current attachment counts to persistent history on resume', async () => {
@@ -12240,18 +12797,15 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       }),
     });
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext(undefined);
     context.options.req.body.isTemporary = false;
     context.options.req.config.fileConfig = {
       endpoints: { agents: { fileLimit: 10 } },
     };
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).resolves.toBeUndefined();
-    expect(resume).toHaveBeenCalledTimes(1);
+    await resumeWithPi(context);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
   it('counts a restored request file only once when it is already in the checkpoint', async () => {
@@ -12273,17 +12827,13 @@ describe('AgentClient - resumeCompletion content protection', () => {
       }),
     });
     require('~/models').getFiles.mockResolvedValue([retainedFile]);
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext(undefined);
     context.options.attachments = [retainedFile];
     context.options.req.config.fileConfig = { fileContextCharLimit: 1_000_000 };
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).resolves.toBeUndefined();
+    await resumeWithPi(context);
 
-    expect(mockCreateRun).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
     expect(context.attachmentMemoryContext.attachments).toEqual([retainedFile]);
   });
 
@@ -12305,17 +12855,25 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       }),
     });
+    require('~/models').getMessages.mockResolvedValue([
+      {
+        messageId: 'parent-123',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'inspect the retained historical file',
+        files: [{ file_id: 'old-history-10' }],
+      },
+    ]);
     require('~/models').getFiles.mockResolvedValue(historicalFiles);
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext(undefined);
     context.options.req.config.fileConfig = {
       endpoints: { agents: { fileLimit: 10 } },
     };
 
-    await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
+    await resumeWithPi(context);
 
-    expect(mockCreateRun).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
     expect(context.attachmentMemoryContext.attachments).toEqual([
       expect.objectContaining({ file_id: 'old-history-10' }),
     ]);
@@ -12352,9 +12910,17 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       }),
     });
+    require('~/models').getMessages.mockResolvedValue([
+      {
+        messageId: 'parent-123',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: true,
+        role: 'user',
+        text: 'continue with checkpoint files',
+        files: checkpointFiles.map(({ file_id }) => ({ file_id })),
+      },
+    ]);
     require('~/models').getFiles.mockResolvedValue(checkpointFiles);
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext(undefined);
     context.options.req.config.fileConfig = {
       endpoints: {
@@ -12362,13 +12928,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     };
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).resolves.toBeUndefined();
-    expect(resume).toHaveBeenCalledTimes(1);
+    await resumeWithPi(context);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
-  it('reapplies each secondary agent endpoint limit on resume', async () => {
+  it('fails closed before Pi dispatch for a secondary-agent resume graph', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12403,15 +12967,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
       ],
     ]);
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'AGENT_ATTACHMENT_LIMIT_EXCEEDED',
-      limitType: 'count',
-      observed: 2,
-      limit: 1,
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumeToFailClosed(context);
   });
 
   it('restores agent-scoped file context before rebuilding a resumed run', async () => {
@@ -12420,8 +12976,6 @@ describe('AgentClient - resumeCompletion content protection', () => {
         checkpoint: { channel_values: { messages: [] } },
       }),
     });
-    const resume = jest.fn().mockResolvedValue(undefined);
-    mockCreateRun.mockResolvedValue({ resume, getCalibrationRatio: jest.fn(() => 0) });
     const context = makeContext(undefined);
     context.options.agentContextAttachmentsByAgentId = new Map([
       [
@@ -12439,13 +12993,13 @@ describe('AgentClient - resumeCompletion content protection', () => {
       ],
     ]);
 
-    await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
+    await resumeWithPi(context, { resumeValue: {} });
 
     expect(context.options.agent.additional_instructions).toContain('Resume-only private context');
-    expect(mockCreateRun).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
-  it('reapplies shared attachment limits after a lazy resume agent resolves', async () => {
+  it('fails closed before resolving a lazy resume agent', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12480,23 +13034,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
         Moonshot: { totalSizeLimit: 1 },
       },
     };
-    mockCreateRun.mockImplementation(async () => ({
-      resume: jest.fn(async () => descriptor.resolve({ signal: new AbortController().signal })),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
-
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'AGENT_ATTACHMENT_LIMIT_EXCEEDED',
-      limitType: 'bytes',
-      observed: 2 * 1024 * 1024,
-      limit: 1024 * 1024,
-    });
-    expect(resolveLazy).toHaveBeenCalledTimes(1);
+    await expectPiResumeToFailClosed(context);
+    expect(resolveLazy).not.toHaveBeenCalled();
   });
 
-  it('includes admitted steer files when a lazy resume agent resolves', async () => {
+  it('fails closed before resolving a lazy agent with steer files', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12508,9 +13050,10 @@ describe('AgentClient - resumeCompletion content protection', () => {
       model_parameters: { model: 'moonshot-v1' },
       tools: [],
     };
+    const resolveLazy = jest.fn().mockResolvedValue(resolvedChild);
     const descriptor = {
       id: 'lazy-secondary',
-      resolve: jest.fn().mockResolvedValue(resolvedChild),
+      resolve: resolveLazy,
     };
     const steerFile = {
       file_id: 'steer-large',
@@ -12523,31 +13066,18 @@ describe('AgentClient - resumeCompletion content protection', () => {
     const context = makeContext(undefined);
     context.options.agent.endpoint = 'openAI';
     context.options.agent.lazySubagentConfigs = [descriptor];
+    context.options.attachments = [steerFile];
     context.options.req.config.fileConfig = {
       endpoints: {
         openAI: { totalSizeLimit: 128 },
         Moonshot: { totalSizeLimit: 1 },
       },
     };
-    mockCreateRun.mockImplementation(async () => ({
-      resume: jest.fn(async () => {
-        context.turnSharedAttachmentFiles.push(steerFile);
-        return descriptor.resolve({ signal: new AbortController().signal });
-      }),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
-
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'AGENT_ATTACHMENT_LIMIT_EXCEEDED',
-      limitType: 'bytes',
-      observed: 2 * 1024 * 1024,
-      limit: 1024 * 1024,
-    });
+    await expectPiResumeToFailClosed(context);
+    expect(resolveLazy).not.toHaveBeenCalled();
   });
 
-  it('reserves a lazy resume endpoint before awaiting its scoped context', async () => {
+  it('rejects lazy Pi resume after preparing only root scoped context', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12559,39 +13089,27 @@ describe('AgentClient - resumeCompletion content protection', () => {
       model_parameters: { model: 'moonshot-v1' },
       tools: [],
     };
+    const resolveLazy = jest.fn().mockResolvedValue(resolvedChild);
     const descriptor = {
       id: 'lazy-secondary',
-      resolve: jest.fn().mockResolvedValue(resolvedChild),
+      resolve: resolveLazy,
     };
-    const lateScopedContext = deferred();
-    mockBuildAgentScopedContext.mockImplementationOnce((...args) =>
-      jest.requireActual('@librechat/api').buildAgentScopedContext(...args),
-    );
-    mockBuildAgentScopedContext.mockImplementationOnce(() => lateScopedContext.promise);
     const context = makeContext(undefined);
     context.options.agent.endpoint = 'openAI';
     context.options.agent.lazySubagentConfigs = [descriptor];
     context.options.req.config.fileConfig = {
+      fileContextSizeLimit: 0.0001,
       endpoints: {
         openAI: { totalSizeLimit: 128 },
         Moonshot: { totalSizeLimit: 1 },
       },
     };
-    mockCreateRun.mockImplementation(async () => ({
-      resume: jest.fn(async () => descriptor.resolve({ signal: new AbortController().signal })),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
-
-    const resumePromise = AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
-    for (
-      let attempt = 0;
-      attempt < 20 && mockBuildAgentScopedContext.mock.calls.length < 2;
-      attempt++
-    ) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-
-    expect(mockBuildAgentScopedContext).toHaveBeenCalledTimes(2);
+    await expectPiResumeToFailClosed(context);
+    expect(resolveLazy).not.toHaveBeenCalled();
+    expect(mockBuildAgentScopedContext).toHaveBeenCalledTimes(1);
+    expect(mockBuildAgentScopedContext).toHaveBeenCalledWith(
+      expect.objectContaining({ agentIds: ['agent-123'] }),
+    );
     expect(() =>
       AgentClient.prototype.admitSteerAttachments.call(context, [
         {
@@ -12609,12 +13127,9 @@ describe('AgentClient - resumeCompletion content protection', () => {
         limitType: 'bytes',
       }),
     );
-
-    lateScopedContext.resolve(new Map([['lazy-secondary', '']]));
-    await expect(resumePromise).resolves.toBeUndefined();
   });
 
-  it('restores scoped file context after a lazy resume agent resolves', async () => {
+  it('fails closed before loading scoped context for a lazy resume agent', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12643,18 +13158,13 @@ describe('AgentClient - resumeCompletion content protection', () => {
     };
     const context = makeContext(undefined);
     context.options.agent.lazySubagentConfigs = [descriptor];
-    mockCreateRun.mockImplementation(async () => ({
-      resume: jest.fn(async () => descriptor.resolve({ signal: new AbortController().signal })),
-      getCalibrationRatio: jest.fn(() => 0),
-    }));
+    await expectPiResumeToFailClosed(context);
 
-    await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
-
-    expect(resolvedChild.additional_instructions).toContain('Lazy resume private context');
-    expect(resolveLazy).toHaveBeenCalledTimes(1);
+    expect(resolvedChild.additional_instructions).toBeUndefined();
+    expect(resolveLazy).not.toHaveBeenCalled();
   });
 
-  it('fails closed when a paused file reference cannot be rehydrated', async () => {
+  it('blocks an unrehydrated Pi history file before provider dispatch', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12680,13 +13190,14 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_uninspectable',
-      body: { source: 'file', field: 'extracted_text' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_uninspectable',
+        body: { source: 'file', field: 'extracted_text' },
+      },
+    );
   });
 
   it('fails closed when resume file-reference traversal exceeds its depth bound', async () => {
@@ -12719,17 +13230,18 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_uninspectable',
-      body: { source: 'file', field: 'extracted_text' },
-    });
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_uninspectable',
+        body: { source: 'file', field: 'extracted_text' },
+      },
+    );
     expect(require('~/models').getFiles).not.toHaveBeenCalled();
-    expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
-  it('blocks seeded tool arguments before rebuilding the run', async () => {
+  it('blocks protected arguments on the Pi provider transcript before dispatch', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12750,28 +13262,34 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       },
     });
-
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, {
-        resumeValue: {},
-        seedContent: [
-          {
-            type: ContentTypes.TOOL_CALL,
-            tool_call: {
-              name: 'example_tool',
-              arguments: { value: 'PRIVATE-TOOL-INPUT' },
+    context.buildMessages = jest.fn(async () => ({
+      prompt: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                name: 'file_search',
+                arguments: { query: 'PRIVATE-TOOL-INPUT' },
+              },
             },
-          },
-        ],
-      }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_block',
-      body: { source: 'tool_argument', field: 'arguments' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+          ],
+        },
+      ],
+    }));
+
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_block',
+        body: { source: 'tool_argument', field: 'arguments' },
+      },
+    );
   });
 
-  it('fails closed when selected seeded tool arguments cannot be fully traversed', async () => {
+  it('fails closed when Pi provider tool arguments cannot be fully traversed', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -12796,32 +13314,38 @@ describe('AgentClient - resumeCompletion content protection', () => {
         },
       },
     });
-
-    await expect(
-      AgentClient.prototype.resumeCompletion.call(context, {
-        resumeValue: {},
-        seedContent: [
-          {
-            type: ContentTypes.TOOL_CALL,
-            tool_call: {
-              name: 'example_tool',
-              arguments: deepArguments,
+    context.buildMessages = jest.fn(async () => ({
+      prompt: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                name: 'file_search',
+                arguments: deepArguments,
+              },
             },
-          },
-        ],
-      }),
-    ).rejects.toMatchObject({
-      code: 'content_filter_uninspectable',
-      body: { source: 'tool_argument', field: 'arguments' },
-    });
-    expect(mockCreateRun).not.toHaveBeenCalled();
+          ],
+        },
+      ],
+    }));
+
+    await expectPiResumePolicyError(
+      context,
+      {},
+      {
+        code: 'content_filter_uninspectable',
+        body: { source: 'message', field: 'content_part' },
+      },
+    );
   });
 
   it('does not log or persist provider error content while resuming', async () => {
     const { logger } = require('@librechat/data-schemas');
     const privateValue = 'PRIVATE-RESUME-PROVIDER-CONTENT';
     const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-    mockCreateRun.mockRejectedValue(
+    mockExecutePiGeneration.mockRejectedValue(
       Object.assign(new Error(`Provider echoed ${privateValue}`), {
         code: 'ERR_REMOTE',
         response: { status: 422, data: { prompt: privateValue } },
@@ -12836,7 +13360,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
       },
     });
 
-    await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
+    await resumeWithPi(context, { resumeValue: {} });
 
     expect(context.contentParts).toContainEqual({
       type: ContentTypes.ERROR,
@@ -12845,7 +13369,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
     expect(JSON.stringify(context.contentParts)).not.toContain(privateValue);
     expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(privateValue);
     expect(errorSpy).toHaveBeenCalledWith(
-      '[api/server/controllers/agents/client.js #resumeCompletion] Unhandled error',
+      '[api/server/controllers/agents/client.js #resumePiCompletion] Unhandled error',
       expect.objectContaining({ type: 'Error' }),
     );
     errorSpy.mockRestore();
@@ -12873,28 +13397,23 @@ describe('AgentClient - resumeCompletion content protection', () => {
     });
     const abortController = new AbortController();
     const errorSpy = jest.spyOn(logger, 'error').mockImplementation(() => logger);
-    mockCreateRun.mockImplementation(async (options) => {
-      const tracker = options.modelCallbacks.find(
-        (callback) => callback.name === 'librechat-upstream-model-error-tracker',
-      );
-      return {
-        resume: jest.fn(async () => {
-          tracker.handleLLMError(providerError, 'resumed-model-run');
-          abortController.abort();
-          throw providerError;
-        }),
-        getCalibrationRatio: jest.fn(() => 0),
-      };
-    });
+    mockExecutePiGeneration.mockImplementation(
+      async ({ onModelProviderError, onSessionCreated }) => {
+        onSessionCreated?.();
+        onModelProviderError?.(providerError);
+        abortController.abort();
+        throw providerError;
+      },
+    );
     const context = makeContext(undefined);
 
-    await AgentClient.prototype.resumeCompletion.call(context, {
+    await resumeWithPi(context, {
       resumeValue: {},
       abortController,
     });
 
     expect(errorSpy).toHaveBeenCalledWith(
-      '[api/server/controllers/agents/client.js #resumeCompletion] Upstream model error',
+      '[api/server/controllers/agents/client.js #resumePiCompletion] Upstream model error',
       {
         type: 'Error',
         status: 503,
@@ -12922,25 +13441,20 @@ describe('AgentClient - resumeCompletion content protection', () => {
     async (maxProviderErrorChars) => {
       const explanation = '400 Request rejected: this prompt cannot be masked safely';
       const trackTerminalProviderError = (providerError) => {
-        mockCreateRun.mockImplementation(async (options) => {
-          const tracker = options.modelCallbacks.find(
-            (callback) => callback.name === 'librechat-upstream-model-error-tracker',
-          );
-          return {
-            resume: jest.fn(async () => {
-              tracker.handleLLMError(providerError, 'resumed-model-run');
-              throw providerError;
-            }),
-            getCalibrationRatio: jest.fn(() => 0),
-          };
-        });
+        mockExecutePiGeneration.mockImplementation(
+          async ({ onModelProviderError, onSessionCreated }) => {
+            onSessionCreated?.();
+            onModelProviderError?.(providerError);
+            throw providerError;
+          },
+        );
       };
 
       trackTerminalProviderError(Object.assign(new Error(explanation), { status: 400 }));
       const context = makeContext(undefined);
       context.options.req.config.endpoints = { agents: { maxProviderErrorChars } };
 
-      await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
+      await resumeWithPi(context, { resumeValue: {} });
 
       expect(context.contentParts).toContainEqual({
         type: ContentTypes.ERROR,
@@ -12959,7 +13473,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
         messages: { pii: { fields: ['text'], starterPatterns: ['email'] } },
       });
 
-      await AgentClient.prototype.resumeCompletion.call(protectedContext, { resumeValue: {} });
+      await resumeWithPi(protectedContext, { resumeValue: {} });
 
       expect(protectedContext.contentParts).toContainEqual({
         type: ContentTypes.ERROR,
@@ -12972,10 +13486,10 @@ describe('AgentClient - resumeCompletion content protection', () => {
 
   it('preserves provider error detail when content protection is disabled', async () => {
     const providerMessage = 'Legacy provider detail';
-    mockCreateRun.mockRejectedValue(new Error(providerMessage));
+    mockExecutePiGeneration.mockRejectedValue(new Error(providerMessage));
     const context = makeContext(undefined);
 
-    await AgentClient.prototype.resumeCompletion.call(context, { resumeValue: {} });
+    await resumeWithPi(context, { resumeValue: {} });
 
     expect(context.contentParts).toContainEqual({
       type: ContentTypes.ERROR,
@@ -13068,3 +13582,4 @@ describe('seedContextMeta', () => {
     expect(client.contextMeta).toBeUndefined();
   });
 });
+/* eslint jest/expect-expect: ["warn", { "assertFunctionNames": ["expect", "expectPiResumePolicyError", "expectPiResumeToFailClosed"] }] */

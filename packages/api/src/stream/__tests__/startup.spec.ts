@@ -121,6 +121,9 @@ it('keeps a fresh terminal writer and its DONE subscription when cleanup reaps a
       job.streamId,
       job.createdAt,
       JSON.stringify({ final: true, terminalStatus: 'complete' }),
+      undefined,
+      `terminal:${job.createdAt}`,
+      claim!.persistenceOwnerToken,
     );
     await manager.emitDone(job.streamId, { final: true }, job.createdAt);
     expect(onDone).toHaveBeenCalledTimes(1);
@@ -722,14 +725,12 @@ describe('GenerationJobManager startup telemetry', () => {
       'stream-hot-path',
       firstDelta,
       job.createdAt,
-      { providerOwner: undefined },
     );
     expect(publishWithReceipt).toHaveBeenNthCalledWith(
       2,
       'stream-hot-path',
       laterDelta,
       job.createdAt,
-      { providerOwner: undefined },
     );
     expect(emitChunk).not.toHaveBeenCalled();
 
@@ -3502,15 +3503,17 @@ describe('GenerationJobManager startup telemetry', () => {
         terminalPersistenceStartedAt: Date.now() - 60_000,
       },
     });
-    const finalize = jobStore.finalizeTerminalPersistence.bind(jobStore);
+    const finalize = jobStore.recoverExpiredTerminalPersistence.bind(jobStore);
     let successorCreatedAt = 0;
-    jest.spyOn(jobStore, 'finalizeTerminalPersistence').mockImplementation(async (...args) => {
-      const finalized = await finalize(...args);
-      const successor = await jobStore.createJob(streamId, 'user-1', streamId);
-      successorCreatedAt = successor.createdAt;
-      await manager.getJob(streamId);
-      return finalized;
-    });
+    jest
+      .spyOn(jobStore, 'recoverExpiredTerminalPersistence')
+      .mockImplementation(async (...args) => {
+        const finalized = await finalize(...args);
+        const successor = await jobStore.createJob(streamId, 'user-1', streamId);
+        successorCreatedAt = successor.createdAt;
+        await manager.getJob(streamId);
+        return finalized;
+      });
     jest.spyOn(eventTransport, 'emitDone').mockImplementation((_streamId, _event, generationId) => {
       throw new GenerationPublicationFencedError('done', streamId, generationId);
     });
@@ -3562,7 +3565,7 @@ describe('GenerationJobManager startup telemetry', () => {
         terminalPersistenceStartedAt: Date.now() - 60_000,
       },
     });
-    const finalize = jobStore.finalizeTerminalPersistence.bind(jobStore);
+    const finalize = jobStore.recoverExpiredTerminalPersistence.bind(jobStore);
     let finalizeEntered!: () => void;
     const finalizationStarted = new Promise<void>((resolve) => {
       finalizeEntered = resolve;
@@ -3572,14 +3575,16 @@ describe('GenerationJobManager startup telemetry', () => {
       releaseFinalize = resolve;
     });
     let successorCreatedAt = 0;
-    jest.spyOn(jobStore, 'finalizeTerminalPersistence').mockImplementation(async (...args) => {
-      finalizeEntered();
-      await finalizeReleased;
-      const finalized = await finalize(...args);
-      const successor = await jobStore.createJob(streamId, 'user-1', streamId);
-      successorCreatedAt = successor.createdAt;
-      return finalized;
-    });
+    jest
+      .spyOn(jobStore, 'recoverExpiredTerminalPersistence')
+      .mockImplementation(async (...args) => {
+        finalizeEntered();
+        await finalizeReleased;
+        const finalized = await finalize(...args);
+        const successor = await jobStore.createJob(streamId, 'user-1', streamId);
+        successorCreatedAt = successor.createdAt;
+        return finalized;
+      });
     jest.spyOn(eventTransport, 'emitDone').mockImplementation((_streamId, _event, generationId) => {
       throw new GenerationPublicationFencedError('done', streamId, generationId);
     });
@@ -3652,13 +3657,15 @@ describe('GenerationJobManager startup telemetry', () => {
         terminalPersistenceStartedAt: Date.now() - 60_000,
       },
     });
-    const finalize = jobStore.finalizeTerminalPersistence.bind(jobStore);
+    const finalize = jobStore.recoverExpiredTerminalPersistence.bind(jobStore);
     let successorCreatedAt = 0;
-    jest.spyOn(jobStore, 'finalizeTerminalPersistence').mockImplementation(async (...args) => {
-      const successor = await jobStore.createJob(streamId, 'user-1', streamId);
-      successorCreatedAt = successor.createdAt;
-      return finalize(...args);
-    });
+    jest
+      .spyOn(jobStore, 'recoverExpiredTerminalPersistence')
+      .mockImplementation(async (...args) => {
+        const successor = await jobStore.createJob(streamId, 'user-1', streamId);
+        successorCreatedAt = successor.createdAt;
+        return finalize(...args);
+      });
     jest.useFakeTimers();
 
     try {
@@ -3711,17 +3718,19 @@ describe('GenerationJobManager startup telemetry', () => {
         terminalPersistenceStartedAt: Date.now() - 60_000,
       },
     });
-    const finalize = jobStore.finalizeTerminalPersistence.bind(jobStore);
-    jest.spyOn(jobStore, 'finalizeTerminalPersistence').mockImplementation(async (...args) => {
-      const finalized = await finalize(...args);
-      const successor = await jobStore.createJob(streamId, 'user-1', streamId);
-      await jobStore.updateJob(
-        streamId,
-        { status: 'error', error: 'successor provider failure', completedAt: Date.now() },
-        successor.createdAt,
-      );
-      return finalized;
-    });
+    const finalize = jobStore.recoverExpiredTerminalPersistence.bind(jobStore);
+    jest
+      .spyOn(jobStore, 'recoverExpiredTerminalPersistence')
+      .mockImplementation(async (...args) => {
+        const finalized = await finalize(...args);
+        const successor = await jobStore.createJob(streamId, 'user-1', streamId);
+        await jobStore.updateJob(
+          streamId,
+          { status: 'error', error: 'successor provider failure', completedAt: Date.now() },
+          successor.createdAt,
+        );
+        return finalized;
+      });
     jest.spyOn(eventTransport, 'emitDone').mockImplementation((_streamId, _event, generationId) => {
       throw new GenerationPublicationFencedError('done', streamId, generationId);
     });
@@ -4355,7 +4364,6 @@ describe('GenerationJobManager startup telemetry', () => {
       'stream-shutdown-owned',
       'Generation interrupted because its server shut down',
       job.createdAt,
-      undefined,
     );
   });
 

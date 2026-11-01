@@ -118,7 +118,7 @@ describe('background code harvest generation lifecycle', () => {
 
   it('does not retire a result while the real manager is awaiting terminal message persistence', async () => {
     const manager = new GenerationJobManagerClass();
-    const store = new InMemoryJobStore({ ttlAfterComplete: 0 });
+    const store = new InMemoryJobStore({ ttlAfterComplete: 0, staleJobTimeout: 0 });
     manager.configure({
       jobStore: store,
       eventTransport: new InMemoryEventTransport(),
@@ -135,11 +135,15 @@ describe('background code harvest generation lifecycle', () => {
       const row = { unfinished: true };
       const running = harvest(manager, row);
       await jest.advanceTimersByTimeAsync(1_000_000);
+      const beforeErrorPublication = jest.fn(() => save);
       const completing = manager.completeJob('conversation', 'provider error', job.createdAt, {
-        beforeErrorPublication: () => save,
+        beforeErrorPublication,
       });
+      // Cross both the 30-second stale-owner threshold and periodic manager
+      // cleanup: this manager must recognize its own still-pending save claim.
       await jest.advanceTimersByTimeAsync(120_000);
       const beforePersistence = running.getResult();
+      expect(beforeErrorPublication).toHaveBeenCalledTimes(1);
       expect((await store.getJob('conversation'))?.terminalPersistencePending).toBe(true);
       row.unfinished = false;
       finishSave();

@@ -165,10 +165,12 @@ const SHUTTING_DOWN_ERROR = 'Generation job manager is shutting down';
 export const TERMINAL_PUBLICATION_RECONNECT_ERROR =
   'Terminal publication failed; reconnect to load the durable result';
 export const GENERATION_RECOVERY_FAILED_ERROR = 'generation_recovery_failed';
-/** Upper bound for a terminal owner's required persistence barrier. A crashed
- * owner leaves the durable pending bit behind; the next read or subscriber
- * promotes it to conservative reconciliation after this window. */
+/** Legacy pending rows have no renewable owner lease. Recovery uses this grace
+ * window for those rows; new claims carry a store-clock lease instead. */
 const TERMINAL_PERSISTENCE_TIMEOUT_MS = 30_000;
+/** A live terminal writer renews its durable lease well before cleanup scans. */
+const TERMINAL_PERSISTENCE_LEASE_MS = 90_000;
+const TERMINAL_PERSISTENCE_HEARTBEAT_MS = 10_000;
 const terminalPublicationIdentity = (createdAt: number): string => `terminal:${createdAt}`;
 const isTerminalPublicationPending = (job: SerializableJobData | null | undefined): boolean =>
   job?.terminalPublicationId != null &&
@@ -757,6 +759,8 @@ export interface TerminalJobClaim {
   /** The winner must durably publish either its normal FINAL or a
    * reconciliation payload before cleanup may remove the job. */
   readonly persistencePending?: true;
+  /** Fences terminal persistence renew/finalize against stale owners. */
+  readonly persistenceOwnerToken?: string;
   /** Exact Pi provider capability retained only while this terminal owner drains. */
   readonly providerOwnerContext?: ProviderOwnerContext;
   /** Exact queued + claimed steers atomically parked by the winning CAS. */
@@ -984,6 +988,17 @@ class GenerationJobManagerClass {
   /** Exact local runtime observed when a claim won; never clean a later runtime. */
   private terminalClaimRuntimes = new WeakMap<TerminalJobClaim, RuntimeJobState | null>();
 
+  /** Live persistence owners renew the durable store lease until finalization. */
+  private terminalPersistenceLeases = new Map<
+    string,
+    {
+      claim: TerminalJobClaim;
+      store: IJobStoreV2;
+      timer: NodeJS.Timeout;
+      renewing: boolean;
+    }
+  >();
+
   /** Claims whose durable final exists but whose DONE transport publication
    * failed. Retain their job record through normal finish so the forced
    * reconnect can replay that authoritative final payload. */
@@ -1103,6 +1118,7 @@ class GenerationJobManagerClass {
   }): void {
     assertJobStoreV2(services.jobStore);
     this.cancelFencedRuntimeRetirements();
+    this.clearTerminalPersistenceLeases();
     const previousStore = this.storeLabel;
     if (this.cleanupInterval) {
       logger.warn(
@@ -1458,6 +1474,93 @@ class GenerationJobManagerClass {
     this.preserveFencedRuntimeUntilHandoff(streamId, runtime);
   }
 
+  private terminalPersistenceLeaseKey(claim: TerminalJobClaim): string | undefined {
+    return claim.persistenceOwnerToken == null
+      ? undefined
+      : `${claim.streamId}:${claim.createdAt}:${claim.persistenceOwnerToken}`;
+  }
+
+  private startTerminalPersistenceLease(claim: TerminalJobClaim): void {
+    const key = this.terminalPersistenceLeaseKey(claim);
+    if (key == null || claim.persistencePending !== true) {
+      return;
+    }
+    const store = this.jobStore;
+    if (typeof store.renewTerminalPersistenceLease !== 'function') {
+      throw new Error('The configured job store cannot renew terminal persistence ownership');
+    }
+    const existing = this.terminalPersistenceLeases.get(key);
+    if (existing?.claim === claim) {
+      return;
+    }
+    if (existing) {
+      clearInterval(existing.timer);
+      this.terminalPersistenceLeases.delete(key);
+    }
+    const lease = {
+      claim,
+      store,
+      timer: undefined as unknown as NodeJS.Timeout,
+      renewing: false,
+    };
+    lease.timer = setInterval(() => {
+      if (lease.renewing) {
+        return;
+      }
+      if (this.shuttingDown || this.jobStore !== store) {
+        this.stopTerminalPersistenceLease(claim);
+        return;
+      }
+      lease.renewing = true;
+      void store
+        .renewTerminalPersistenceLease(
+          claim.streamId,
+          claim.createdAt,
+          claim.persistenceOwnerToken!,
+          TERMINAL_PERSISTENCE_LEASE_MS,
+        )
+        .then((renewed) => {
+          if (!renewed) {
+            logger.warn(
+              `[GenerationJobManager] Lost terminal persistence lease for ${claim.streamId}@${claim.createdAt}`,
+            );
+            this.stopTerminalPersistenceLease(claim);
+          }
+        })
+        .catch((error) => {
+          logger.error(
+            `[GenerationJobManager] Failed to renew terminal persistence lease for ${claim.streamId}@${claim.createdAt}`,
+            getSafeErrorMetadata(error),
+          );
+        })
+        .finally(() => {
+          lease.renewing = false;
+        });
+    }, TERMINAL_PERSISTENCE_HEARTBEAT_MS);
+    lease.timer.unref?.();
+    this.terminalPersistenceLeases.set(key, lease);
+  }
+
+  private stopTerminalPersistenceLease(claim: TerminalJobClaim): void {
+    const key = this.terminalPersistenceLeaseKey(claim);
+    if (key == null) {
+      return;
+    }
+    const lease = this.terminalPersistenceLeases.get(key);
+    if (lease?.claim !== claim) {
+      return;
+    }
+    clearInterval(lease.timer);
+    this.terminalPersistenceLeases.delete(key);
+  }
+
+  private clearTerminalPersistenceLeases(): void {
+    for (const lease of this.terminalPersistenceLeases.values()) {
+      clearInterval(lease.timer);
+    }
+    this.terminalPersistenceLeases.clear();
+  }
+
   /** Promotes a terminal claim whose persistence owner disappeared to a conservative
    * terminal payload. The store CAS races safely with a slow owner: whichever
    * side finalizes first chooses the only payload subscribers may consume. */
@@ -1486,15 +1589,6 @@ class GenerationJobManagerClass {
     ) {
       return jobData;
     }
-    const startedAt =
-      jobData.terminalPersistenceStartedAt ?? jobData.completedAt ?? jobData.createdAt;
-    if (
-      jobData.terminalPersistencePending === true &&
-      jobData.providerRecoveryOutcome !== 'outcome_unknown' &&
-      Date.now() - startedAt < TERMINAL_PERSISTENCE_TIMEOUT_MS
-    ) {
-      return jobData;
-    }
     const observedRuntime = this.runtimeState.get(jobData.streamId);
     let runtime = observedRuntime?.createdAt === jobData.createdAt ? observedRuntime : undefined;
     /** Preserve the pre-await object when one exists, but also admit a predecessor
@@ -1515,17 +1609,19 @@ class GenerationJobManagerClass {
     let durableJob = jobData;
     if (jobData.terminalPersistencePending === true) {
       const serialized = JSON.stringify(reconcileEvent);
-      const finalized = await this.jobStore.finalizeTerminalPersistence(
+      const finalized = await this.jobStore.recoverExpiredTerminalPersistence(
         jobData.streamId,
         jobData.createdAt,
         serialized,
-        undefined,
-        terminalPublicationId,
+        terminalPublicationId!,
+        TERMINAL_PERSISTENCE_TIMEOUT_MS,
       );
       if (finalized) {
         durableJob = {
           ...jobData,
           terminalPersistencePending: false,
+          terminalPersistenceOwnerToken: undefined,
+          terminalPersistenceLeaseExpiresAt: undefined,
           finalEvent: serialized,
           terminalPublicationId,
         };
@@ -4300,6 +4396,7 @@ class GenerationJobManagerClass {
       return null;
     }
     const terminalError = status === 'error' ? (error ?? 'Generation failed') : undefined;
+    const persistenceOwnerToken = options.persistencePending === true ? randomUUID() : undefined;
     await this.flushCoalescedStreamBuffers(streamId);
     await this.persistAgentEventRunStepEvidence(streamId, jobData);
     const completedAt = Date.now();
@@ -4328,8 +4425,12 @@ class GenerationJobManagerClass {
         ...(options.persistencePending === true && {
           terminalPersistencePending: true,
           terminalPersistenceStartedAt: completedAt,
+          terminalPersistenceOwnerToken: persistenceOwnerToken,
         }),
       },
+      ...(options.persistencePending === true && {
+        terminalPersistenceLeaseMs: TERMINAL_PERSISTENCE_LEASE_MS,
+      }),
       ...(sourceStatus === 'requires_action' && {
         clear: [
           'pendingAction',
@@ -4357,6 +4458,7 @@ class GenerationJobManagerClass {
       ...(terminalError != null && { error: terminalError }),
       ...(options.persistencePending === true && {
         persistencePending: true as const,
+        persistenceOwnerToken,
       }),
       ...(status !== 'aborted' &&
         providerOwnerContext != null && {
@@ -4365,6 +4467,7 @@ class GenerationJobManagerClass {
       drainedSteers: Object.freeze([...drainedSteers]),
     });
     this.terminalClaimRuntimes.set(claim, runtime ?? null);
+    this.startTerminalPersistenceLease(claim);
 
     // An aborted claim must stop its exact generation immediately. Cleanup is
     // still deferred to finishTerminalJob so terminal publication can happen
@@ -4395,6 +4498,21 @@ class GenerationJobManagerClass {
    * this method will publish.
    */
   async publishTerminalClaim(
+    claim: TerminalJobClaim,
+    finalEvent: t.ServerSentEvent | null,
+  ): Promise<{
+    finalEvent: t.ServerSentEvent;
+    persistenceFailed: boolean;
+    publicationFenced?: true;
+  }> {
+    try {
+      return await this.publishTerminalClaimInternal(claim, finalEvent);
+    } finally {
+      this.stopTerminalPersistenceLease(claim);
+    }
+  }
+
+  private async publishTerminalClaimInternal(
     claim: TerminalJobClaim,
     finalEvent: t.ServerSentEvent | null,
   ): Promise<{
@@ -4438,6 +4556,7 @@ class GenerationJobManagerClass {
         JSON.stringify(desiredEvent),
         claim.providerOwnerContext,
         candidatePublicationId,
+        claim.persistenceOwnerToken,
       );
       if (finalized) {
         publicationEvent = desiredEvent;
@@ -4694,12 +4813,16 @@ class GenerationJobManagerClass {
           if (runtime?.createdEventPublication) {
             await runtime.createdEventPublication;
           }
-          await this.eventTransport.emitError(
-            streamId,
-            terminalError,
-            createdAt,
-            claim.providerOwnerContext,
-          );
+          if (claim.providerOwnerContext == null) {
+            await this.eventTransport.emitError(streamId, terminalError, createdAt);
+          } else {
+            await this.eventTransport.emitError(
+              streamId,
+              terminalError,
+              createdAt,
+              claim.providerOwnerContext,
+            );
+          }
         } catch (publishError) {
           if (!(publishError instanceof GenerationPublicationFencedError)) {
             logger.error(
@@ -4744,6 +4867,7 @@ class GenerationJobManagerClass {
       cleanupError = err;
       retainTerminalHostEvidence = true;
     } finally {
+      this.stopTerminalPersistenceLease(claim);
       if (runtime && this.runtimeState.get(streamId) === runtime) {
         if (!generationHadSubscriber) {
           recordGenerationStreamAttachment(this.storeLabel, 'never_attached');
@@ -4828,45 +4952,51 @@ class GenerationJobManagerClass {
       return false;
     }
 
-    if (beforeErrorPublication) {
-      let persistenceFinalized = false;
-      try {
-        await beforeErrorPublication();
-        persistenceFinalized = await this.jobStore.finalizeTerminalPersistence(
-          streamId,
-          claim.createdAt,
-          JSON.stringify(
-            buildTerminalPersistenceReconcile({
-              createdAt: claim.createdAt,
-              conversationId: claim.conversationId,
-              status: claim.status,
-            }),
-          ),
-          claim.providerOwnerContext,
-        );
-      } catch (persistenceError) {
-        logger.error(
-          `[GenerationJobManager] Failed required error persistence for ${streamId}:`,
-          persistenceError,
-        );
+    try {
+      if (beforeErrorPublication) {
+        let persistenceFinalized = false;
         try {
-          await this.publishTerminalClaim(claim, null);
-        } catch (publishError) {
-          logger.error(
-            `[GenerationJobManager] Failed to publish error persistence reconciliation for ${streamId}:`,
-            publishError,
+          await beforeErrorPublication();
+          persistenceFinalized = await this.jobStore.finalizeTerminalPersistence(
+            streamId,
+            claim.createdAt,
+            JSON.stringify(
+              buildTerminalPersistenceReconcile({
+                createdAt: claim.createdAt,
+                conversationId: claim.conversationId,
+                status: claim.status,
+              }),
+            ),
+            claim.providerOwnerContext,
+            undefined,
+            claim.persistenceOwnerToken,
           );
+        } catch (persistenceError) {
+          logger.error(
+            `[GenerationJobManager] Failed required error persistence for ${streamId}:`,
+            persistenceError,
+          );
+          try {
+            await this.publishTerminalClaim(claim, null);
+          } catch (publishError) {
+            logger.error(
+              `[GenerationJobManager] Failed to publish error persistence reconciliation for ${streamId}:`,
+              publishError,
+            );
+          }
+        }
+
+        if (!persistenceFinalized) {
+          this.terminalErrorPublicationSuppressions.add(claim);
         }
       }
 
-      if (!persistenceFinalized) {
-        this.terminalErrorPublicationSuppressions.add(claim);
-      }
+      await options.beforeTerminalCleanup?.();
+      await this.finishTerminalJob(claim);
+      return true;
+    } finally {
+      this.stopTerminalPersistenceLease(claim);
     }
-
-    await options.beforeTerminalCleanup?.();
-    await this.finishTerminalJob(claim);
-    return true;
   }
 
   /**
@@ -5057,6 +5187,7 @@ class GenerationJobManagerClass {
      * exact queued/claimed set parked by the winning abort, so the final event
      * can restore it without a second read or a recovery race. */
     const terminalPersistenceStartedAt = Date.now();
+    const persistenceOwnerToken = randomUUID();
     let transitionFrom = abortableStatus;
     let drainedSteers: SteerQueueItem[] | null = null;
     let currentAfterConflict: SerializableJobData | null = jobData;
@@ -5075,11 +5206,13 @@ class GenerationJobManagerClass {
           completedAt: terminalPersistenceStartedAt,
           terminalPersistencePending: true,
           terminalPersistenceStartedAt,
+          terminalPersistenceOwnerToken: persistenceOwnerToken,
           ...(jobData.agentEventDeliveryKey != null &&
             this.terminalHostActionHandler != null && {
               terminalHostActionPending: true,
             }),
         },
+        terminalPersistenceLeaseMs: TERMINAL_PERSISTENCE_LEASE_MS,
         clear: ['pendingAction', 'pendingActionId', 'piResumeContinuation'],
       });
       if (drainedSteers != null) {
@@ -5149,9 +5282,11 @@ class GenerationJobManagerClass {
       ...(jobData.userId != null && { userId: jobData.userId }),
       status: 'aborted',
       persistencePending: true,
+      persistenceOwnerToken,
       drainedSteers: Object.freeze([...drainedSteers]),
     });
     this.terminalClaimRuntimes.set(terminalClaim, runtime ?? null);
+    this.startTerminalPersistenceLease(terminalClaim);
 
     try {
       const pendingSteers = drainedSteers.map(toPendingSteer);
@@ -7382,14 +7517,23 @@ class GenerationJobManagerClass {
       if (eventType && eventData !== undefined) {
         runtime.durableEventSequence += 1;
         // Store in format expected by aggregateContent: { event, data }
-        const appendPromise = this.jobStore.appendChunk(
-          streamId,
-          { event: eventType, data: eventData },
-          runtime.createdAt,
-          options?.deliveredSteer,
-          coalescableDelta ? { coalesce: true } : undefined,
-          runtime.providerOwnerContext,
-        );
+        const appendPromise =
+          options?.deliveredSteer == null &&
+          !coalescableDelta &&
+          runtime.providerOwnerContext == null
+            ? this.jobStore.appendChunk(
+                streamId,
+                { event: eventType, data: eventData },
+                runtime.createdAt,
+              )
+            : this.jobStore.appendChunk(
+                streamId,
+                { event: eventType, data: eventData },
+                runtime.createdAt,
+                options?.deliveredSteer,
+                coalescableDelta ? { coalesce: true } : undefined,
+                runtime.providerOwnerContext,
+              );
 
         /** Before the generation-wide first-subscriber admission, publication
          * is the cross-replica boundary: its durable record must already exist
@@ -7487,7 +7631,7 @@ class GenerationJobManagerClass {
         streamId,
         event,
         runtime.createdAt,
-        { coalesce: true, providerOwner: runtime.providerOwnerContext },
+        { coalesce: true },
       );
       if (buffered) {
         runtime.earlyEventSequencePromises.push(
@@ -7527,13 +7671,12 @@ class GenerationJobManagerClass {
 
     if (!buffered && !runtime.startupTelemetry) {
       try {
-        const published = await emitChunkWithReceipt(
-          this.eventTransport,
-          streamId,
-          event,
-          runtime.createdAt,
-          { providerOwner: runtime.providerOwnerContext },
-        );
+        const published =
+          runtime.providerOwnerContext == null
+            ? await emitChunkWithReceipt(this.eventTransport, streamId, event, runtime.createdAt)
+            : await emitChunkWithReceipt(this.eventTransport, streamId, event, runtime.createdAt, {
+                providerOwner: runtime.providerOwnerContext,
+              });
         if (published === false) {
           this.retireRuntimeAfterDurableFence(streamId, runtime);
           if (options?.durable === true && options.deliveredSteer == null) {
@@ -7557,13 +7700,12 @@ class GenerationJobManagerClass {
       return;
     }
 
-    const publication = emitChunkWithReceipt(
-      this.eventTransport,
-      streamId,
-      event,
-      runtime.createdAt,
-      { providerOwner: runtime.providerOwnerContext },
-    );
+    const publication =
+      runtime.providerOwnerContext == null
+        ? emitChunkWithReceipt(this.eventTransport, streamId, event, runtime.createdAt)
+        : emitChunkWithReceipt(this.eventTransport, streamId, event, runtime.createdAt, {
+            providerOwner: runtime.providerOwnerContext,
+          });
     if (buffered) {
       // Store a non-rejecting sequence receipt before yielding. The absolute value
       // establishes the exact replay frontier; a failed/unsequenced publication
@@ -9681,12 +9823,16 @@ class GenerationJobManagerClass {
       .catch((err) => {
         logger.error(`[GenerationJobManager] Failed to persist error:`, err);
       });
-    await this.eventTransport.emitError(
-      streamId,
-      error,
-      generationId,
-      matchingRuntime?.providerOwnerContext,
-    );
+    if (matchingRuntime?.providerOwnerContext == null) {
+      await this.eventTransport.emitError(streamId, error, generationId);
+    } else {
+      await this.eventTransport.emitError(
+        streamId,
+        error,
+        generationId,
+        matchingRuntime.providerOwnerContext,
+      );
+    }
     matchingRuntime?.startupTelemetry?.mark('first_response_event_queued');
   }
 
@@ -10428,6 +10574,7 @@ class GenerationJobManagerClass {
     }
     this.shuttingDown = true;
     this.cancelFencedRuntimeRetirements();
+    this.clearTerminalPersistenceLeases();
 
     for (const runtime of this.runtimeState.values()) {
       runtime.startupTelemetry?.end('aborted');
@@ -10456,6 +10603,7 @@ class GenerationJobManagerClass {
     const settlementDeadline = Date.now() + settlementBudgetMs;
     this.shuttingDown = true;
     this.cancelFencedRuntimeRetirements();
+    this.clearTerminalPersistenceLeases();
 
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);

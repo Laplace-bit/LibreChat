@@ -172,6 +172,7 @@ function assertCreateIdempotencyArguments(
  *     steerReceiptTtl (0 to leave unchanged),
  *     ownerId, providerExecutionId, providerFence, ownerLeaseMode,
  *     returnDrainedSteers,
+ *     terminalPersistenceLeaseMs (0 if unset),
  *     hdelCount,
  *     ...hdelFields,
  *     ...hsetPairs
@@ -234,9 +235,10 @@ const JOB_CAS_LUA =
   'or (item.recoveringCreatedAt and (type(item.recoveringCreatedAt) ~= "number" or item.recoveringCreatedAt < 0)) then return 0 end ' +
   'validatedPrior[#validatedPrior + 1] = item end end end ' +
   'local currentReceipt = redis.call("HGET", KEYS[1], "scheduleOutcomeError") ' +
-  'local clearReceipt = false local hdelCount = tonumber(ARGV[17]) ' +
-  'for i = 18, 17 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
-  'local hsetStart = 18 + hdelCount local targetStatus = nil ' +
+  'local clearReceipt = false local terminalPersistenceLeaseMs = tonumber(ARGV[17]) ' +
+  'local hdelCount = tonumber(ARGV[18]) ' +
+  'for i = 19, 18 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
+  'local hsetStart = 19 + hdelCount local targetStatus = nil ' +
   'for i = hsetStart, #ARGV, 2 do if ARGV[i] == "status" then targetStatus = ARGV[i+1] break end end ' +
   'if terminal and (targetStatus == "complete" or targetStatus == "error") and ARGV[12] == "" ' +
   'and redis.call("HGET", KEYS[1], "providerDrained") == "0" then ' +
@@ -257,12 +259,26 @@ const JOB_CAS_LUA =
   'if terminal and ARGV[15] == "expired" then local now = redis.call("TIME") ' +
   'ownerLostAt = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
   'redis.call("HSET", KEYS[1], "providerOwnerLostAt", ownerLostAt) end ' +
-  'local idx = 18 ' +
+  'local idx = 19 ' +
   'for i = 1, hdelCount do redis.call("HDEL", KEYS[1], ARGV[idx]) idx = idx + 1 end ' +
   'local hset = {} ' +
   'for i = idx, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
   'if ownerLostAt then hset[#hset + 1] = "completedAt" hset[#hset + 1] = ownerLostAt ' +
   'hset[#hset + 1] = "terminalPersistenceStartedAt" hset[#hset + 1] = ownerLostAt end ' +
+  'local persistencePending = false local persistenceOwnerToken = nil local persistenceLeaseExpiry = nil ' +
+  'for i = 1, #hset, 2 do ' +
+  'if hset[i] == "terminalPersistencePending" then persistencePending = hset[i+1] == "1" end ' +
+  'if hset[i] == "terminalPersistenceOwnerToken" then persistenceOwnerToken = hset[i+1] end ' +
+  'if hset[i] == "terminalPersistenceLeaseExpiresAt" then persistenceLeaseExpiry = hset[i+1] end end ' +
+  'if terminalPersistenceLeaseMs > 0 then ' +
+  'if not terminal or not persistencePending or not persistenceOwnerToken or persistenceOwnerToken == "" ' +
+  'or persistenceLeaseExpiry then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = nowMs + terminalPersistenceLeaseMs if leaseUntil > 9007199254740991 then return 0 end ' +
+  'hset[#hset + 1] = "terminalPersistenceLeaseExpiresAt" ' +
+  'hset[#hset + 1] = tostring(leaseUntil) ' +
+  'elseif terminal and persistencePending and persistenceOwnerToken and persistenceOwnerToken ~= "" then return 0 end ' +
+  'if persistenceLeaseExpiry then return 0 end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, currentReceipt, clearReceipt, originalReceipt) ' +
@@ -925,12 +941,58 @@ const ACK_TERMINAL_PUBLICATION_LUA =
   'or redis.call("HGET", KEYS[1], "terminalPublicationId") ~= ARGV[2] ' +
   'or redis.call("HGET", KEYS[1], "terminalPublicationPublishedId") ~= ARGV[2] then return 0 end return 1';
 
+const RENEW_TERMINAL_PERSISTENCE_LEASE_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" ' +
+  'or redis.call("HGET", KEYS[1], "terminalPersistenceOwnerToken") ~= ARGV[2] then return 0 end ' +
+  'local status = redis.call("HGET", KEYS[1], "status") ' +
+  'if status == "detached_terminal_pending_v1" then status = redis.call("HGET", KEYS[1], "detachedAgentEventTerminalStatus") end ' +
+  'if status ~= "complete" and status ~= "error" and status ~= "aborted" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "terminalPersistenceLeaseExpiresAt") or "") ' +
+  'if not leaseUntil or leaseUntil ~= leaseUntil or leaseUntil > 9007199254740991 or leaseUntil <= nowMs then return 0 end ' +
+  'local renewedUntil = nowMs + tonumber(ARGV[3]) if renewedUntil > 9007199254740991 then return 0 end ' +
+  'redis.call("HSET", KEYS[1], "terminalPersistenceLeaseExpiresAt", renewedUntil) return 1';
+
+const RECOVER_EXPIRED_TERMINAL_PERSISTENCE_LUA =
+  'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] ' +
+  'or redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" then return 0 end ' +
+  'local status = redis.call("HGET", KEYS[1], "status") ' +
+  'if status == "detached_terminal_pending_v1" then status = redis.call("HGET", KEYS[1], "detachedAgentEventTerminalStatus") end ' +
+  'if status ~= "complete" and status ~= "error" and status ~= "aborted" then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local ownerToken = redis.call("HGET", KEYS[1], "terminalPersistenceOwnerToken") ' +
+  'local leaseRaw = redis.call("HGET", KEYS[1], "terminalPersistenceLeaseExpiresAt") ' +
+  'if ownerToken and ownerToken ~= "" and leaseRaw then ' +
+  'local leaseUntil = tonumber(leaseRaw) ' +
+  'if not leaseUntil or leaseUntil ~= leaseUntil or leaseUntil <= 0 ' +
+  'or leaseUntil > 9007199254740991 or leaseUntil > nowMs then return 0 end ' +
+  'elseif (not ownerToken or ownerToken == "") and not leaseRaw then ' +
+  'local startedAt = tonumber(redis.call("HGET", KEYS[1], "terminalPersistenceStartedAt") ' +
+  'or redis.call("HGET", KEYS[1], "completedAt") or redis.call("HGET", KEYS[1], "createdAt")) ' +
+  'if not startedAt or startedAt ~= startedAt or startedAt < 0 or startedAt > 9007199254740991 ' +
+  'or nowMs - startedAt < tonumber(ARGV[4]) then return 0 end ' +
+  'else return 0 end ' +
+  'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0", "finalEvent", ARGV[2], ' +
+  '"terminalPublicationId", ARGV[3]) ' +
+  'redis.call("HDEL", KEYS[1], "terminalPublicationPublishedId", "terminalPersistenceOwnerToken", ' +
+  '"terminalPersistenceLeaseExpiresAt") return 1';
+
 /** Single-winner promotion from abort-persistence pending to a consumable
  * terminal payload. Owner success/failure and stale-owner recovery share this
  * CAS, so a timeout cannot overwrite a normal FINAL (or vice versa). */
 const TERMINAL_PERSISTENCE_FINALIZE_LUA =
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" then return 0 end ' +
+  'local terminalOwnerToken = redis.call("HGET", KEYS[1], "terminalPersistenceOwnerToken") ' +
+  'local terminalLeaseRaw = redis.call("HGET", KEYS[1], "terminalPersistenceLeaseExpiresAt") ' +
+  'if terminalOwnerToken and terminalOwnerToken ~= "" then ' +
+  'if terminalOwnerToken ~= ARGV[7] or not terminalLeaseRaw then return 0 end ' +
+  'local now = redis.call("TIME") local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
+  'local terminalLeaseUntil = tonumber(terminalLeaseRaw) ' +
+  'if not terminalLeaseUntil or terminalLeaseUntil ~= terminalLeaseUntil ' +
+  'or terminalLeaseUntil > 9007199254740991 or terminalLeaseUntil <= nowMs then return 0 end ' +
+  'elseif ARGV[7] ~= "" or terminalLeaseRaw then return 0 end ' +
   'if ARGV[3] ~= "" then ' +
   'if redis.call("HGET", KEYS[1], "providerOwnerId") ~= ARGV[3] ' +
   'or redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[4] ' +
@@ -939,6 +1001,7 @@ const TERMINAL_PERSISTENCE_FINALIZE_LUA =
   'local leaseUntil = tonumber(redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") or "") ' +
   'if not leaseUntil or leaseUntil <= nowMs then return 0 end end ' +
   'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0", "finalEvent", ARGV[2]) ' +
+  'redis.call("HDEL", KEYS[1], "terminalPersistenceOwnerToken", "terminalPersistenceLeaseExpiresAt") ' +
   'if ARGV[6] ~= "" then redis.call("HSET", KEYS[1], "terminalPublicationId", ARGV[6]) ' +
   'redis.call("HDEL", KEYS[1], "terminalPublicationPublishedId") end ' +
   'return 1';
@@ -3077,6 +3140,7 @@ export class RedisJobStore implements IJobStoreV2 {
     finalEvent: string,
     providerOwner?: ProviderOwnerContext,
     terminalPublicationId?: string,
+    terminalPersistenceOwnerToken?: string,
   ): Promise<boolean> {
     const finalized =
       Number(
@@ -3090,6 +3154,7 @@ export class RedisJobStore implements IJobStoreV2 {
           providerOwner?.providerExecutionId ?? '',
           providerOwner != null ? String(providerOwner.fence) : '',
           terminalPublicationId ?? '',
+          terminalPersistenceOwnerToken ?? '',
         ),
       ) === 1;
     if (finalized) {
@@ -3101,6 +3166,65 @@ export class RedisJobStore implements IJobStoreV2 {
       }
     }
     return finalized;
+  }
+
+  async renewTerminalPersistenceLease(
+    streamId: string,
+    expectedCreatedAt: number,
+    terminalPersistenceOwnerToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (
+      typeof terminalPersistenceOwnerToken !== 'string' ||
+      terminalPersistenceOwnerToken.length === 0 ||
+      terminalPersistenceOwnerToken.length > 128 ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs <= 0
+    ) {
+      throw new Error('Invalid terminal persistence lease renewal');
+    }
+    return (
+      Number(
+        await this.redis.eval(
+          RENEW_TERMINAL_PERSISTENCE_LEASE_LUA,
+          1,
+          KEYS.job(streamId),
+          String(expectedCreatedAt),
+          terminalPersistenceOwnerToken,
+          String(leaseMs),
+        ),
+      ) === 1
+    );
+  }
+
+  async recoverExpiredTerminalPersistence(
+    streamId: string,
+    expectedCreatedAt: number,
+    finalEvent: string,
+    terminalPublicationId: string,
+    legacyTimeoutMs: number,
+  ): Promise<boolean> {
+    if (
+      typeof terminalPublicationId !== 'string' ||
+      terminalPublicationId.length === 0 ||
+      !Number.isSafeInteger(legacyTimeoutMs) ||
+      legacyTimeoutMs <= 0
+    ) {
+      throw new Error('Invalid terminal persistence recovery request');
+    }
+    return (
+      Number(
+        await this.redis.eval(
+          RECOVER_EXPIRED_TERMINAL_PERSISTENCE_LUA,
+          1,
+          KEYS.job(streamId),
+          String(expectedCreatedAt),
+          finalEvent,
+          terminalPublicationId,
+          String(legacyTimeoutMs),
+        ),
+      ) === 1
+    );
   }
 
   async acknowledgePiProviderRecoveryPublication(
@@ -3476,6 +3600,24 @@ export class RedisJobStore implements IJobStoreV2 {
     const { from, to, patch, clear, expectActionId, expectCreatedAt, notAfterMs } = args;
     const key = KEYS.job(streamId);
     const terminal = this.statusSetKey(to) === null;
+    const terminalPersistenceLeaseMs = args.terminalPersistenceLeaseMs;
+    if (
+      (terminalPersistenceLeaseMs != null &&
+        (!Number.isSafeInteger(terminalPersistenceLeaseMs) ||
+          terminalPersistenceLeaseMs <= 0 ||
+          !terminal ||
+          patch?.terminalPersistencePending !== true ||
+          typeof patch.terminalPersistenceOwnerToken !== 'string' ||
+          patch.terminalPersistenceOwnerToken.length === 0 ||
+          patch.terminalPersistenceOwnerToken.length > 128)) ||
+      (terminal &&
+        patch?.terminalPersistencePending === true &&
+        patch.terminalPersistenceOwnerToken != null &&
+        terminalPersistenceLeaseMs == null) ||
+      patch?.terminalPersistenceLeaseExpiresAt != null
+    ) {
+      throw new Error('Invalid terminal persistence lease claim');
+    }
     const terminalJob = terminal ? await this.getJob(streamId) : null;
     let reconcileEpoch: number | undefined;
     if (patch?.preserveForScheduleReconcile === true)
@@ -3614,6 +3756,7 @@ export class RedisJobStore implements IJobStoreV2 {
       expectedProviderOwner != null ? String(expectedProviderOwner.fence) : '',
       providerOwnerMode,
       returnDrainedSteers ? '1' : '0',
+      String(terminalPersistenceLeaseMs ?? 0),
       String(clearFields.length),
       ...clearFields,
       ...fields,
@@ -6183,6 +6326,10 @@ export class RedisJobStore implements IJobStoreV2 {
           : undefined,
       terminalPersistenceStartedAt: data.terminalPersistenceStartedAt
         ? parseInt(data.terminalPersistenceStartedAt, 10)
+        : undefined,
+      terminalPersistenceOwnerToken: data.terminalPersistenceOwnerToken || undefined,
+      terminalPersistenceLeaseExpiresAt: data.terminalPersistenceLeaseExpiresAt
+        ? parseInt(data.terminalPersistenceLeaseExpiresAt, 10)
         : undefined,
       providerOwnerId: data.providerOwnerId || undefined,
       providerOwnerFence: data.providerOwnerFence

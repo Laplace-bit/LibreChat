@@ -19,6 +19,8 @@ export const JOB_STORE_V2_REQUIRED_METHODS = [
   'beginProviderExecution',
   'getCleanupBlockingJobIdsByUser',
   'finalizeTerminalPersistence',
+  'renewTerminalPersistenceLease',
+  'recoverExpiredTerminalPersistence',
   'getTerminalPersistencePendingJobs',
   'acknowledgePiProviderRecoveryPublication',
   'acknowledgeTerminalPublication',

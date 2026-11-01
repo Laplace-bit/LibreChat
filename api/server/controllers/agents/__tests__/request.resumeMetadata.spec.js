@@ -518,6 +518,7 @@ describe('ResumableAgentController resume metadata', () => {
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 1000,
       metadata: {
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
         checkpointNamespace: '1000',
         providerExecutionId: 'provider-segment-1',
         providerDrained: true,
@@ -1085,6 +1086,73 @@ describe('ResumableAgentController resume metadata', () => {
       expect.objectContaining({
         initialMetadata: expect.objectContaining({
           agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        }),
+      }),
+    );
+    expect(initializeClient).toHaveBeenCalledWith(
+      expect.objectContaining({ agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } }),
+    );
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+      conversationId,
+      expect.stringContaining('stop before Pi dispatch'),
+      1000,
+      expect.any(Object),
+    );
+  });
+
+  it('admits scheduled turns into the Pi runtime through the existing durable job lifecycle', async () => {
+    const conversationId = 'scheduled-pi-conversation';
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop before Pi dispatch'));
+    mockGenerationJobManager.claimGeneration.mockResolvedValue(
+      wonGenerationClaim({ streamId: conversationId, conversationId }),
+    );
+    mockGenerationJobManager.createJob.mockResolvedValueOnce({
+      createdAt: 1000,
+      metadata: {
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        checkpointNamespace: '1000',
+        providerExecutionId: 'provider-segment-1',
+        providerDrained: true,
+      },
+      readyPromise: Promise.resolve(),
+      abortController: new AbortController(),
+      emitter: { on: jest.fn() },
+    });
+    const req = {
+      _isScheduledFire: true,
+      user: { id: 'user-123' },
+      body: {
+        text: 'Run the scheduled Pi digest.',
+        messageId: 'scheduled-pi-user-message',
+        clientRequestId: 'sched:schedule-pi:20261101T120000Z',
+        conversationId: 'new',
+        newConversationId: conversationId,
+        scheduleId: 'schedule-pi',
+        scheduledFor: '2026-11-01T12:00:00.000Z',
+        scheduleConfigRevision: 3,
+        agentRuntime: { engine: 'legacy' },
+        endpointOption: {
+          endpoint: 'agents',
+          agent_id: 'agent-pi-scheduled',
+          modelOptions: { model: 'gpt-4.1' },
+        },
+      },
+      config: {},
+    };
+    const res = createResumableResponse();
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
+      conversationId,
+      'user-123',
+      conversationId,
+      expect.objectContaining({
+        initialMetadata: expect.objectContaining({
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+          scheduleId: 'schedule-pi',
+          scheduledFor: '2026-11-01T12:00:00.000Z',
+          scheduleConfigRevision: 3,
         }),
       }),
     );
@@ -4007,6 +4075,66 @@ describe('ResumableAgentController resume metadata', () => {
       }
     }
 
+    it('admits manual compaction onto the Pi GenerationJobManager lifecycle', async () => {
+      const anchorId = 'persisted-conversation-leaf';
+      const responseMessageId = 'pi-compaction-response';
+      mockGenerationJobManager.createJob.mockResolvedValueOnce({
+        createdAt: 1000,
+        metadata: {
+          checkpointNamespace: '1000',
+          providerExecutionId: 'provider-segment-1',
+          providerDrained: true,
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        },
+        readyPromise: Promise.resolve(),
+        abortController: new AbortController(),
+        emitter: { on: jest.fn() },
+      });
+      mockGetMessages.mockImplementation(async ({ messageId }) =>
+        messageId === anchorId ? [{ _id: 'persisted-anchor', messageId: anchorId }] : [],
+      );
+      const client = {
+        options: { agent: { id: 'agent-pi-compaction' } },
+        sendMessage: jest.fn(async (_text, options) => {
+          options.onStart({ messageId: anchorId, conversationId, text: '' }, responseMessageId);
+        }),
+      };
+      const initializeClient = jest.fn().mockResolvedValue({ client });
+      const req = createFailedRequest({
+        compact: true,
+        text: '',
+        messageId: anchorId,
+        parentMessageId: anchorId,
+        endpointOption: {
+          endpoint: 'agents',
+          agent_id: 'agent-pi-compaction',
+          modelOptions: { model: 'gpt-4o' },
+        },
+      });
+
+      const response = createResumableResponse();
+      await AgentController(req, response, jest.fn(), initializeClient, null);
+      await flushBackgroundGeneration();
+
+      expect(initializeClient).toHaveBeenCalled();
+      expect(client.sendMessage).toHaveBeenCalledTimes(1);
+      expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
+        conversationId,
+        'user-123',
+        conversationId,
+        expect.objectContaining({
+          initialMetadata: expect.objectContaining({
+            agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+            compact: true,
+            isRegenerate: true,
+            userMessage: { messageId: anchorId, conversationId, text: '' },
+            responseMessageId: expect.any(String),
+            mcpRequestBody: expect.objectContaining({ parentMessageId: anchorId }),
+          }),
+        }),
+      );
+    });
+
     it.each(['history', 'exact-model'])(
       'does not persist a protected turn rejected by %s policy during terminal recovery',
       async (boundary) => {
@@ -4232,11 +4360,18 @@ describe('ResumableAgentController resume metadata', () => {
     it.each(['a'.repeat(256) + '_', 'a'.repeat(257)])(
       'persists a failed compaction without overwriting a maximum-length anchor',
       async (anchorId) => {
+        mockGenerationJobManager.createJob.mockResolvedValueOnce({
+          createdAt: 1000,
+          metadata: { agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } },
+          readyPromise: Promise.resolve(),
+          abortController: new AbortController(),
+          emitter: { on: jest.fn() },
+        });
         mockGetMessages.mockImplementation(async ({ messageId }) =>
           messageId === anchorId ? [{ _id: 'persisted-anchor' }] : [],
         );
         const client = {
-          options: {},
+          options: { agent: { id: 'agent-pi-failed-compaction' } },
           sendMessage: jest.fn(async (_text, options) => {
             options.onStart(
               { messageId: anchorId, conversationId, text: '' },
@@ -4288,6 +4423,13 @@ describe('ResumableAgentController resume metadata', () => {
     it('keeps repeated failed compactions admissible without rewriting their anchors', async () => {
       let anchorId = 'a'.repeat(257);
       const rows = new Map([[anchorId, { _id: 'original-anchor', messageId: anchorId }]]);
+      mockGenerationJobManager.createJob.mockImplementation(async () => ({
+        createdAt: 1000,
+        metadata: { agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } },
+        readyPromise: Promise.resolve(),
+        abortController: new AbortController(),
+        emitter: { on: jest.fn() },
+      }));
       mockGetMessages.mockImplementation(async ({ messageId }) =>
         rows.has(messageId) ? [rows.get(messageId)] : [],
       );
@@ -4311,7 +4453,7 @@ describe('ResumableAgentController resume metadata', () => {
         validateChatMessageIds(request, res, next);
         expect(next).toHaveBeenCalledTimes(1);
         const client = {
-          options: {},
+          options: { agent: { id: 'agent-pi-failed-compaction' } },
           sendMessage: jest.fn(async (_text, options) => {
             options.onStart(
               { messageId: anchorId, conversationId, text: '' },
@@ -5797,7 +5939,7 @@ describe('ResumableAgentController resume metadata', () => {
     );
   });
 
-  it('routes an enabled authenticated event through the checkpoint-fork executor', async () => {
+  it('rejects an authenticated checkpoint Event Actor before Pi provider dispatch', async () => {
     mockGenerationJobManager.claimGeneration.mockResolvedValue(
       wonGenerationClaim({ streamId: 'child-conversation', conversationId: 'child-conversation' }),
     );
@@ -5806,20 +5948,11 @@ describe('ResumableAgentController resume metadata', () => {
       agent_id: 'parent-agent',
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-1' } },
       sendMessage: jest.fn(async () => {
         throw new Error('stop after event actor invocation started');
       }),
     };
-    mockExecuteAgentEventActor.mockImplementationOnce(async (input) => {
-      await input.invoke({
-        checkpointNamespace: 'event-actor/fork',
-        checkpointId: 'checkpoint-base',
-        invocationId: 'req-event-fork',
-        continuation: 'warm',
-        signal: input.signal,
-      });
-    });
     const event = {
       id: 'game-1:ply-8',
       type: 'chess.\u202Eturn',
@@ -5869,26 +6002,13 @@ describe('ResumableAgentController resume metadata', () => {
         canPause: false,
       }),
     );
-    expect(mockExecuteAgentEventActor).toHaveBeenCalledWith(
-      expect.objectContaining({
-        conversationId: 'child-conversation',
-        invocationId: 'req-event-fork',
-        event,
-        expectedAction: { toolName: 'submit_\u200Fmove', argumentSubset: { expectedPly: 8 } },
-      }),
-      expect.objectContaining({
-        getSnapshot: expect.any(Function),
-        commitState: expect.any(Function),
-        recordReconciliation: expect.any(Function),
-        resolveReconciliation: expect.any(Function),
-        clearReconciliation: expect.any(Function),
-        admitAction: expect.any(Function),
-        releaseAction: expect.any(Function),
-        hasActionAdmission: expect.any(Function),
-        getReceipt: expect.any(Function),
-      }),
+    expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
+      'checkpoint',
     );
-    expect(mockExecuteAgentEventActor.mock.calls[0][0]).not.toHaveProperty('tenantId');
+    expect(req._piEventActorHistoryInvocationEligible).toBeUndefined();
+    expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+    expect(mockBeginAgentEventActorLegacyTurn).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
     expect(req._agentEventTriggerProjection).toEqual({
       version: 1,
       eventType: 'chess. turn',
@@ -5896,34 +6016,21 @@ describe('ResumableAgentController resume metadata', () => {
       occurredAt: new Date(event.occurredAt),
       expectedActionToolName: 'submit_ move',
     });
-    expect(client).toMatchObject({
-      checkpointNamespace: 'event-actor/fork',
-      eventActorCheckpointId: 'checkpoint-base',
-      eventActorInvocationId: 'req-event-fork',
-      eventActorContinuation: 'warm',
-    });
+    expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
+      'child-conversation',
+      expect.stringContaining('The Pi agent runtime is not available on this server.'),
+      expect.any(Number),
+      expect.any(Object),
+    );
   });
 
-  it('prefers the execution-time action receipt over lagging run steps', async () => {
+  it('rejects checkpoint Event Actor turns before collecting Pi action evidence', async () => {
     mockGenerationJobManager.claimGeneration.mockResolvedValue(
       wonGenerationClaim({ streamId: 'child-conversation', conversationId: 'child-conversation' }),
     );
     mockGetConvo.mockResolvedValue({
       conversationId: 'parent-conversation',
       agent_id: 'parent-agent',
-    });
-    mockFindAgentEventAppliedAction.mockReturnValue(undefined);
-    let observedRead;
-    mockExecuteAgentEventActor.mockImplementationOnce(async (input) => {
-      await input.invoke({
-        checkpointNamespace: 'event-actor/fork',
-        checkpointId: 'checkpoint-base',
-        invocationId: 'req-event-receipt',
-        continuation: 'warm',
-        signal: input.signal,
-      });
-      observedRead = input.readAppliedAction();
-      throw new Error('stop after evidence read');
     });
     const req = {
       user: { id: 'user-123', tenantId: '' },
@@ -5954,11 +6061,8 @@ describe('ResumableAgentController resume metadata', () => {
       _agentEventBindingTenantId: undefined,
       _agentEventBindingRetention: { expiredAt: new Date(Date.now() + 60_000) },
     };
-    /** Reproduces the observed race: the tool executed (graph context fires
-     * the observer during sendMessage) but the run-step collection is still
-     * empty when the executor reads evidence right after resolution. */
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-1' } },
       sendMessage: jest.fn(async () => {
         req._agentEventActionObserver({
           input: { expectedPly: 9 },
@@ -5977,22 +6081,22 @@ describe('ResumableAgentController resume metadata', () => {
     );
     await nextTick();
 
-    expect(mockExecuteAgentEventActor).toHaveBeenCalledTimes(1);
-    expect(mockCreateAgentEventActionRecorder).toHaveBeenCalledWith({
-      toolName: 'submit_move',
-      argumentSubset: { expectedPly: 9 },
-    });
-    expect(typeof req._agentEventActionObserver).toBe('function');
-    expect(observedRead).toEqual({ toolName: 'submit_move', toolCallId: 'call-9' });
-    expect(mockFindAgentEventAppliedAction).not.toHaveBeenCalled();
+    expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
+      'checkpoint',
+    );
+    expect(req._piEventActorHistoryInvocationEligible).toBeUndefined();
+    expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+    expect(req._agentEventActionObserver).toBeUndefined();
+    expect(client.sendMessage).not.toHaveBeenCalled();
   });
 
-  it('resumes the original actor suspension from exact detached terminal evidence', async () => {
+  it('rejects detached Event Actor completion before Pi dispatch', async () => {
     mockGenerationJobManager.isRedis = true;
     mockGenerationJobManager.detachedAgentEventActionStoreMode = 'distributed';
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 2000,
       metadata: {
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
         checkpointNamespace: '2000',
         providerExecutionId: 'provider-segment-2',
         providerDrained: true,
@@ -6043,7 +6147,7 @@ describe('ResumableAgentController resume metadata', () => {
       expect(input.readSuspension()).toBe(repaused);
       throw new Error('stop after resume contract');
     });
-    const client = { options: { agent: {} }, sendMessage: jest.fn() };
+    const client = { options: { agent: { id: 'agent-1' } }, sendMessage: jest.fn() };
     const req = {
       user: { id: 'user-123', tenantId: 'tenant-1' },
       body: {
@@ -6090,57 +6194,13 @@ describe('ResumableAgentController resume metadata', () => {
     await nextTick();
 
     expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
-    expect(mockResumeAgentEventActor).toHaveBeenCalledWith(
-      expect.objectContaining({
-        conversationId: 'child-conversation',
-        bindingId: 'binding-1',
-        suspension,
-        resumeAttemptId: 'detached-resume-generation-1',
-        resumeValue: expect.objectContaining({
-          taskId: 'task-detached-1',
-          status: 'succeeded',
-          result: 'move accepted',
-        }),
-      }),
-      expect.objectContaining({
-        claimSuspension: expect.any(Function),
-        settleSuspension: expect.any(Function),
-      }),
-    );
-    expect(mockGetAgentEventActorDetachedAction).toHaveBeenCalledWith(
-      expect.objectContaining({
-        deliveryKey: 'original-delivery-1',
-        generationCreatedAt: 1000,
-      }),
-    );
-    expect(mockCreateAgentEventActorDetachedActionLifecycle).toHaveBeenCalledWith(
-      expect.objectContaining({
-        generationCreatedAt: 1000,
-        turnCreatedAt: 2000,
-      }),
-      expect.any(Object),
-    );
-    const lifecycleDependencies =
-      mockCreateAgentEventActorDetachedActionLifecycle.mock.calls.at(-1)[1];
-    expect(lifecycleDependencies.storeMode()).toBe('distributed');
-    mockGenerationJobManager.detachedAgentEventActionStoreMode = 'process_local';
-    expect(lifecycleDependencies.storeMode()).toBe('process_local');
-    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
-      'child-conversation',
-      'user-123',
-      'child-conversation',
-      expect.objectContaining({
-        initialMetadata: expect.objectContaining({
-          agentEventDeliveryKey: 'detached-resume-generation-1',
-          agentEventInvocationKey: 'original-delivery-1',
-          agentEventInvocationGenerationCreatedAt: 1000,
-          agentEventDetachedActionProducerRequired: true,
-        }),
-      }),
-    );
+    expect(mockResumeAgentEventActor).not.toHaveBeenCalled();
+    expect(mockGetAgentEventActorDetachedAction).not.toHaveBeenCalled();
+    expect(mockCreateAgentEventActorDetachedActionLifecycle).not.toHaveBeenCalled();
+    expect(client.sendMessage).not.toHaveBeenCalled();
   });
 
-  it('records reconciliation when persistence fails after an event action commits', async () => {
+  it('rejects checkpoint Event Actor turns before a Pi action can commit', async () => {
     mockGenerationJobManager.claimGeneration.mockResolvedValue(
       wonGenerationClaim({ streamId: 'child-conversation', conversationId: 'child-conversation' }),
     );
@@ -6148,25 +6208,6 @@ describe('ResumableAgentController resume metadata', () => {
       conversationId: 'parent-conversation',
       agent_id: 'parent-agent',
       tenantId: 'tenant-1',
-    });
-    const checkpoint = {
-      threadId: 'child-conversation',
-      checkpointId: 'checkpoint-applied',
-      checkpointNs: 'event-actor/applied',
-    };
-    mockExecuteAgentEventActor.mockResolvedValueOnce({
-      value: {
-        messageId: 'req-event-persistence:assistant',
-        databasePromise: Promise.resolve().then(() => {
-          throw new Error('response persistence unavailable');
-        }),
-      },
-      execution: {
-        status: 'applied',
-        continuation: 'warm',
-        head: { actorThreadId: 'child-conversation', generation: 2, checkpoint },
-        result: { action: { toolName: 'submit_move', toolCallId: 'call-move' } },
-      },
     });
     const req = {
       user: { id: 'user-123', tenantId: 'tenant-1' },
@@ -6203,36 +6244,19 @@ describe('ResumableAgentController resume metadata', () => {
       req,
       createResumableResponse(),
       jest.fn(),
-      jest.fn().mockResolvedValue({ client: { options: {} } }),
+      jest.fn().mockResolvedValue({ client: { options: { agent: { id: 'agent-1' } } } }),
       null,
     );
-    for (
-      let attempt = 0;
-      attempt < 20 && mockRecordAgentEventActorReconciliation.mock.calls.length === 0;
-      attempt++
-    ) {
-      await nextTick();
-    }
+    await nextTick();
 
-    expect(mockExecuteAgentEventActor).toHaveBeenCalledTimes(1);
-    expect(mockLogger.info).toHaveBeenCalledWith(
-      '[event-actor] Bound child event completed',
-      expect.any(Object),
+    expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
+      'checkpoint',
     );
-    expect(mockRecordAgentEventActorReconciliation).toHaveBeenCalledWith({
-      user: 'user-123',
-      tenantId: 'tenant-1',
-      conversationId: 'child-conversation',
-      reconciliation: expect.objectContaining({
-        invocationId: 'req-event-persistence',
-        status: 'persistence_failed',
-        checkpoint,
-        action: { toolName: 'submit_move', toolCallId: 'call-move' },
-      }),
-    });
+    expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+    expect(mockRecordAgentEventActorReconciliation).not.toHaveBeenCalled();
   });
 
-  it('records the applied actor history barrier only after both deterministic messages persist', async () => {
+  it('rejects a checkpoint Event Actor before persistence or Pi provider dispatch', async () => {
     mockGenerationJobManager.claimGeneration.mockResolvedValue(
       wonGenerationClaim({ streamId: 'child-conversation', conversationId: 'child-conversation' }),
     );
@@ -6241,50 +6265,10 @@ describe('ResumableAgentController resume metadata', () => {
       agent_id: 'parent-agent',
       tenantId: 'tenant-1',
     });
-    const checkpoint = {
-      threadId: 'child-conversation',
-      checkpointId: 'checkpoint-applied',
-      checkpointNs: 'event-actor/applied',
-    };
-    const userMessage = {
-      messageId: 'req-event-success:user',
-      parentMessageId: 'parent-message',
-      conversationId: 'child-conversation',
-      text: 'Play the next move.',
-    };
-    const client = {
-      options: {},
-      skipSaveUserMessage: false,
-      sendMessage: jest.fn(async (_text, options) => {
-        options.onStart(userMessage, 'req-event-success:assistant');
-        return {
-          messageId: 'req-event-success:assistant',
-          text: 'Move submitted.',
-          databasePromise: Promise.resolve({
-            conversation: { conversationId: 'child-conversation' },
-          }),
-        };
-      }),
-    };
-    mockExecuteAgentEventActor.mockImplementationOnce(async (input) => ({
-      value: await input.invoke({
-        checkpointNamespace: checkpoint.checkpointNs,
-        checkpointId: checkpoint.checkpointId,
-        invocationId: 'req-event-success',
-        continuation: 'warm',
-        signal: input.signal,
-      }),
-      execution: {
-        status: 'applied',
-        continuation: 'warm',
-        head: { actorThreadId: 'child-conversation', generation: 2, checkpoint },
-        result: { action: { toolName: 'submit_move', toolCallId: 'call-move' } },
-      },
-    }));
     const req = {
       user: { id: 'user-123', tenantId: 'tenant-1' },
       body: {
-        text: userMessage.text,
+        text: 'Play the next move.',
         clientRequestId: 'req-event-success',
         conversationId: 'child-conversation',
         endpointOption: { endpoint: 'agents', modelOptions: { model: 'gpt-4.1' } },
@@ -6316,44 +6300,24 @@ describe('ResumableAgentController resume metadata', () => {
       req,
       createResumableResponse(),
       jest.fn(),
-      jest.fn().mockResolvedValue({ client }),
+      jest.fn().mockResolvedValue({
+        client: {
+          options: { agent: { id: 'agent-1' } },
+          sendMessage: jest.fn(),
+        },
+      }),
       null,
     );
-    for (
-      let attempt = 0;
-      attempt < 20 && mockRecordAgentEventActorReconciliation.mock.calls.length === 0;
-      attempt++
-    ) {
-      await nextTick();
-    }
+    await nextTick();
 
-    expect(mockSaveMessage).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ messageId: 'req-event-success:user' }),
-      expect.any(Object),
+    expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
+      'checkpoint',
     );
-    expect(mockSaveMessage).toHaveBeenCalledWith(
-      expect.any(Object),
-      expect.objectContaining({ messageId: 'req-event-success:assistant' }),
-      expect.any(Object),
-    );
-    expect(mockRecordAgentEventActorReconciliation).toHaveBeenCalledWith({
-      user: 'user-123',
-      tenantId: 'tenant-1',
-      conversationId: 'child-conversation',
-      reconciliation: {
-        invocationId: 'req-event-success',
-        status: 'history_persisted',
-        checkpoint,
-        action: { toolName: 'submit_move', toolCallId: 'call-move' },
-        actionAdmitted: true,
-        observedAt: expect.any(Date),
-      },
-    });
-    const lastMessageWrite = Math.max(...mockSaveMessage.mock.invocationCallOrder);
-    expect(lastMessageWrite).toBeLessThan(
-      mockRecordAgentEventActorReconciliation.mock.invocationCallOrder[0],
-    );
+    expect(req._piEventActorHistoryInvocationEligible).toBeUndefined();
+    expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+    expect(mockBeginAgentEventActorLegacyTurn).not.toHaveBeenCalled();
+    expect(mockSaveMessage).not.toHaveBeenCalled();
+    expect(mockRecordAgentEventActorReconciliation).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -6371,13 +6335,6 @@ describe('ResumableAgentController resume metadata', () => {
       { toolDefinitions: [{ name: 'ask_user_question' }] },
       {},
       undefined,
-      undefined,
-    ],
-    [
-      'added-agent ask_user_question',
-      { toolDefinitions: [] },
-      {},
-      new Map([['added-agent', { toolDefinitions: [{ name: 'ask_user_question' }] }]]),
       undefined,
     ],
     [
@@ -6405,7 +6362,7 @@ describe('ResumableAgentController resume metadata', () => {
       1,
     ],
   ])(
-    'routes %s event actors through the compatible continuation path',
+    'allows only history-strategy %s event actors onto Pi',
     async (_label, agent, config, agentConfigs, clientOptions, generationProtocolVersion = 2) => {
       mockGenerationJobManager.claimGeneration.mockResolvedValue(
         wonGenerationClaim({
@@ -6417,6 +6374,7 @@ describe('ResumableAgentController resume metadata', () => {
       mockGenerationJobManager.createJob.mockResolvedValueOnce({
         createdAt: 1000,
         metadata: {
+          agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
           checkpointNamespace: '1000',
           providerExecutionId: 'provider-segment-1',
           providerDrained: true,
@@ -6431,27 +6389,19 @@ describe('ResumableAgentController resume metadata', () => {
         agent_id: 'parent-agent',
         tenantId: 'tenant-1',
       });
+      let eventRequest;
+      const observedEligibility = [];
       const client = {
-        options: { agent, ...(clientOptions ?? {}) },
+        options: { agent: { id: 'agent-1', ...agent }, ...(clientOptions ?? {}) },
         agentConfigs,
         sendMessage: jest.fn(async () => {
+          observedEligibility.push(eventRequest?._piEventActorHistoryInvocationEligible === true);
           throw new Error('stop after legacy event invocation started');
         }),
       };
-      const shouldCheckpoint =
-        _label !== 'memory-checkpointer' && _label !== 'pre-capability pause consumer fleet';
-      if (shouldCheckpoint) {
-        mockExecuteAgentEventActor.mockImplementationOnce(async (input) => {
-          await input.invoke({
-            checkpointNamespace: 'event-actor/pause-capable',
-            checkpointId: 'checkpoint-pause-capable',
-            invocationId: 'req-event-hitl',
-            continuation: 'warm',
-            signal: input.signal,
-          });
-        });
-      }
-      const req = {
+      const shouldUseHistory =
+        _label === 'memory-checkpointer' || _label === 'pre-capability pause consumer fleet';
+      eventRequest = {
         user: { id: 'user-123', tenantId: 'tenant-1' },
         body: {
           text: 'Continue with a pause-capable actor.',
@@ -6480,6 +6430,8 @@ describe('ResumableAgentController resume metadata', () => {
         _agentEventBindingTenantId: 'tenant-1',
         _agentEventBindingRetention: { expiredAt: new Date(Date.now() + 60_000) },
       };
+      const req = eventRequest;
+      client.options.req = req;
 
       await AgentController(
         req,
@@ -6490,19 +6442,26 @@ describe('ResumableAgentController resume metadata', () => {
       );
       await nextTick();
 
-      if (shouldCheckpoint) {
-        expect(mockExecuteAgentEventActor).toHaveBeenCalled();
-        expect(mockGetMessages).not.toHaveBeenCalled();
+      expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
+        shouldUseHistory ? 'history' : 'checkpoint',
+      );
+      expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+
+      if (!shouldUseHistory) {
+        expect(req._piEventActorHistoryInvocationEligible).toBeUndefined();
         expect(mockBeginAgentEventActorLegacyTurn).not.toHaveBeenCalled();
-        expect(mockGenerationJobManager.updateMetadata).not.toHaveBeenCalledWith(
+        expect(client.sendMessage).not.toHaveBeenCalled();
+        expect(observedEligibility).toEqual([]);
+        expect(mockGenerationJobManager.completeJob).toHaveBeenCalledWith(
           'child-conversation',
-          expect.objectContaining({ agentEventLegacyTurnToken: expect.any(String) }),
+          expect.stringContaining('The Pi agent runtime is not available on this server.'),
           1000,
+          expect.any(Object),
         );
-        expect(client.sendMessage).toHaveBeenCalledTimes(1);
         return;
       }
-      expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
+
+      expect(req._piEventActorHistoryInvocationEligible).toBe(true);
       expect(mockBeginAgentEventActorLegacyTurn).toHaveBeenCalledWith({
         user: 'user-123',
         tenantId: 'tenant-1',
@@ -6510,6 +6469,7 @@ describe('ResumableAgentController resume metadata', () => {
         token: expect.any(String),
       });
       expect(client.sendMessage).toHaveBeenCalledTimes(1);
+      expect(observedEligibility).toEqual([true]);
       /** The fence must open before execution and close only after this
        * turn's history is durable, under the same token. */
       const fenceToken = mockBeginAgentEventActorLegacyTurn.mock.calls[0][0].token;
@@ -6533,6 +6493,12 @@ describe('ResumableAgentController resume metadata', () => {
       expect(mockCompleteAgentEventActorLegacyTurn.mock.invocationCallOrder[0]).toBeGreaterThan(
         client.sendMessage.mock.invocationCallOrder[0],
       );
+      const durableErrorWrites = mockSaveMessage.mock.invocationCallOrder;
+      if (durableErrorWrites.length > 0) {
+        expect(Math.max(...durableErrorWrites)).toBeLessThan(
+          mockCompleteAgentEventActorLegacyTurn.mock.invocationCallOrder[0],
+        );
+      }
     },
   );
 
@@ -6855,8 +6821,20 @@ describe('ResumableAgentController resume metadata', () => {
         clientRequestId: 'req-event-legacy',
         conversationId: 'child-conversation',
         endpointOption: { endpoint: 'agents', modelOptions: { model: 'gpt-4.1' } },
+        agentEventDelivery: {
+          deliveryKey: 'req-event-legacy',
+          event: {
+            id: 'event-legacy',
+            type: 'test.event',
+            occurredAt: Date.now(),
+            source: { id: 'test', type: 'api' },
+            payload: {},
+          },
+        },
       },
       config: {},
+      _isAgentTrigger: true,
+      _agentEventBindingId: 'binding-legacy',
       _agentEventBindingParentConversationId: 'parent-conversation',
       _agentEventBindingParentAgentId: 'parent-agent',
       _agentEventBindingTenantId: undefined,
@@ -6893,8 +6871,20 @@ describe('ResumableAgentController resume metadata', () => {
         clientRequestId: 'req-event-expired',
         conversationId: 'child-conversation',
         endpointOption: { endpoint: 'agents', modelOptions: { model: 'gpt-4.1' } },
+        agentEventDelivery: {
+          deliveryKey: 'req-event-expired',
+          event: {
+            id: 'event-expired',
+            type: 'test.event',
+            occurredAt: Date.now(),
+            source: { id: 'test', type: 'api' },
+            payload: {},
+          },
+        },
       },
       config: {},
+      _isAgentTrigger: true,
+      _agentEventBindingId: 'binding-expired',
       _agentEventBindingParentConversationId: 'parent-conversation',
       _agentEventBindingParentAgentId: 'parent-agent',
       _agentEventBindingTenantId: 'tenant-1',

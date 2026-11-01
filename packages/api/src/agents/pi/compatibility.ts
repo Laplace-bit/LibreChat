@@ -1,11 +1,10 @@
+import { PI_SUBAGENT_TOOL_NAME, PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
-import { PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 import { isPiActionToolName } from './actionSchema';
 import { isPiMcpToolName } from './mcpSchema';
 
 export type PiUnsupportedTurnMode =
   | 'event_actor'
-  | 'scheduled'
   | 'background'
   | 'compaction'
   | 'regenerate'
@@ -18,6 +17,8 @@ export interface PiCompatibilityInput {
   callableToolNames: readonly string[];
   supportedToolNames: readonly string[];
   unsupportedModes: readonly PiUnsupportedTurnMode[];
+  /** The host may generate the subagent capability only after building a server-authorized plan. */
+  allowPiSubagent?: boolean;
 }
 
 /** Pi Code API support is limited to an explicitly configured managed endpoint. */
@@ -70,7 +71,9 @@ export function assertPiCompatible(input: PiCompatibilityInput): void {
   const supportedNames = new Set(
     input.supportedToolNames.filter(
       (name) =>
-        PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name) ||
+        (name === PI_SUBAGENT_TOOL_NAME
+          ? input.allowPiSubagent === true
+          : PI_SUPPORTED_HOST_TOOLS.some((supportedName) => supportedName === name)) ||
         isPiMcpToolName(name) ||
         isPiActionToolName(name),
     ),

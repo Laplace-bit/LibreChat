@@ -10,6 +10,7 @@ const {
 const {
   isEnabled,
   checkAccess,
+  buildToolSet,
   buildRunToolSet,
   sanitizeTitle,
   payloadParser,
@@ -36,6 +37,10 @@ const {
   resolveAgentTokenConfig,
   buildPersistedContextUsage,
   buildPiSystemPrompt,
+  resolvePiManualCompactionSettings,
+  buildPiManualCompactionInstruction,
+  getNextPiSummaryVersion,
+  getPiSummaryCarrierTokenCount,
   computeEffectiveMaxContextTokens,
   resolveRetainedToolTokens,
   computeSummaryUsedTokens,
@@ -60,6 +65,7 @@ const {
   hasDurableAgentInterruptCheckpoint,
   isHITLEnabled,
   resolveToolApprovalPolicy,
+  canAgentGraphPause,
   buildToolApprovalHooks,
   collectAttachedCodeEnvironmentAgentIds,
   collectAttachedCodeApprovalPolicies,
@@ -141,6 +147,8 @@ const {
   assertAgentAttachmentLimits,
   assertAgentAttachmentTopology,
   collectHistoricalAttachmentIds,
+  collectModelBoundHistoricalFileIdState,
+  resolveCheckpointMessage,
   admitSteerAttachmentHistory,
   rollbackSteerAttachmentHistory,
   isModelBoundAttachmentFile,
@@ -160,6 +168,8 @@ const {
   resolveYouTubeInjectionConfig,
   decrementPendingRequest,
   assertModelBoundContent,
+  ContentTraversalLimitError,
+  isContentTraversalProtected,
   reportLocatorTraversalFailure,
   filterFilesByEndpointRuntimeConfig,
   createModelBoundChatModelCallback: createModelBoundContentCallback,
@@ -228,6 +238,13 @@ const {
   revalidatePiMcpApprovalArguments,
   revalidatePiActionApprovalArguments,
   executePiGeneration,
+  createPiSubagentPlan,
+  createPiSubagentToolDefinition,
+  resolvePiSubagentTarget,
+  resolvePiSubagentAgent,
+  PiSubagentCompatibilityError,
+  createSubagentUsageSink,
+  PI_SUBAGENT_TOOL_NAME,
 } = require('@librechat/api');
 const {
   Run,
@@ -242,6 +259,7 @@ const {
   SteerEvents,
   ActivityLabelEvents,
   UsageEvents,
+  StepEvents,
   Permissions,
   VisionModes,
   ErrorTypes,
@@ -274,12 +292,158 @@ const agentRuntimeDispatcher = createAgentRuntimeDispatcher({
   executePiGeneration,
 });
 
+const PI_SUBAGENT_NESTED_TOOLS = new Set([
+  Constants.SUBAGENT,
+  'conditional_transfer',
+  ASK_USER_QUESTION_TOOL_NAME,
+  Constants.CHECK_BACKGROUND_TASK,
+  'run_in_background',
+]);
+
+function buildPiSubagentApprovalAgent(agent) {
+  const tools = Array.isArray(agent?.tools)
+    ? agent.tools.filter((tool) => !PI_SUBAGENT_NESTED_TOOLS.has(tool?.name ?? tool))
+    : agent?.tools;
+  const toolDefinitions = Array.isArray(agent?.toolDefinitions)
+    ? agent.toolDefinitions.filter((tool) => !PI_SUBAGENT_NESTED_TOOLS.has(tool?.name))
+    : agent?.toolDefinitions;
+  const toolRegistry =
+    agent?.toolRegistry instanceof Map
+      ? new Map([...agent.toolRegistry].filter(([name]) => !PI_SUBAGENT_NESTED_TOOLS.has(name)))
+      : agent?.toolRegistry;
+  return {
+    ...agent,
+    tools,
+    toolDefinitions,
+    toolRegistry,
+    edges: [],
+    subagents: { enabled: false, allowSelf: false, agent_ids: [] },
+    subagentAgentConfigs: [],
+    lazySubagentConfigs: [],
+    subagentGraphConfigs: [],
+  };
+}
+
 const loadAgent = (params) =>
   loadAgentFn(params, {
     getAgent: db.getAgentWithVersionCount,
     getMCPServerTools,
     getAccessibleMCPServers,
   });
+
+const MAX_PI_RESUME_HISTORY_BOUNDARY_ROWS = 10000;
+
+/** Capture only lineage and file IDs before BaseClient rehydrates/mutates rows. */
+function capturePiResumeHistoryBoundary(rows, shouldSummarize) {
+  const rowsById = new Map();
+  let overflowed = false;
+  if (!Array.isArray(rows)) {
+    return { rowsById, overflowed: true };
+  }
+
+  const rowCount = Math.min(rows.length, MAX_PI_RESUME_HISTORY_BOUNDARY_ROWS);
+  overflowed = rows.length > rowCount;
+  for (let index = 0; index < rowCount; index++) {
+    const row = rows[index];
+    if (row == null || typeof row !== 'object') {
+      continue;
+    }
+
+    let checkpoint = false;
+    try {
+      checkpoint = shouldSummarize && resolveCheckpointMessage(row) != null;
+    } catch {
+      overflowed = true;
+    }
+    const fileState = collectModelBoundHistoricalFileIdState([{ files: row.files }]);
+    const boundaryRow = {
+      parentMessageId: row.parentMessageId,
+      checkpoint,
+      fileIds: fileState.fileIds,
+      fileIdsOverflowed: fileState.overflowed,
+    };
+    const messageId = row.messageId;
+    const id = row.id;
+    if (typeof messageId === 'string' && messageId.length > 0 && !rowsById.has(messageId)) {
+      rowsById.set(messageId, boundaryRow);
+    }
+    if (typeof id === 'string' && id.length > 0 && !rowsById.has(id)) {
+      rowsById.set(id, boundaryRow);
+    }
+  }
+  return { rowsById, overflowed };
+}
+
+/** The same parent walk as BaseClient, with missing/cyclic tails treated as incomplete. */
+function hasCompletePiResumeHistoryBranch(boundary, parentMessageId, shouldSummarize) {
+  if (boundary?.overflowed || !(boundary?.rowsById instanceof Map)) {
+    return false;
+  }
+  let currentMessageId = parentMessageId;
+  const visitedMessageIds = new Set();
+  for (let index = 0; index < MAX_PI_RESUME_HISTORY_BOUNDARY_ROWS; index++) {
+    if (currentMessageId == null || currentMessageId === Constants.NO_PARENT) {
+      return true;
+    }
+    if (typeof currentMessageId !== 'string' || currentMessageId.length === 0) {
+      return false;
+    }
+    if (visitedMessageIds.has(currentMessageId)) {
+      return false;
+    }
+    const row = boundary.rowsById.get(currentMessageId);
+    if (row == null) {
+      return false;
+    }
+    visitedMessageIds.add(currentMessageId);
+    if (shouldSummarize && row.checkpoint) {
+      return true;
+    }
+    if (row.parentMessageId == null || row.parentMessageId === Constants.NO_PARENT) {
+      return true;
+    }
+    currentMessageId = row.parentMessageId;
+  }
+  return false;
+}
+
+function mergePiResumeHistoricalFileIds(fileIdsBySourceMessageId, storedMessages, boundary) {
+  const merged = new Map(fileIdsBySourceMessageId ?? []);
+  let overflowed = false;
+  for (const message of storedMessages ?? []) {
+    if (message == null) {
+      continue;
+    }
+    for (const messageId of [message.messageId, message.id]) {
+      if (typeof messageId !== 'string' || messageId.length === 0) {
+        continue;
+      }
+      const boundaryRow = boundary?.rowsById?.get(messageId);
+      if (boundaryRow == null) {
+        continue;
+      }
+      overflowed ||= boundaryRow.fileIdsOverflowed === true;
+      if (boundaryRow.fileIds.length === 0) {
+        continue;
+      }
+      const fileIds = new Set(merged.get(messageId) ?? []);
+      for (const fileId of boundaryRow.fileIds) {
+        fileIds.add(fileId);
+      }
+      merged.set(messageId, [...fileIds]);
+    }
+  }
+  return { fileIdsBySourceMessageId: merged, overflowed };
+}
+
+function createScheduledHitlSharedStoreError() {
+  return Object.assign(
+    new Error(
+      'This scheduled run can pause for approval, but shared run state is unavailable. Ask an administrator to enable shared run state, then retry the run.',
+    ),
+    { code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE' },
+  );
+}
 
 function getPiToolSchemaBinding(input) {
   if (input.kind === 'action' || isPiActionToolName(input.name)) {
@@ -2193,16 +2357,43 @@ class AgentClient extends BaseClient {
   /** Run the same source-aware provider-content projection for runtimes that
    * do not enter LangChain's model callback boundary (currently Pi). */
   assertBuiltModelBoundContent(messages) {
+    if (this.piResumeHistoryComplete === false) {
+      const incompleteHistoryError = new ContentTraversalLimitError(
+        [],
+        [{ source: 'message', fields: ['content_part', 'text'] }],
+      );
+      if (
+        isContentTraversalProtected({
+          error: incompleteHistoryError,
+          filters: this.options.req?.config?.filters,
+          legacyPii: this.options.req?.config?.messageFilter?.pii,
+        })
+      ) {
+        throw incompleteHistoryError;
+      }
+      /** Even without an active content policy, an incomplete resume transcript
+       *  cannot be passed to Pi as if it were the complete persisted branch. */
+      throw new AgentRuntimeUnavailableError();
+    }
+
     const fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this);
+    const resumeFileProjection =
+      this.piResumeHistoryBoundary != null && this.options.resendFiles !== false
+        ? mergePiResumeHistoricalFileIds(
+            fileProjection.fileIdsBySourceMessageId,
+            this.modelBoundStoredMessages,
+            this.piResumeHistoryBoundary,
+          )
+        : { fileIdsBySourceMessageId: fileProjection.fileIdsBySourceMessageId, overflowed: false };
     const callback = createModelBoundContentCallback({
       onTraversalFailure: reportLocatorTraversalFailure,
       filters: this.options.req?.config?.filters,
       legacyPii: this.options.req?.config?.messageFilter?.pii,
       storedMessages: this.modelBoundStoredMessages,
       privateTextTokens: getPrivateTextInspectionTokens(this.modelBoundStoredMessages ?? []),
-      fileIdsBySourceMessageId: fileProjection.fileIdsBySourceMessageId,
+      fileIdsBySourceMessageId: resumeFileProjection.fileIdsBySourceMessageId,
       resolvedFiles: fileProjection.resolvedFiles,
-      sourceFileProjectionOverflowed: fileProjection.overflowed,
+      sourceFileProjectionOverflowed: fileProjection.overflowed || resumeFileProjection.overflowed,
     });
     callback.handleChatModelStart(
       undefined,
@@ -2487,6 +2678,9 @@ class AgentClient extends BaseClient {
    *  answers are built: the walk it returns stops at a checkpoint summary. */
   onHistoryLoaded(rows) {
     this.loadedHistoryRows = rows;
+    if (this.capturePiResumeHistoryBoundary === true) {
+      this.piResumeHistoryBoundary = capturePiResumeHistoryBoundary(rows, this.shouldSummarize);
+    }
   }
 
   async loadHistory(conversationId, parentMessageId = null) {
@@ -4058,9 +4252,13 @@ class AgentClient extends BaseClient {
       options.endpointTokenConfigByAgentId instanceof Map
         ? new Map(options.endpointTokenConfigByAgentId)
         : options.endpointTokenConfigByAgentId;
-    let subagentUsageSeq = this.subagentUsageSeq;
+    /** Every foreground child emitter shares one run-local counter. Capture the mutable counter
+     *  object rather than `this`, so detached callbacks remain safe after client disposal. */
+    const usageSequenceState =
+      this.subagentUsageSequenceState ??
+      (this.subagentUsageSequenceState = { next: this.subagentUsageSeq });
     return (usage) => {
-      subagentUsageSeq += 1;
+      usageSequenceState.next += 1;
       const cache_creation =
         usage.input_token_details?.cache_creation ?? usage.cache_creation_input_tokens;
       const cache_read = usage.input_token_details?.cache_read ?? usage.cache_read_input_tokens;
@@ -4075,7 +4273,7 @@ class AgentClient extends BaseClient {
         usage_type: 'subagent',
         runId: jobCreatedAt != null ? `${responseMessageId}:${jobCreatedAt}` : responseMessageId,
         /** Unique per child call for reconnect/resume dedupe. */
-        seq: subagentUsageSeq,
+        seq: usageSequenceState.next,
         /** Price with the SUBAGENT's own endpoint token config (its endpoint may
          *  differ from the parent's); `usage.agentId` is tagged by the sink. */
         cost: includeCost
@@ -4126,6 +4324,436 @@ class AgentClient extends BaseClient {
       pendingSubagentEmits.push(emit);
       return emit;
     };
+  }
+
+  /** Run one authorized foreground child inside the parent GenerationJob. */
+  async executePiSubagentTool({
+    call,
+    plan,
+    signal,
+    appConfig,
+    request,
+    handlers,
+    parentMetadata,
+    effectiveToolApprovalPolicy,
+    runToolApprovalAllows,
+    resolvedToolApprovalHooks,
+    tokenCounter,
+  }) {
+    const errorResult = (
+      message = 'This subagent request is not supported by the Pi runtime.',
+    ) => ({
+      toolCallId: call.id,
+      status: 'error',
+      content: message,
+    });
+    if (call?.name !== PI_SUBAGENT_TOOL_NAME || plan == null) {
+      return errorResult();
+    }
+
+    let resolved;
+    try {
+      resolved = resolvePiSubagentTarget({
+        plan,
+        args: call.args,
+        depth: 0,
+        ancestry: [plan.parentAgentId],
+      });
+    } catch {
+      return errorResult('The requested subagent is not available.');
+    }
+    const { target, args } = resolved;
+    const childRunId = `${this.responseMessageId}:subagent:${nanoid()}`;
+    const throwIfRunNotOwned = async (currentSignal) => {
+      if (currentSignal?.aborted) {
+        const error = new Error('Pi subagent execution was cancelled.');
+        error.name = 'AbortError';
+        throw error;
+      }
+      const ownsRun = await GenerationJobManager.assertPiProviderOwner(
+        this.conversationId,
+        this.jobCreatedAt,
+        currentSignal,
+      );
+      if (!ownsRun) {
+        const error = new Error('This run no longer owns permission to continue the subagent.');
+        error.code = 'PROVIDER_OWNER_FENCED';
+        throw error;
+      }
+    };
+
+    const childMetadata = {
+      ...parentMetadata,
+      run_id: childRunId,
+      agent_id: target.type,
+      agentId: target.type,
+      last_agent_id: target.type,
+      langgraph_node: `agent=${target.type}`,
+      hide_sequential_outputs: false,
+    };
+    const subagentUpdateHandler = handlers?.[GraphEvents.ON_SUBAGENT_UPDATE];
+    const emitSubagentUpdate = async (phase, data) => {
+      if (typeof subagentUpdateHandler?.handle !== 'function') {
+        return;
+      }
+      await throwIfRunNotOwned(signal);
+      await subagentUpdateHandler.handle(
+        GraphEvents.ON_SUBAGENT_UPDATE,
+        {
+          runId: this.responseMessageId,
+          parentRunId: this.responseMessageId,
+          subagentRunId: childRunId,
+          parentToolCallId: call.id,
+          subagentType: target.type,
+          subagentKind: 'agent',
+          subagentAgentId: target.type,
+          memberAgentId: target.type,
+          parentAgentId: plan.parentAgentId,
+          depth: 1,
+          phase,
+          ...(data === undefined ? {} : { data }),
+          timestamp: new Date().toISOString(),
+        },
+        childMetadata,
+      );
+    };
+    let child;
+
+    try {
+      await throwIfRunNotOwned(signal);
+      if (target.descriptor != null) {
+        const userId = typeof request?.user?.id === 'string' ? request.user.id : undefined;
+        const tenantId = resolveRequestTenantId(request ?? {});
+        const requestBody = {
+          ...(typeof this.conversationId === 'string'
+            ? { conversationId: this.conversationId }
+            : {}),
+          ...(typeof this.responseMessageId === 'string'
+            ? { messageId: this.responseMessageId }
+            : {}),
+          ...(typeof this.parentMessageId === 'string'
+            ? { parentMessageId: this.parentMessageId }
+            : {}),
+        };
+        const user = {
+          ...(userId == null ? {} : { id: userId }),
+          ...(typeof request?.user?.role === 'string' ? { role: request.user.role } : {}),
+          ...(typeof tenantId === 'string' ? { tenantId } : {}),
+        };
+        const resolverContext = {
+          descriptor: {
+            type: target.type,
+            name: target.agent.name ?? target.type,
+            description: target.agent.description ?? '',
+            configId: target.descriptor.configId,
+          },
+          executionId: childRunId,
+          parentRunId: this.responseMessageId,
+          parentAgentId: plan.parentAgentId,
+          parentToolCallId: call.id,
+          threadId: this.conversationId,
+          signal,
+          configurable: {
+            ...(Object.keys(requestBody).length === 0 ? {} : { requestBody }),
+            ...(Object.keys(user).length === 0 ? {} : { user }),
+            ...(userId == null ? {} : { user_id: userId }),
+          },
+        };
+        child = await resolvePiSubagentAgent({ target, context: resolverContext });
+        await throwIfRunNotOwned(signal);
+      } else {
+        child = target.agent;
+      }
+      if (
+        child?.id == null ||
+        agentRequestsAskUserQuestion(child) ||
+        child?.toolDefinitions?.some(
+          (definition) =>
+            definition?.name === ASK_USER_QUESTION_TOOL_NAME ||
+            definition?.name === Constants.CHECK_BACKGROUND_TASK ||
+            definition?.name === 'run_in_background',
+        ) ||
+        (child?.backgroundToolNames?.length ?? 0) > 0
+      ) {
+        return errorResult(
+          'This child agent requires an approval, question, or background mode that cannot be resumed safely here.',
+        );
+      }
+
+      const childToolSet = buildRunToolSet(child, undefined, undefined, [
+        new HumanMessage(args.description),
+      ]);
+      const childCallableToolNames = [...childToolSet].filter(
+        (name) =>
+          name !== Constants.SUBAGENT &&
+          name !== 'conditional_transfer' &&
+          name !== ASK_USER_QUESTION_TOOL_NAME &&
+          name !== Constants.CHECK_BACKGROUND_TASK &&
+          name !== 'run_in_background',
+      );
+      const childToolDefinitions = (
+        Array.isArray(child.toolDefinitions) ? child.toolDefinitions : []
+      ).filter(
+        (definition) =>
+          (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
+            isPiMcpToolName(definition?.name) ||
+            isPiActionToolName(definition?.name)) &&
+          definition.name !== PI_SUBAGENT_TOOL_NAME &&
+          childCallableToolNames.includes(definition.name),
+      );
+      let childMcpToolSchemas;
+      let childActionToolSchemas;
+      try {
+        childMcpToolSchemas = compilePiMcpToolSchemaRegistry(childToolDefinitions);
+        childActionToolSchemas = compilePiActionToolSchemaRegistry(childToolDefinitions);
+      } catch {
+        return errorResult(
+          'This child agent has a tool schema that the Pi runtime cannot execute.',
+        );
+      }
+      const childHasCodeTools = childToolDefinitions.some((definition) =>
+        isPiCodeExecutionToolName(definition.name),
+      );
+      const unsupportedModes = [];
+      if (childHasCodeTools && !isPiManagedCodeExecutionCompatible(child)) {
+        unsupportedModes.push('code_api_environment');
+      }
+      try {
+        assertPiCompatible({
+          rootAgentId: child.id,
+          loadedAgentIds: [child.id],
+          callableToolNames: childCallableToolNames,
+          supportedToolNames: childToolDefinitions.map((definition) => definition.name),
+          unsupportedModes,
+        });
+      } catch {
+        return errorResult(
+          'This child agent has a tool configuration that the Pi runtime cannot execute.',
+        );
+      }
+      if (
+        childToolDefinitions.length > 0 &&
+        typeof handlers?.[GraphEvents.ON_TOOL_EXECUTE]?.handle !== 'function'
+      ) {
+        return errorResult('Authorized child tool execution is unavailable.');
+      }
+
+      const createModelBinding = getAgentPiModelBindingFactory(child);
+      if (createModelBinding == null) {
+        return errorResult('The child agent does not have an available model configuration.');
+      }
+      const piCodeSessionBridge = childHasCodeTools ? createPiCodeSessionBridge() : undefined;
+      let nextStepIndex = 0;
+      const createStepIdentity = () => {
+        const index = nextStepIndex++;
+        return {
+          id: `pi-${childRunId}-${nanoid()}`,
+          index,
+          messageId: childRunId,
+          runId: childRunId,
+          agentId: child.id,
+        };
+      };
+      const collectedText = [];
+      const emitSubagentUsage = createSubagentUsageSink(
+        this.collectedUsage,
+        this.buildSubagentUsageEmitter(appConfig),
+      );
+      const handleChildHostEvent = async (event) => {
+        if (event.event === UsageEvents.ON_TOKEN_USAGE) {
+          emitSubagentUsage({
+            usage: event.data,
+            memberAgentId: child.id,
+            subagentAgentId: child.id,
+            provider: child.provider,
+            model: child.model_parameters?.model ?? child.model ?? event.data?.model,
+          });
+          return;
+        }
+        if (event.event === UsageEvents.ON_CONTEXT_USAGE) {
+          return;
+        }
+        let phase;
+        switch (event.event) {
+          case GraphEvents.ON_RUN_STEP:
+            phase = 'run_step';
+            break;
+          case GraphEvents.ON_RUN_STEP_DELTA:
+            phase = 'run_step_delta';
+            break;
+          case GraphEvents.ON_RUN_STEP_COMPLETED:
+            phase = 'run_step_completed';
+            break;
+          case GraphEvents.ON_RUN_STEP_CLOSED:
+            phase = 'run_step_closed';
+            break;
+          case GraphEvents.ON_MESSAGE_DELTA:
+            phase = 'message_delta';
+            for (const part of event.data?.delta?.content ?? []) {
+              if (part?.type === ContentTypes.TEXT && typeof part.text === 'string') {
+                collectedText.push(part.text);
+              }
+            }
+            break;
+          case GraphEvents.ON_REASONING_DELTA:
+            phase = 'reasoning_delta';
+            break;
+          case StepEvents.ON_TOOL_CALLS_DISPATCHED:
+            phase = 'tool_calls_dispatched';
+            break;
+          default:
+            throw new AgentRuntimeUnavailableError();
+        }
+        await emitSubagentUpdate(phase, event.data);
+      };
+      const childToolHandler = handlers?.[GraphEvents.ON_TOOL_EXECUTE];
+      const executeChildToolBatch =
+        typeof childToolHandler?.handle === 'function'
+          ? createPiHostToolBatchExecutor({
+              handler: childToolHandler,
+              userId: this.user ?? request?.user?.id,
+              agentId: child.id,
+              request,
+              threadId: this.conversationId,
+              runId: childRunId,
+              metadata: childMetadata,
+              authorizedToolNames: childToolDefinitions.map((definition) => definition.name),
+              authorize: async (currentSignal) => {
+                await throwIfRunNotOwned(currentSignal);
+                return true;
+              },
+              ...(piCodeSessionBridge == null ? {} : { codeSessionBridge: piCodeSessionBridge }),
+            })
+          : undefined;
+      const executeChildHostToolCall =
+        executeChildToolBatch == null
+          ? undefined
+          : async (childCall, childSignal) => {
+              await throwIfRunNotOwned(childSignal);
+              const admitted = await GenerationJobManager.admitPiToolInvocation(
+                this.conversationId,
+                this.jobCreatedAt,
+                childCall.id,
+              );
+              if (!admitted) {
+                const error = new Error(
+                  'This run no longer owns permission to execute child tools.',
+                );
+                error.code = 'PROVIDER_OWNER_FENCED';
+                throw error;
+              }
+              return executeChildToolBatch(childCall, childSignal);
+            };
+      const childApprovalMayPause = canAgentGraphPause({
+        policy: effectiveToolApprovalPolicy,
+        agents: [buildPiSubagentApprovalAgent(child)],
+        resolvedProgrammaticHooks: resolvedToolApprovalHooks ?? [],
+        pluginHookSource: getPluginHookSource(),
+        askUserQuestionAdminDisabled: isAskUserQuestionAdminDisabled(appConfig),
+        toolApprovalAllows: runToolApprovalAllows,
+      });
+      if (childApprovalMayPause) {
+        return errorResult(
+          'This child agent may require an approval that cannot be resumed safely here.',
+        );
+      }
+      const childToolExecutionGate = createPiToolApprovalGate({
+        policy: effectiveToolApprovalPolicy,
+        allowedTools: runToolApprovalAllows,
+        logger,
+        pluginHookSource: getPluginHookSource(),
+        resolvedHooks: resolvedToolApprovalHooks,
+        hookContext: {
+          userId: request?.user?.id,
+          conversationId: this.conversationId,
+          tenantId: resolveRequestTenantId(request ?? {}),
+          appConfig,
+        },
+        runId: childRunId,
+        threadId: this.conversationId,
+        agentId: child.id,
+        mcpToolSchemas: childMcpToolSchemas,
+        actionToolSchemas: childActionToolSchemas,
+        model: child.model_parameters?.model ?? child.model ?? undefined,
+      });
+      const childSystemPrompt = buildPiSystemPrompt({ agent: child });
+      await emitSubagentUpdate('start');
+      const outcome = await agentRuntimeDispatcher.executeTurn({
+        engine: 'pi',
+        selection: this.runtimeProgress.selection,
+        input: {
+          messages: [
+            ...(childSystemPrompt.length > 0 ? [new SystemMessage(childSystemPrompt)] : []),
+            new HumanMessage(args.description),
+          ],
+          createModelBinding,
+          toolDefinitions: childToolDefinitions,
+          mcpToolSchemas: childMcpToolSchemas,
+          actionToolSchemas: childActionToolSchemas,
+          executeHostToolCall: executeChildHostToolCall,
+          ...(piCodeSessionBridge == null
+            ? {}
+            : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
+          toolExecutionGate: childToolExecutionGate,
+          askUserQuestionEnabled: false,
+          createToolStepIdentity: createStepIdentity,
+          createToolCallId: () => `pi-tool-${childRunId}-${nanoid()}`,
+          signal,
+          onSessionCreated: () => undefined,
+          usageAttribution: {
+            provider: child.provider,
+            agentId: child.id,
+            runId: childRunId,
+          },
+          contextUsage: {
+            tokenCounter,
+            runId: childRunId,
+            agentId: child.id,
+            maxContextTokens: child.baseContextTokens ?? this.maxContextTokens,
+            reserveRatio: child.summarization?.reserveRatio,
+          },
+          createStepIdentity,
+          handleHostEvent: handleChildHostEvent,
+        },
+      });
+      if (outcome.status === 'cancelled' || signal?.aborted) {
+        const error = new Error('Pi subagent execution was cancelled.');
+        error.name = 'AbortError';
+        throw error;
+      }
+      if (outcome.status === 'paused') {
+        await emitSubagentUpdate('error');
+        return errorResult(
+          'A child tool requested an approval that cannot be resumed safely here.',
+        );
+      }
+      if (outcome.status === 'unsupported') {
+        await emitSubagentUpdate('error');
+        return errorResult('The child Pi run returned an unsupported execution mode.');
+      }
+      await throwIfRunNotOwned(signal);
+      const content = collectedText.join('').trim();
+      await emitSubagentUpdate('stop');
+      return {
+        toolCallId: call.id,
+        status: 'success',
+        content: content || 'The child agent completed without a text response.',
+      };
+    } catch (error) {
+      if (signal?.aborted || error?.name === 'AbortError') {
+        throw error;
+      }
+      if (error?.code === 'PROVIDER_OWNER_FENCED') {
+        throw error;
+      }
+      try {
+        await emitSubagentUpdate('error');
+      } catch {
+        // Preserve the execution error; a lost owner must not publish a late update.
+      }
+      logger.warn('[AgentClient] Pi foreground subagent failed', getSafeErrorMetadata(error));
+      return errorResult();
+    }
   }
 
   /**
@@ -4495,11 +5123,7 @@ class AgentClient extends BaseClient {
     const checkpointerCfg = appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
     if (this.options.req?._isScheduledFire === true) {
       if (!GenerationJobManager.isRedis) {
-        const error = new Error(
-          'The agent paused, but its shared action state is unavailable. Please retry the run.',
-        );
-        error.code = 'SCHEDULED_HITL_REQUIRES_SHARED_STORE';
-        throw error;
+        throw createScheduledHitlSharedStoreError();
       }
       let hasDurableInterrupt = false;
       try {
@@ -4697,11 +5321,13 @@ class AgentClient extends BaseClient {
       !streamId ||
       (signal?.kind !== 'tool_approval' && !isAskUserQuestion) ||
       this.eventActorInvocationId != null ||
-      this.options.req?._isScheduledFire === true ||
       !this.responseMessageId ||
       !this.options.agent?.id
     ) {
       throw new AgentRuntimeUnavailableError();
+    }
+    if (this.options.req?._isScheduledFire === true && !GenerationJobManager.isRedis) {
+      throw createScheduledHitlSharedStoreError();
     }
 
     const toolCall = signal.toolCall;
@@ -5159,29 +5785,38 @@ class AgentClient extends BaseClient {
         let piActionToolSchemas;
         let piCodeSessionBridge;
         let askUserQuestionEnabled = false;
+        let piSubagentPlan;
+        try {
+          piSubagentPlan = isCompactionTurn ? undefined : createPiSubagentPlan(this.options.agent);
+        } catch (error) {
+          if (error instanceof PiSubagentCompatibilityError) {
+            throw new AgentRuntimeUnavailableError();
+          }
+          throw error;
+        }
         const unsupportedModes = [];
+        const piHistoryEventActorEligible =
+          request?._piEventActorHistoryInvocationEligible === true &&
+          this.eventActorContinuation == null &&
+          this.eventActorInvocationId == null &&
+          this.eventActorCheckpointId == null;
         if (
           this.eventActorContinuation != null ||
           this.eventActorInvocationId != null ||
-          request?._isAgentTrigger === true ||
-          request?._agentEventBindingParentConversationId != null
+          this.eventActorCheckpointId != null ||
+          ((request?._isAgentTrigger === true ||
+            request?._agentEventBindingParentConversationId != null) &&
+            !piHistoryEventActorEligible)
         ) {
           unsupportedModes.push('event_actor');
         }
-        if (request?._isScheduledFire === true || request?.body?.scheduleId != null) {
-          unsupportedModes.push('scheduled');
-        }
         if (
-          this.options.subagentTasks != null ||
-          this.agentConfigs?.size > 0 ||
-          (this.options.agent?.edges?.length ?? 0) > 0 ||
-          (this.options.agent?.subagents?.length ?? 0) > 0 ||
-          (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
+          !isCompactionTurn &&
+          (this.agentConfigs?.size > 0 ||
+            (this.options.agent?.edges?.length ?? 0) > 0 ||
+            (this.options.agent?.subagents?.length ?? 0) > 0)
         ) {
           unsupportedModes.push('background');
-        }
-        if (isCompactionTurn) {
-          unsupportedModes.push('compaction');
         }
         if (request?.body?.isRegenerate === true || request?.body?.isContinued === true) {
           unsupportedModes.push('regenerate');
@@ -5197,14 +5832,24 @@ class AgentClient extends BaseClient {
           unsupportedModes.push('code_api_environment');
         }
 
-        const internalToolNames = new Set([Constants.SUBAGENT, 'conditional_transfer']);
+        const internalToolNames = new Set(['conditional_transfer']);
         askUserQuestionEnabled =
+          !isCompactionTurn &&
           !isAskUserQuestionAdminDisabled(appConfig) &&
           agentRequestsAskUserQuestion(this.options.agent) &&
           !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
-        const callableToolNames = [...toolSet].filter(
+        const callableToolNames = (
+          isCompactionTurn
+            ? []
+            : [
+                ...buildToolSet(this.options.agent),
+                ...(piSubagentPlan == null ? [] : [Constants.SUBAGENT]),
+              ]
+        ).filter(
           (name) =>
             !internalToolNames.has(name) &&
+            (name !== Constants.SUBAGENT || piSubagentPlan != null) &&
+            name !== Constants.CHECK_BACKGROUND_TASK &&
             (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
         );
         const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
@@ -5215,8 +5860,28 @@ class AgentClient extends BaseClient {
             (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
               isPiMcpToolName(definition?.name) ||
               isPiActionToolName(definition?.name)) &&
+            definition.name !== PI_SUBAGENT_TOOL_NAME &&
             callableToolNames.includes(definition.name),
         );
+        if (!isCompactionTurn && piSubagentPlan != null) {
+          piToolDefinitions.push(createPiSubagentToolDefinition(piSubagentPlan));
+          const childAgents = [
+            ...new Set([...piSubagentPlan.targets.values()].map(({ agent }) => agent)),
+          ];
+          if (
+            childAgents.some((child) => agentRequestsAskUserQuestion(child)) ||
+            canAgentGraphPause({
+              policy: effectiveToolApprovalPolicy,
+              agents: childAgents.map(buildPiSubagentApprovalAgent),
+              resolvedProgrammaticHooks: resolvedToolApprovalHooks ?? [],
+              pluginHookSource: getPluginHookSource(),
+              askUserQuestionAdminDisabled: isAskUserQuestionAdminDisabled(appConfig),
+              toolApprovalAllows: runToolApprovalAllows,
+            })
+          ) {
+            throw new AgentRuntimeUnavailableError();
+          }
+        }
         try {
           piMcpToolSchemas = compilePiMcpToolSchemaRegistry(piToolDefinitions);
           piActionToolSchemas = compilePiActionToolSchemaRegistry(piToolDefinitions);
@@ -5225,6 +5890,22 @@ class AgentClient extends BaseClient {
             throw new AgentRuntimeUnavailableError();
           }
           throw error;
+        }
+        if (request?._isScheduledFire === true && !GenerationJobManager.isRedis) {
+          const pluginHookSource = getPluginHookSource();
+          const scheduledRunMayPause = canAgentGraphPause({
+            policy: effectiveToolApprovalPolicy,
+            agents,
+            hostGeneratedToolNames:
+              this.options.subagentTasks == null ? [] : [Constants.CHECK_BACKGROUND_TASK],
+            resolvedProgrammaticHooks: resolvedToolApprovalHooks ?? [],
+            pluginHookSource,
+            askUserQuestionAdminDisabled: isAskUserQuestionAdminDisabled(appConfig),
+            toolApprovalAllows: runToolApprovalAllows,
+          });
+          if (scheduledRunMayPause) {
+            throw createScheduledHitlSharedStoreError();
+          }
         }
         const piHasCodeExecutionTools = piToolDefinitions.some((definition) =>
           isPiCodeExecutionToolName(definition.name),
@@ -5238,6 +5919,7 @@ class AgentClient extends BaseClient {
           callableToolNames,
           supportedToolNames: piToolDefinitions.map((definition) => definition.name),
           unsupportedModes,
+          allowPiSubagent: piSubagentPlan != null,
         });
         piModelBindingFactory = getAgentPiModelBindingFactory(this.options.agent);
         if (piModelBindingFactory == null) {
@@ -5268,19 +5950,58 @@ class AgentClient extends BaseClient {
           activityPhase?.handlers(offsetHandlers) ??
           (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
 
-        const piSystemPrompt = buildPiSystemPrompt({
-          agent: this.options.agent,
-          summary: continuationSummary,
-        });
         const summarizationConfig = this.options.agent.summarization ?? appConfig?.summarization;
+        const piCompactionSettings = isCompactionTurn
+          ? resolvePiManualCompactionSettings({
+              agentProvider: this.options.agent.provider,
+              agentModel:
+                this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
+              configured: summarizationConfig,
+            })
+          : undefined;
+        const piSystemPrompt = isCompactionTurn
+          ? ''
+          : buildPiSystemPrompt({
+              agent: this.options.agent,
+              summary: continuationSummary,
+            });
         const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
           summarizationConfig?.reserveRatio,
           this.options.agent.baseContextTokens,
           this.maxContextTokens,
         );
-        const piMessages =
-          piSystemPrompt.length > 0 ? [new SystemMessage(piSystemPrompt), ...messages] : messages;
+        let piMessages = messages;
+        if (isCompactionTurn && piCompactionSettings != null) {
+          piMessages = [
+            ...messages,
+            new HumanMessage(
+              buildPiManualCompactionInstruction({
+                settings: piCompactionSettings,
+                previousSummary: continuationSummary?.text,
+                semanticIndex: this.compactionSemanticIndexSnapshot,
+              }),
+            ),
+          ];
+        } else if (piSystemPrompt.length > 0) {
+          piMessages = [new SystemMessage(piSystemPrompt), ...messages];
+        }
         const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
+        const sharedAttachmentFiles =
+          this.turnSharedAttachmentFiles ?? this.modelBoundCurrentFiles ?? [];
+        const aggregateOnlyAttachmentFiles = this.turnAggregateOnlyAttachmentFiles ?? [];
+        const scopedAttachmentInjections = [
+          ...(this.turnScopedAttachmentsByAgentId?.values() ?? []),
+        ].flat();
+        if (
+          sharedAttachmentFiles.length > 0 ||
+          aggregateOnlyAttachmentFiles.length > 0 ||
+          scopedAttachmentInjections.length > 0
+        ) {
+          this.assertTurnAttachmentLimits(
+            [...sharedAttachmentFiles, ...aggregateOnlyAttachmentFiles],
+            scopedAttachmentInjections,
+          );
+        }
         try {
           /** Pi has no LangChain callback boundary. Inspect the exact formatted host messages
            *  before converting them, retaining stored-message and file provenance. */
@@ -5347,7 +6068,9 @@ class AgentClient extends BaseClient {
                 threadId: this.conversationId,
                 runId: this.responseMessageId,
                 metadata: piMetadata,
-                authorizedToolNames: piToolDefinitions.map((definition) => definition.name),
+                authorizedToolNames: piToolDefinitions
+                  .map((definition) => definition.name)
+                  .filter((name) => name !== PI_SUBAGENT_TOOL_NAME),
                 authorize: (signal) =>
                   GenerationJobManager.assertPiProviderOwner(
                     this.conversationId,
@@ -5378,51 +6101,70 @@ class AgentClient extends BaseClient {
                   error.code = 'PROVIDER_OWNER_FENCED';
                   throw error;
                 }
+                if (call.name === PI_SUBAGENT_TOOL_NAME) {
+                  return this.executePiSubagentTool({
+                    call,
+                    plan: piSubagentPlan,
+                    signal,
+                    appConfig,
+                    request,
+                    handlers: piHandlers,
+                    parentMetadata: piMetadata,
+                    effectiveToolApprovalPolicy,
+                    runToolApprovalAllows,
+                    resolvedToolApprovalHooks,
+                    tokenCounter,
+                  });
+                }
                 return executePiHostToolBatch(call, signal);
               };
-        const piToolExecutionGate = createPiToolApprovalGate({
-          policy: exemptAskUserQuestionFromApproval(
-            effectiveToolApprovalPolicy,
-            ASK_USER_QUESTION_TOOL_NAME,
-          ),
-          allowedTools: runToolApprovalAllows,
-          logger,
-          pluginHookSource: getPluginHookSource(),
-          resolvedHooks: resolvedToolApprovalHooks,
-          hookContext: {
-            userId: request?.user?.id,
-            conversationId: this.conversationId,
-            tenantId: resolveRequestTenantId(request ?? {}),
-            appConfig,
-          },
-          runId: this.responseMessageId,
-          threadId: this.conversationId,
-          agentId: this.options.agent.id,
-          mcpToolSchemas: piMcpToolSchemas,
-          actionToolSchemas: piActionToolSchemas,
-          model:
-            this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
-        });
+        const piToolExecutionGate = isCompactionTurn
+          ? undefined
+          : createPiToolApprovalGate({
+              policy: exemptAskUserQuestionFromApproval(
+                effectiveToolApprovalPolicy,
+                ASK_USER_QUESTION_TOOL_NAME,
+              ),
+              allowedTools: runToolApprovalAllows,
+              logger,
+              pluginHookSource: getPluginHookSource(),
+              resolvedHooks: resolvedToolApprovalHooks,
+              hookContext: {
+                userId: request?.user?.id,
+                conversationId: this.conversationId,
+                tenantId: resolveRequestTenantId(request ?? {}),
+                appConfig,
+              },
+              runId: this.responseMessageId,
+              threadId: this.conversationId,
+              agentId: this.options.agent.id,
+              mcpToolSchemas: piMcpToolSchemas,
+              actionToolSchemas: piActionToolSchemas,
+              model:
+                this.options.agent.model_parameters?.model ?? this.options.agent.model ?? undefined,
+            });
         const outcome = await agentRuntimeDispatcher.executeTurn({
           engine: 'pi',
           selection: runtimeResolution.selection,
           input: {
             messages: piMessages,
             createModelBinding: piModelBindingFactory,
-            toolDefinitions: piToolDefinitions,
+            toolDefinitions: isCompactionTurn ? [] : piToolDefinitions,
             mcpToolSchemas: piMcpToolSchemas,
             actionToolSchemas: piActionToolSchemas,
-            executeHostToolCall: executePiHostToolCall,
+            executeHostToolCall: isCompactionTurn ? undefined : executePiHostToolCall,
             ...(piCodeSessionBridge == null
               ? {}
               : { getCodeSessionContext: () => piCodeSessionBridge.snapshot() }),
             toolExecutionGate: piToolExecutionGate,
-            askUserQuestionEnabled,
+            askUserQuestionEnabled: isCompactionTurn ? false : askUserQuestionEnabled,
             createToolStepIdentity: createPiStepIdentity,
             createToolCallId: () => `pi-tool-${this.responseMessageId}-${nanoid()}`,
             signal: abortController.signal,
             onModelProviderError: terminalRunError.modelCallback.handleLLMError,
-            onTurnEnd: this.buildPiSteerTurnEndHandler(streamId, abortController.signal),
+            ...(isCompactionTurn
+              ? {}
+              : { onTurnEnd: this.buildPiSteerTurnEndHandler(streamId, abortController.signal) }),
             onSessionCreated: () => {
               this.runtimeProgress = markAgentRuntimeExecutionStarted(this.runtimeProgress);
             },
@@ -5440,6 +6182,20 @@ class AgentClient extends BaseClient {
               calibrationRatio,
               summaryTokens: continuationSummary?.tokenCount,
             },
+            ...(piCompactionSettings == null
+              ? {}
+              : {
+                  summaryOnly: {
+                    settings: piCompactionSettings,
+                    agentId: this.options.agent.id,
+                    messagesToRefineCount: messages.length,
+                    summaryVersion: getNextPiSummaryVersion(payload),
+                    countSummaryTokens: (text) =>
+                      getPiSummaryCarrierTokenCount(text, (carrier) =>
+                        tokenCounter(new HumanMessage(carrier)),
+                      ),
+                  },
+                }),
             createStepIdentity: createPiStepIdentity,
             handleHostEvent: handlePiHostEvent,
           },
@@ -5693,6 +6449,9 @@ class AgentClient extends BaseClient {
   }) {
     const piContinuation = piAskUserQuestionContinuation ?? piApprovalContinuation;
     const isAskUserQuestionResume = piAskUserQuestionContinuation != null;
+    if (this.isCompactionTurn()) {
+      throw new AgentRuntimeUnavailableError();
+    }
     if (
       piContinuation == null ||
       (isAskUserQuestionResume
@@ -5750,10 +6509,21 @@ class AgentClient extends BaseClient {
         GenerationJobManager.setContentParts(streamId, this.contentParts, this.jobCreatedAt);
       }
 
-      const historyRows = await this.loadHistory(this.conversationId, this.parentMessageId);
+      this.capturePiResumeHistoryBoundary = true;
+      let historyRows;
+      try {
+        historyRows = await this.loadHistory(this.conversationId, this.parentMessageId);
+      } finally {
+        this.capturePiResumeHistoryBoundary = false;
+      }
       if (!Array.isArray(historyRows) || historyRows.length === 0) {
         throw new AgentRuntimeUnavailableError();
       }
+      this.piResumeHistoryComplete = hasCompletePiResumeHistoryBranch(
+        this.piResumeHistoryBoundary,
+        this.parentMessageId,
+        this.shouldSummarize,
+      );
       const modelBoundHistory = BaseClient.prototype.getModelBoundStoredMessages.call(
         this,
         historyRows,
@@ -5768,6 +6538,17 @@ class AgentClient extends BaseClient {
 
       const toolSet = buildRunToolSet(this.options.agent, undefined, undefined, built.prompt);
       const agents = [this.options.agent];
+      let piSubagentPlan;
+      try {
+        piSubagentPlan = this.isCompactionTurn()
+          ? undefined
+          : createPiSubagentPlan(this.options.agent);
+      } catch (error) {
+        if (error instanceof PiSubagentCompatibilityError) {
+          throw new AgentRuntimeUnavailableError();
+        }
+        throw error;
+      }
       const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
         endpoint: agentsEConfig?.toolApproval,
         attachedCodeEnvironment: false,
@@ -5776,22 +6557,36 @@ class AgentClient extends BaseClient {
         !isAskUserQuestionAdminDisabled(appConfig) &&
         agentRequestsAskUserQuestion(this.options.agent) &&
         !isToolDeniedByApprovalPolicy(effectiveToolApprovalPolicy, ASK_USER_QUESTION_TOOL_NAME);
-      const callableToolNames = [...toolSet].filter(
+      const callableToolNames = (
+        this.isCompactionTurn()
+          ? []
+          : [
+              ...buildToolSet(this.options.agent),
+              ...(piSubagentPlan == null ? [] : [Constants.SUBAGENT]),
+            ]
+      ).filter(
         (name) =>
-          name !== Constants.SUBAGENT &&
+          (name !== Constants.SUBAGENT || piSubagentPlan != null) &&
           name !== 'conditional_transfer' &&
+          name !== Constants.CHECK_BACKGROUND_TASK &&
           (name !== ASK_USER_QUESTION_TOOL_NAME || askUserQuestionEnabled),
       );
       const configuredToolDefinitions = Array.isArray(this.options.agent?.toolDefinitions)
         ? this.options.agent.toolDefinitions
         : [];
-      const piToolDefinitions = configuredToolDefinitions.filter(
-        (definition) =>
-          (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
-            isPiMcpToolName(definition?.name) ||
-            isPiActionToolName(definition?.name)) &&
-          callableToolNames.includes(definition.name),
-      );
+      const piToolDefinitions = this.isCompactionTurn()
+        ? []
+        : configuredToolDefinitions.filter(
+            (definition) =>
+              (PI_SUPPORTED_HOST_TOOLS.includes(definition?.name) ||
+                isPiMcpToolName(definition?.name) ||
+                isPiActionToolName(definition?.name)) &&
+              definition.name !== PI_SUBAGENT_TOOL_NAME &&
+              callableToolNames.includes(definition.name),
+          );
+      if (piSubagentPlan != null) {
+        piToolDefinitions.push(createPiSubagentToolDefinition(piSubagentPlan));
+      }
       let piMcpToolSchemas;
       let piActionToolSchemas;
       try {
@@ -5812,13 +6607,9 @@ class AgentClient extends BaseClient {
         this.eventActorInvocationId != null ||
         req?._isAgentTrigger === true ||
         req?._agentEventBindingParentConversationId != null ||
-        req?._isScheduledFire === true ||
-        req?.body?.scheduleId != null ||
-        this.options.subagentTasks != null ||
         this.agentConfigs?.size > 0 ||
         (this.options.agent?.edges?.length ?? 0) > 0 ||
-        (this.options.agent?.subagents?.length ?? 0) > 0 ||
-        (this.options.agent?.lazySubagentConfigs?.length ?? 0) > 0
+        (this.options.agent?.subagents?.length ?? 0) > 0
       ) {
         unsupportedModes.push('unsupported_resume_mode');
       }
@@ -5844,6 +6635,7 @@ class AgentClient extends BaseClient {
         callableToolNames,
         supportedToolNames: piToolDefinitions.map((definition) => definition.name),
         unsupportedModes,
+        allowPiSubagent: piSubagentPlan != null,
       });
       if (!piToolDefinitions.some((definition) => definition.name === piContinuation.toolName)) {
         throw new AgentRuntimeUnavailableError();
@@ -5855,6 +6647,17 @@ class AgentClient extends BaseClient {
       if (isAskUserQuestionResume) {
         try {
           continuationToolArguments = validatePiAskUserQuestionArguments(continuationToolArguments);
+        } catch {
+          throw new AgentRuntimeUnavailableError();
+        }
+      } else if (piContinuation.toolName === PI_SUBAGENT_TOOL_NAME) {
+        try {
+          resolvePiSubagentTarget({
+            plan: piSubagentPlan,
+            args: continuationToolArguments,
+            depth: 0,
+            ancestry: [piSubagentPlan?.parentAgentId],
+          });
         } catch {
           throw new AgentRuntimeUnavailableError();
         }
@@ -6029,7 +6832,9 @@ class AgentClient extends BaseClient {
               threadId: this.conversationId,
               runId: this.responseMessageId,
               metadata: piMetadata,
-              authorizedToolNames: piToolDefinitions.map((definition) => definition.name),
+              authorizedToolNames: piToolDefinitions
+                .map((definition) => definition.name)
+                .filter((name) => name !== PI_SUBAGENT_TOOL_NAME),
               authorize: (signal) =>
                 GenerationJobManager.assertPiProviderOwner(
                   this.conversationId,
@@ -6058,6 +6863,25 @@ class AgentClient extends BaseClient {
                 error.code = 'PROVIDER_OWNER_FENCED';
                 throw error;
               }
+              if (call.name === PI_SUBAGENT_TOOL_NAME) {
+                return this.executePiSubagentTool({
+                  call,
+                  plan: piSubagentPlan,
+                  signal,
+                  appConfig,
+                  request: req,
+                  handlers: piHandlers,
+                  parentMetadata: piMetadata,
+                  effectiveToolApprovalPolicy,
+                  runToolApprovalAllows: resolveRunToolApprovalAllows(
+                    agentsEConfig?.toolApproval,
+                    req?.resolvedConversation,
+                    this.conversationId,
+                  ),
+                  resolvedToolApprovalHooks: resolvedToolApprovalHooks ?? [],
+                  tokenCounter,
+                });
+              }
               return executePiHostToolBatch(call, signal);
             };
       const resolvedToolApprovalHooks = isHITLEnabled(effectiveToolApprovalPolicy)
@@ -6068,6 +6892,28 @@ class AgentClient extends BaseClient {
             appConfig,
           })
         : undefined;
+      if (piSubagentPlan != null) {
+        const childAgents = [
+          ...new Set([...piSubagentPlan.targets.values()].map(({ agent }) => agent)),
+        ];
+        if (
+          childAgents.some((child) => agentRequestsAskUserQuestion(child)) ||
+          canAgentGraphPause({
+            policy: effectiveToolApprovalPolicy,
+            agents: childAgents.map(buildPiSubagentApprovalAgent),
+            resolvedProgrammaticHooks: resolvedToolApprovalHooks ?? [],
+            pluginHookSource: getPluginHookSource(),
+            askUserQuestionAdminDisabled: isAskUserQuestionAdminDisabled(appConfig),
+            toolApprovalAllows: resolveRunToolApprovalAllows(
+              agentsEConfig?.toolApproval,
+              req?.resolvedConversation,
+              this.conversationId,
+            ),
+          })
+        ) {
+          throw new AgentRuntimeUnavailableError();
+        }
+      }
       const piToolExecutionGate = createPiToolApprovalGate({
         policy: exemptAskUserQuestionFromApproval(
           effectiveToolApprovalPolicy,
@@ -6113,7 +6959,7 @@ class AgentClient extends BaseClient {
         input: {
           messages: piMessages,
           createModelBinding,
-          toolDefinitions: piToolDefinitions,
+          toolDefinitions: this.isCompactionTurn() ? [] : piToolDefinitions,
           executeHostToolCall: executePiHostToolCall,
           mcpToolSchemas: piMcpToolSchemas,
           actionToolSchemas: piActionToolSchemas,

@@ -1047,9 +1047,26 @@ export class InMemoryJobStore implements IJobStoreV2 {
     finalEvent: string,
     providerOwner?: ProviderOwnerContext,
     terminalPublicationId?: string,
+    terminalPersistenceOwnerToken?: string,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
     if (!job || job.createdAt !== expectedCreatedAt || job.terminalPersistencePending !== true) {
+      return false;
+    }
+    const currentOwnerToken = job.terminalPersistenceOwnerToken;
+    const leaseExpiresAt = job.terminalPersistenceLeaseExpiresAt;
+    if (currentOwnerToken != null) {
+      if (
+        currentOwnerToken.length === 0 ||
+        terminalPersistenceOwnerToken !== currentOwnerToken ||
+        leaseExpiresAt == null ||
+        !Number.isSafeInteger(leaseExpiresAt) ||
+        leaseExpiresAt <= Date.now()
+      ) {
+        return false;
+      }
+    } else if (terminalPersistenceOwnerToken != null || leaseExpiresAt != null) {
+      // Only tokenless historical pending records retain the old finalize contract.
       return false;
     }
     if (
@@ -1061,10 +1078,105 @@ export class InMemoryJobStore implements IJobStoreV2 {
     }
     job.terminalPersistencePending = false;
     job.finalEvent = finalEvent;
+    delete job.terminalPersistenceOwnerToken;
+    delete job.terminalPersistenceLeaseExpiresAt;
     if (terminalPublicationId != null) {
       job.terminalPublicationId = terminalPublicationId;
       delete job.terminalPublicationPublishedId;
     }
+    return true;
+  }
+
+  async renewTerminalPersistenceLease(
+    streamId: string,
+    expectedCreatedAt: number,
+    terminalPersistenceOwnerToken: string,
+    leaseMs: number,
+  ): Promise<boolean> {
+    if (
+      typeof terminalPersistenceOwnerToken !== 'string' ||
+      terminalPersistenceOwnerToken.length === 0 ||
+      terminalPersistenceOwnerToken.length > 128 ||
+      !Number.isSafeInteger(leaseMs) ||
+      leaseMs <= 0
+    ) {
+      throw new Error('Invalid terminal persistence lease renewal');
+    }
+    const job = this.jobs.get(streamId);
+    const now = Date.now();
+    if (
+      !job ||
+      job.createdAt !== expectedCreatedAt ||
+      !['complete', 'error', 'aborted'].includes(job.status) ||
+      job.terminalPersistencePending !== true ||
+      job.terminalPersistenceOwnerToken !== terminalPersistenceOwnerToken ||
+      job.terminalPersistenceLeaseExpiresAt == null ||
+      !Number.isSafeInteger(job.terminalPersistenceLeaseExpiresAt) ||
+      job.terminalPersistenceLeaseExpiresAt <= now
+    ) {
+      return false;
+    }
+    const renewedUntil = now + leaseMs;
+    if (!Number.isSafeInteger(renewedUntil)) {
+      return false;
+    }
+    job.terminalPersistenceLeaseExpiresAt = renewedUntil;
+    return true;
+  }
+
+  async recoverExpiredTerminalPersistence(
+    streamId: string,
+    expectedCreatedAt: number,
+    finalEvent: string,
+    terminalPublicationId: string,
+    legacyTimeoutMs: number,
+  ): Promise<boolean> {
+    if (
+      typeof terminalPublicationId !== 'string' ||
+      terminalPublicationId.length === 0 ||
+      !Number.isSafeInteger(legacyTimeoutMs) ||
+      legacyTimeoutMs <= 0
+    ) {
+      throw new Error('Invalid terminal persistence recovery request');
+    }
+    const job = this.jobs.get(streamId);
+    const now = Date.now();
+    if (
+      !job ||
+      job.createdAt !== expectedCreatedAt ||
+      !['complete', 'error', 'aborted'].includes(job.status) ||
+      job.terminalPersistencePending !== true
+    ) {
+      return false;
+    }
+
+    const ownerToken = job.terminalPersistenceOwnerToken;
+    const leaseExpiresAt = job.terminalPersistenceLeaseExpiresAt;
+    if (ownerToken != null && leaseExpiresAt != null) {
+      if (
+        ownerToken.length === 0 ||
+        !Number.isSafeInteger(leaseExpiresAt) ||
+        leaseExpiresAt <= 0 ||
+        leaseExpiresAt > now
+      ) {
+        return false;
+      }
+    } else if (ownerToken == null && leaseExpiresAt == null) {
+      const startedAt = job.terminalPersistenceStartedAt ?? job.completedAt ?? job.createdAt;
+      if (!Number.isSafeInteger(startedAt) || startedAt < 0 || now - startedAt < legacyTimeoutMs) {
+        return false;
+      }
+    } else {
+      // A partially written lease is not safe evidence that an owner is stale.
+      return false;
+    }
+
+    job.terminalPersistencePending = false;
+    job.finalEvent = finalEvent;
+    job.terminalPublicationId = terminalPublicationId;
+    delete job.terminalPublicationPublishedId;
+    delete job.terminalPersistenceOwnerToken;
+    delete job.terminalPersistenceLeaseExpiresAt;
     return true;
   }
 
@@ -1089,6 +1201,28 @@ export class InMemoryJobStore implements IJobStoreV2 {
    */
   async transitionStatus(streamId: string, args: JobStatusTransition): Promise<boolean> {
     assertRuntimeIdentityImmutable(args.patch, args.clear);
+    const targetIsTerminal = ['complete', 'error', 'aborted'].includes(args.to);
+    const terminalPersistenceLeaseMs = args.terminalPersistenceLeaseMs;
+    const terminalPersistenceLeaseExpiresAt =
+      terminalPersistenceLeaseMs == null ? undefined : Date.now() + terminalPersistenceLeaseMs;
+    if (
+      (terminalPersistenceLeaseMs != null &&
+        (!Number.isSafeInteger(terminalPersistenceLeaseMs) ||
+          terminalPersistenceLeaseMs <= 0 ||
+          !Number.isSafeInteger(terminalPersistenceLeaseExpiresAt) ||
+          !targetIsTerminal ||
+          args.patch?.terminalPersistencePending !== true ||
+          typeof args.patch.terminalPersistenceOwnerToken !== 'string' ||
+          args.patch.terminalPersistenceOwnerToken.length === 0 ||
+          args.patch.terminalPersistenceOwnerToken.length > 128)) ||
+      (targetIsTerminal &&
+        args.patch?.terminalPersistencePending === true &&
+        args.patch.terminalPersistenceOwnerToken != null &&
+        terminalPersistenceLeaseMs == null) ||
+      args.patch?.terminalPersistenceLeaseExpiresAt != null
+    ) {
+      throw new Error('Invalid terminal persistence lease claim');
+    }
     const job = this.jobs.get(streamId);
     if (!job || job.status !== args.from) {
       return false;
@@ -1154,9 +1288,13 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (args.expectExpiredProviderOwner != null) {
       job.providerOwnerLostAt = Date.now();
     }
-    const patch = retainScheduleMCPFailure(job, args.patch ?? {});
+    const patchInput = { ...(args.patch ?? {}) };
+    const patch = retainScheduleMCPFailure(job, patchInput);
     const receipt = retainedScheduleReceipt(job, args.patch ?? {}, args.clear ?? []);
     Object.assign(job, patch);
+    if (terminalPersistenceLeaseExpiresAt != null) {
+      job.terminalPersistenceLeaseExpiresAt = terminalPersistenceLeaseExpiresAt;
+    }
     for (const field of args.clear ?? []) delete job[field];
     Object.assign(job, receipt);
     const receiptEntries = this.steerReceipts.get(streamId)?.values() ?? [];

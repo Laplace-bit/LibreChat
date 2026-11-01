@@ -29,6 +29,7 @@ import {
   PI_DELETE_MEMORY_TOOL_NAME,
   PI_READ_FILE_TOOL_NAME,
   PI_SET_MEMORY_TOOL_NAME,
+  PI_SUBAGENT_TOOL_NAME,
   PI_SKILL_TOOL_NAME,
   PI_WEB_SEARCH_TOOL_NAME,
 } from './toolNames';
@@ -78,6 +79,7 @@ export type PiSkillArguments = {
 
 export type PiSetMemoryArguments = { key: string; value: string };
 export type PiDeleteMemoryArguments = { key: string };
+export type PiSubagentArguments = { description: string; subagent_type: string };
 export type PiAskUserQuestionArguments = AskUserQuestionToolInput;
 
 export type PiBuiltInToolArguments =
@@ -89,6 +91,7 @@ export type PiBuiltInToolArguments =
   | PiSkillArguments
   | PiSetMemoryArguments
   | PiDeleteMemoryArguments
+  | PiSubagentArguments
   | PiAskUserQuestionArguments;
 
 export type PiToolArguments = PiBuiltInToolArguments | PiMcpToolArguments | PiActionToolArguments;
@@ -135,6 +138,11 @@ export type PiHostToolExecutionInput =
       toolCallId: string;
       name: typeof PI_DELETE_MEMORY_TOOL_NAME;
       args: PiDeleteMemoryArguments;
+    }
+  | {
+      toolCallId: string;
+      name: typeof PI_SUBAGENT_TOOL_NAME;
+      args: PiSubagentArguments;
     }
   | {
       toolCallId: string;
@@ -225,6 +233,10 @@ const TOOL_FIELDS = {
   [PI_DELETE_MEMORY_TOOL_NAME]: {
     label: 'Delete memory',
     description: 'Delete user memory through LibreChat’s authorized memory service.',
+  },
+  [PI_SUBAGENT_TOOL_NAME]: {
+    label: 'Delegate to agent',
+    description: 'Delegate a focused task to an authorized agent in an isolated Pi session.',
   },
   [ASK_USER_QUESTION_TOOL_NAME]: {
     label: 'Ask user question',
@@ -607,10 +619,88 @@ function convertPiMemorySchema(name: string, schema: Record<string, unknown>): T
   } satisfies TSchema;
 }
 
+function convertPiSubagentSchema(schema: unknown): TSchema {
+  if (
+    !isRecord(schema) ||
+    !hasOnlyKeys(schema, [
+      'type',
+      'properties',
+      'required',
+      'additionalProperties',
+      'description',
+    ]) ||
+    schema.type !== 'object' ||
+    !isRecord(schema.properties) ||
+    !hasOnlyKeys(schema.properties, ['description', 'subagent_type']) ||
+    !isRecord(schema.properties.description) ||
+    !hasOnlyKeys(schema.properties.description, ['type', 'description']) ||
+    schema.properties.description.type !== 'string' ||
+    !isRecord(schema.properties.subagent_type) ||
+    !hasOnlyKeys(schema.properties.subagent_type, ['type', 'enum', 'description']) ||
+    schema.properties.subagent_type.type !== 'string' ||
+    !Array.isArray(schema.properties.subagent_type.enum) ||
+    schema.properties.subagent_type.enum.length === 0 ||
+    schema.properties.subagent_type.enum.length > 128 ||
+    !schema.properties.subagent_type.enum.every(
+      (value) => typeof value === 'string' && value.trim().length > 0 && value.length <= 200,
+    ) ||
+    new Set(schema.properties.subagent_type.enum).size !==
+      schema.properties.subagent_type.enum.length ||
+    !Array.isArray(schema.required) ||
+    schema.required.length !== 2 ||
+    !schema.required.includes('description') ||
+    !schema.required.includes('subagent_type') ||
+    (schema.additionalProperties !== undefined && schema.additionalProperties !== false)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+
+  const properties = schema.properties;
+  const targetTypeProperty = properties.subagent_type;
+  const descriptionPropertySchema = properties.description;
+  if (
+    !isRecord(targetTypeProperty) ||
+    !Array.isArray(targetTypeProperty.enum) ||
+    !isRecord(descriptionPropertySchema)
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+  }
+  const targetTypes: string[] = [];
+  for (const value of targetTypeProperty.enum) {
+    if (typeof value !== 'string' || value.trim().length === 0 || value.length > 200) {
+      throw new PiToolCompatibilityError('PI_TOOL_SCHEMA_UNSUPPORTED');
+    }
+    targetTypes.push(value);
+  }
+  const description = optionalDescription(schema);
+  const descriptionProperty = optionalDescription(descriptionPropertySchema);
+  const targetPropertyDescription = optionalDescription(targetTypeProperty);
+  return {
+    type: 'object',
+    required: ['description', 'subagent_type'],
+    properties: {
+      description: {
+        type: 'string',
+        ...(descriptionProperty == null ? {} : { description: descriptionProperty }),
+      },
+      subagent_type: {
+        type: 'string',
+        enum: [...targetTypes],
+        ...(targetPropertyDescription == null ? {} : { description: targetPropertyDescription }),
+      },
+    },
+    additionalProperties: false,
+    ...(description == null ? {} : { description }),
+  } satisfies TSchema;
+}
+
 /** Converts reviewed host schemas only; unrecognized JSON Schema fails closed. */
 export function convertPiToolSchema(name: string, schema: unknown): TSchema {
   if (name === ASK_USER_QUESTION_TOOL_NAME) {
     return AskUserQuestionToolDefinition.schema;
+  }
+  if (name === PI_SUBAGENT_TOOL_NAME) {
+    return convertPiSubagentSchema(schema);
   }
   if (isPiActionToolName(name)) {
     return validateMcpSchemaResult(
@@ -862,6 +952,22 @@ export function validatePiDeleteMemoryArguments(value: unknown): PiDeleteMemoryA
   return { key: value.key };
 }
 
+export function validatePiSubagentArguments(value: unknown): PiSubagentArguments {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, ['description', 'subagent_type']) ||
+    typeof value.description !== 'string' ||
+    value.description.trim().length === 0 ||
+    value.description.length > 16_384 ||
+    typeof value.subagent_type !== 'string' ||
+    value.subagent_type.trim().length === 0 ||
+    value.subagent_type.length > 200
+  ) {
+    throw new PiToolCompatibilityError('PI_TOOL_ARGUMENTS_INVALID');
+  }
+  return { description: value.description, subagent_type: value.subagent_type };
+}
+
 export function validatePiAskUserQuestionArguments(value: unknown): PiAskUserQuestionArguments {
   const parsed = askUserQuestionToolSchema.safeParse(value);
   if (!parsed.success || !hasExactPiAskUserQuestionKeys(value)) {
@@ -951,6 +1057,12 @@ export function validatePiToolExecutionInput(
         toolCallId,
         name: PI_DELETE_MEMORY_TOOL_NAME,
         args: validatePiDeleteMemoryArguments(args),
+      };
+    case PI_SUBAGENT_TOOL_NAME:
+      return {
+        toolCallId,
+        name: PI_SUBAGENT_TOOL_NAME,
+        args: validatePiSubagentArguments(args),
       };
     case ASK_USER_QUESTION_TOOL_NAME:
       return {

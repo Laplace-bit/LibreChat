@@ -15,6 +15,7 @@ import {
   subagentProgressKey,
   takeRegisteredSubagentProgressKeys,
 } from '../state';
+import { createEventServices } from '../../stream/__fixtures__/events';
 import { createSSETransport } from '../../../core/transport';
 import { StreamHostProvider } from '../../stream/host';
 import { useSubagentActivityStream } from '../stream';
@@ -71,6 +72,8 @@ jest.mock('@tanstack/react-query', () => ({
   useQueryClient: () => mockQueryClient,
 }));
 
+const eventServices = createEventServices();
+
 const host: StreamHost = {
   useResumableServices: () => () => {
     throw new Error('the activity feed attaches without a resumable binding');
@@ -87,6 +90,8 @@ const host: StreamHost = {
     isFetching: false,
   }),
   useResumeSettings: () => ({ configLoaded: true, conversation: null }),
+  useParentSubagentIndex: () => ({ isError: false, refetch: async () => ({}) }),
+  useEventServices: () => eventServices,
 };
 const transport = createSSETransport({ token: 'token-1' });
 

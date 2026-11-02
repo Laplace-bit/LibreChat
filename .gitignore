@@ -209,3 +209,6 @@ scripts/activity-labels/results/
 # Electron build output
 /desktop/electron/dist/
 /desktop/electron/out/
+
+# Mutation testing sandboxes
+.stryker-tmp/

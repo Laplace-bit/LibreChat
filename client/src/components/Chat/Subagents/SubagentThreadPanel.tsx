@@ -5,6 +5,7 @@ import { dataService, ForkOptions } from 'librechat-data-provider';
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai';
 import { isMacPlatform, resolveComposerKeyDown } from '@librechat/chat';
 import { ArrowUpRight, Clock, OctagonPause, X, Zap } from 'lucide-react';
+import { SubagentActivity, SubagentActivityScrollSurface } from '@librechat/chat/components';
 import {
   Alert,
   Button,
@@ -21,6 +22,23 @@ import {
   subagentProgressKey,
   useSubagentProgress,
   useSubagentActivityStream,
+  adaptDurableThreadActivity,
+  adaptDurableThreadConversation,
+  adaptLivePersistedActivity,
+  mergeChildConversationTurns,
+  retainBoundedMovingWindowTurns,
+  eventSubagentSelection,
+  resolveSubagentAgentId,
+  isLiveSubagentStatus,
+  getSubagentPrompt,
+  useParentSubagents,
+  agentAuthor,
+  resolveSubagentAuthor,
+  isSelfSpawn as isSelfSpawnType,
+  resolveChildAgent,
+  readableSubagentType,
+  useParentAuthor,
+  useChatSurface,
 } from '@librechat/chat/react';
 import type {
   ParentSubagentTaskSummary,
@@ -41,37 +59,15 @@ import {
   useSubagentControlMutation,
   useSubagentThreadQuery,
 } from '~/data-provider';
-import {
-  adaptDurableThreadActivity,
-  adaptDurableThreadConversation,
-  adaptLivePersistedActivity,
-  mergeChildConversationTurns,
-  retainBoundedMovingWindowTurns,
-} from './adapters';
-import {
-  agentAuthor,
-  resolveSubagentAuthor,
-  isSelfSpawn as isSelfSpawnType,
-  resolveChildAgent,
-  readableSubagentType,
-  useParentAuthor,
-} from './author';
-import SubagentActivity, { SubagentActivityScrollSurface } from './SubagentActivity';
 import ApprovalProvider from '~/components/Chat/Messages/Content/ApprovalContext';
 import { TaskContentScopeContext } from '~/data-provider/Subagents/content';
 import { useFocusTrap, useLocalize, useNavigateToConvo } from '~/hooks';
 import { ARTIFACTS_SHEET_MAX_WIDTH } from '~/utils/breakpoints';
 import { useConfiguredFooter } from '~/components/Chat/Footer';
-import { useParentSubagents } from './ParentSubagentsProvider';
 import useScaledMaxWidth from '~/hooks/useScaledMaxWidth';
 import SubagentConversation from './SubagentConversation';
-import { eventSubagentSelection } from './eventSelection';
-import { resolveSubagentAgentId } from './identity';
 import { useAgentsMapContext } from '~/Providers';
-import { isLiveSubagentStatus } from './status';
 import { cn, renderAgentAvatar } from '~/utils';
-import { getSubagentPrompt } from './prompt';
-import { useChatSurface } from './surface';
 
 const EVENT_TASK_PAGE_SIZE = 3;
 const TERMINAL_CONTROL_REASONS = new Set([

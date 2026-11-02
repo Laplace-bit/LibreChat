@@ -48,7 +48,6 @@ jest.mock('@librechat/chat/react', () => {
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string) => (key === 'com_ui_new_chat' ? 'New chat' : key),
   useAddedResponse: () => ({}),
-  useScrollbarGutterSeed: jest.fn(),
 }));
 
 jest.mock('../Presentation', () => ({
@@ -73,11 +72,15 @@ jest.mock('../Input/ChatForm', () => ({
   __esModule: true,
   default: (props: Record<string, unknown>) => {
     mockChatFormProps(props);
-    mockAskHostSaveDrafts(jest.requireActual('../ask/state').useAskAnswerHost());
+    mockAskHostSaveDrafts(jest.requireActual('@librechat/chat/react').useAskAnswerHost());
     return <div />;
   },
 }));
 jest.mock('../Input/ConversationStarters', () => ({ __esModule: true, default: () => <div /> }));
+jest.mock('~/components/Projects/ProjectBadge', () => ({
+  __esModule: true,
+  default: ({ projectId }: { projectId: string }) => <div data-testid={`project-${projectId}`} />,
+}));
 
 describe('ChatView page heading', () => {
   beforeEach(() => {
@@ -271,5 +274,29 @@ describe('ChatView landing footer', () => {
     expect(mockChatFormProps).toHaveBeenLastCalledWith(
       expect.objectContaining({ footerBelow: true }),
     );
+  });
+});
+
+describe('ChatView project badge', () => {
+  beforeEach(() => {
+    mockParams.mockReturnValue({ conversationId: 'convo-1' });
+  });
+
+  test('pins the conversation project above a column that leaves room for it', () => {
+    mockConversation.mockReturnValue({ conversationId: 'convo-1', chatProjectId: 'atlas' });
+
+    const { container } = render(<ChatView />);
+
+    expect(screen.getByTestId('project-atlas')).toBeInTheDocument();
+    expect(container.querySelector('[data-chat-pane="0"]')).toHaveClass('pt-9');
+  });
+
+  test('leaves the column unpadded for a conversation outside any project', () => {
+    mockConversation.mockReturnValue({ conversationId: 'convo-1' });
+
+    const { container } = render(<ChatView />);
+
+    expect(screen.queryByTestId(/^project-/)).not.toBeInTheDocument();
+    expect(container.querySelector('[data-chat-pane="0"]')).not.toHaveClass('pt-9');
   });
 });

@@ -1,6 +1,7 @@
 const { maxWorkers, workerIdleMemoryLimit } = require('../config/jest.workers.cjs');
 
 const esModules = [
+  '@librechat/agents',
   '@librechat/code',
   'openid-client',
   'oauth4webapi',
@@ -38,7 +39,7 @@ module.exports = {
       '<rootDir>/../vendor/code/browser-enrollment-protocol.ts',
   },
   transform: {
-    '\\.[jt]sx?$': [
+    '\\.[cm]?[jt]sx?$': [
       'babel-jest',
       {
         presets: [

@@ -4,10 +4,12 @@ import type {
   ChatTransport,
   RetentionMode,
   TConversation,
+  ParentSubagentIndex,
   TAgentQueuedTurnReceipt,
 } from 'librechat-data-provider';
 import type { Dispatch, ReactNode, SetStateAction } from 'react';
 import type { ResumableHost, ResumableRun, StreamStatusResponse } from '../../core';
+import type { EventServices, EventServicesParams } from './services';
 import type { ChatContract } from '../chat/contract';
 
 /** The chat members a stream writes through: the message cache, the pane's conversation and its
@@ -47,6 +49,13 @@ export type ResumeSettings = {
   retentionMode?: RetentionMode;
   /** The conversation the pane shows. */
   conversation: TConversation | null;
+};
+
+/** The parent conversation's durable subagent index, as the host's query cache holds it. */
+export type ParentSubagentIndexQuery = {
+  data?: ParentSubagentIndex;
+  isError: boolean;
+  refetch: () => Promise<{ data?: ParentSubagentIndex }>;
 };
 
 /** Everything a resumable stream runs on except how it re-attaches, which the binding owns. */
@@ -92,6 +101,17 @@ export interface StreamHost {
   useStreamStatus(conversationId: string | undefined, enabled: boolean): ResumeStatusQuery;
   /** The settings a pane's resume check reads. */
   useResumeSettings(runIndex: number): ResumeSettings;
+  /**
+   * The parent conversation's subagent index from the host's query cache, so the host's own
+   * stream handlers and invalidations keep reaching the same entry. Polls while `isSubmitting`.
+   */
+  useParentSubagentIndex(
+    conversationId: string,
+    enabled: boolean,
+    isSubmitting: boolean,
+  ): ParentSubagentIndexQuery;
+  /** The app services a pane's stream event handlers write through. */
+  useEventServices(params: EventServicesParams): EventServices;
 }
 
 const StreamHostContext = createContext<StreamHost | null>(null);

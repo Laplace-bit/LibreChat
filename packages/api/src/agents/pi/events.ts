@@ -39,6 +39,8 @@ export interface PiContentEventTranslatorOptions {
     summaryVersion: number;
     streamDeltas: boolean;
     countSummaryTokens(text: string): number;
+    coverage?: { retainedFromMessageId: string };
+    onComplete?(summaryText: string, summaryTokenCount: number): void;
   };
   now?: () => number;
 }
@@ -464,19 +466,22 @@ function translateSummaryAgentEnd(
 
   const text = (message.summaryText ?? '').trim();
   if (assistant.stopReason === 'stop' && text.length > 0) {
+    const summaryTokenCount = summaryOptions.countSummaryTokens(text);
     const summary: NonNullable<Agents.SummarizeCompleteEvent['summary']> = {
       type: ContentTypes.SUMMARY,
       provider: summaryOptions.provider,
       model: summaryOptions.model,
       content: [{ type: ContentTypes.TEXT, text }],
-      tokenCount: summaryOptions.countSummaryTokens(text),
+      tokenCount: summaryTokenCount,
       summaryVersion: summaryOptions.summaryVersion,
+      ...(summaryOptions.coverage == null ? {} : { coverage: summaryOptions.coverage }),
       boundary: {
         messageId: step.identity.id,
         contentIndex: step.identity.index,
       },
       createdAt: new Date(now()).toISOString(),
     };
+    summaryOptions.onComplete?.(text, summaryTokenCount);
     return [
       {
         event: GraphEvents.ON_SUMMARIZE_COMPLETE,

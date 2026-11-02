@@ -83,6 +83,7 @@ const samples: Record<ContentTypes, MappableContentPart> = {
   [ContentTypes.SUMMARY]: {
     type: ContentTypes.SUMMARY,
     content: [{ type: ContentTypes.TEXT, text: 'Earlier, we talked.' }],
+    coverage: { retainedFromMessageId: 'user-retained-1' },
     summarizing: false,
   },
   [ContentTypes.ACTIVITY_LABEL]: {
@@ -515,6 +516,7 @@ describe('parts', () => {
         summaries: [
           {
             content: [{ type: ContentTypes.TEXT, text: 'Earlier, we talked.' }],
+            coverage: { retainedFromMessageId: 'user-retained-1' },
             summarizing: false,
           },
         ],

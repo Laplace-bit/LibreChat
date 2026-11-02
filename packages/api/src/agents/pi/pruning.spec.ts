@@ -122,4 +122,85 @@ describe('projectPiHistory', () => {
       maxContextTokens: 100,
     });
   });
+
+  it('plans a durable summary over the old prefix and keeps the latest user turn verbatim', () => {
+    const messages = [
+      new HumanMessage({ content: 'older question '.repeat(8), id: 'user-old' }),
+      new AIMessage({ content: 'older answer '.repeat(8), id: 'assistant-old' }),
+      new HumanMessage({ content: 'recent question '.repeat(5), id: 'user-recent' }),
+      new AIMessage({ content: 'recent answer '.repeat(5), id: 'assistant-recent' }),
+      new HumanMessage({ content: 'current question', id: 'user-current' }),
+    ];
+    for (const message of messages) {
+      message.additional_kwargs.sourceMessageId = message.id;
+    }
+    const originalSnapshot = JSON.stringify(messages.map((message) => message.toDict()));
+    const pruning = createPruningOptions(messages, 0, 120);
+
+    const projection = projectPiHistory({
+      messages,
+      model,
+      tokenCounter,
+      pruning,
+      automaticCompaction: { retainRecent: { turns: 1 } },
+    });
+
+    expect(projection.compactionPlan).toMatchObject({
+      messagesToSummarize: messages.slice(0, 4),
+      retainedMessages: [expect.objectContaining({ id: 'user-current' })],
+      coverage: { retainedFromMessageId: 'user-current' },
+    });
+    expect(JSON.stringify(messages.map((message) => message.toDict()))).toBe(originalSnapshot);
+  });
+
+  it('does not plan compaction when the configured trigger has not fired', () => {
+    const messages = [
+      new HumanMessage({ content: 'older question '.repeat(8), id: 'user-old' }),
+      new AIMessage({ content: 'older answer '.repeat(8), id: 'assistant-old' }),
+      new HumanMessage({ content: 'current question', id: 'user-current' }),
+    ];
+    for (const message of messages) {
+      message.additional_kwargs.sourceMessageId = message.id;
+    }
+    const pruning = createPruningOptions(messages, 0, 100);
+
+    const projection = projectPiHistory({
+      messages,
+      model,
+      tokenCounter,
+      pruning,
+      automaticCompaction: {
+        trigger: { type: 'messages_to_refine', value: 100 },
+        retainRecent: { turns: 1 },
+      },
+    });
+
+    expect(projection.compactionPlan).toBeUndefined();
+    expect(projection.messages).toBe(messages);
+  });
+
+  it('uses the bound model context window when it is below the configured pruning cap', () => {
+    const messages = [
+      new HumanMessage({ content: 'older question '.repeat(4), id: 'user-old' }),
+      new AIMessage({ content: 'older answer '.repeat(4), id: 'assistant-old' }),
+      new HumanMessage({ content: 'current question', id: 'user-current' }),
+    ];
+    for (const message of messages) {
+      message.additional_kwargs.sourceMessageId = message.id;
+    }
+    const pruning = createPruningOptions(messages, 0, 1_000);
+
+    const projection = projectPiHistory({
+      messages,
+      model: { ...model, contextWindow: 100 },
+      tokenCounter,
+      pruning,
+      automaticCompaction: { retainRecent: { turns: 1 } },
+    });
+
+    expect(projection.compactionPlan?.messagesToSummarize).toEqual(messages.slice(0, 2));
+    expect(projection.compactionPlan?.coverage).toEqual({
+      retainedFromMessageId: 'user-current',
+    });
+  });
 });

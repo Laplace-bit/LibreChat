@@ -1,5 +1,11 @@
+import { GraphEvents } from '@librechat/agents';
 import { Tools, UsageEvents } from 'librechat-data-provider';
-import { AIMessage, HumanMessage, ToolMessage } from '@librechat/agents/langchain/messages';
+import {
+  AIMessage,
+  HumanMessage,
+  SystemMessage,
+  ToolMessage,
+} from '@librechat/agents/langchain/messages';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { LCTool } from '@librechat/agents';
 import type { PiGenerationExecutorInput } from './execution';
@@ -7,7 +13,9 @@ import type { PiGenerationDispatchInput } from './dispatch';
 import type { PiModelBinding } from './session';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { PiContextBudgetExceededError } from './contextUsage';
+import { PiAutomaticSummaryFailedError } from './dispatch';
 import { createPiGenerationDispatcher } from './dispatch';
+import { createPiHistoryPruningOptions } from './pruning';
 import { ASK_USER_QUESTION_TOOL_NAME } from './toolNames';
 
 const fileSearchDefinition: LCTool = {
@@ -525,6 +533,195 @@ describe('createPiGenerationDispatcher caller tool handoff', () => {
         }),
       ),
     ).resolves.toMatchObject({ status: 'completed' });
+  });
+});
+
+describe('createPiGenerationDispatcher automatic summarization', () => {
+  async function emitSummary(value: PiGenerationExecutorInput): Promise<void> {
+    const assistant = {
+      role: 'assistant' as const,
+      content: [],
+      api: 'openai-responses',
+      provider: 'openAI',
+      model: 'gpt-4o-mini',
+      usage: {
+        input: 4,
+        output: 3,
+        cacheRead: 0,
+        cacheWrite: 0,
+        totalTokens: 7,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'stop' as const,
+      timestamp: 1,
+    };
+    for (const event of value.translateEvent({ type: 'message_start', message: assistant })) {
+      await value.handleHostEvent(event);
+    }
+    for (const event of value.translateEvent({
+      type: 'message_update',
+      message: assistant,
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: 'Saved checkpoint',
+        partial: assistant,
+      },
+    })) {
+      await value.handleHostEvent(event);
+    }
+    for (const event of value.translateEvent({
+      type: 'agent_end',
+      messages: [assistant],
+      willRetry: false,
+    })) {
+      await value.handleHostEvent(event);
+    }
+  }
+
+  function createAutoSummaryInput() {
+    const messages = [
+      new HumanMessage({ content: 'older user turn '.repeat(10), id: 'user-old' }),
+      new AIMessage({ content: 'older assistant turn '.repeat(10), id: 'assistant-old' }),
+      new HumanMessage({ content: 'current user question', id: 'user-current' }),
+    ];
+    for (const message of messages) {
+      message.additional_kwargs.sourceMessageId = message.id;
+    }
+    const tokenCounter = (message: BaseMessage) => JSON.stringify(message.content).length;
+    const indexTokenCountMap = Object.fromEntries(
+      messages.map((message, index) => [index, tokenCounter(message)]),
+    );
+    const contextPruning = createPiHistoryPruningOptions({
+      indexTokenCountMap,
+      systemPrefixCount: 0,
+      maxContextTokens: 100,
+      reserveRatio: 0,
+      calibrationRatio: 1,
+    });
+    const dispose = jest.fn();
+    const createModelBinding = jest.fn(
+      async (): Promise<PiModelBinding> => ({
+        model: {
+          api: 'openai-responses',
+          provider: 'openAI',
+          id: 'gpt-4o-mini',
+          contextWindow: 8192,
+          maxTokens: 1024,
+        } as PiModelBinding['model'],
+        modelRuntime: {} as PiModelBinding['modelRuntime'],
+        dispose,
+      }),
+    );
+    const value = input({
+      messages,
+      createModelBinding,
+      contextPruning,
+      contextUsage: {
+        tokenCounter,
+        runId: 'response-1',
+        agentId: 'agent-1',
+        maxContextTokens: 8192,
+      },
+      usageAttribution: { provider: 'openAI', agentId: 'agent-1', runId: 'response-1' },
+      autoSummary: {
+        enabled: true,
+        agentId: 'agent-1',
+        agentProvider: 'openAI',
+        agentModel: 'gpt-4o-mini',
+        configuration: {},
+        retainRecent: { turns: 1 },
+        summaryVersion: 1,
+        countSummaryTokens: () => 7,
+        buildPrimaryMessages: ({ summaryText, retainedMessages }) => [
+          new SystemMessage(`## Conversation Summary\n\n${summaryText}`),
+          ...retainedMessages,
+        ],
+      },
+    });
+    return { value, createModelBinding, dispose };
+  }
+
+  it('summarizes once, persists coverage, then starts the primary turn with the retained user prompt', async () => {
+    const order: string[] = [];
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const binding = await value.createModelBinding();
+      try {
+        if (value.systemPrompt.length === 0) {
+          await emitSummary(value);
+          return { status: 'completed' as const };
+        }
+
+        order.push('primary-start');
+        expect(value.systemPrompt).toContain('Saved checkpoint');
+        expect(value.operation).toEqual({
+          kind: 'ordered_prompt',
+          content: [{ type: 'text', text: 'current user question' }],
+        });
+        return { status: 'completed' as const };
+      } finally {
+        await binding.dispose();
+      }
+    });
+    const { value, createModelBinding } = createAutoSummaryInput();
+    value.handleHostEvent = (event) => {
+      if (event.event === GraphEvents.ON_SUMMARIZE_COMPLETE) {
+        order.push('summary-complete');
+        expect(event.data.summary?.coverage).toEqual({
+          retainedFromMessageId: 'user-current',
+        });
+      }
+    };
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(dispatch(value)).resolves.toMatchObject({ status: 'completed' });
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(['summary-complete', 'primary-start']);
+    expect(createModelBinding).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not start the primary turn when cancelled after the durable summary completes', async () => {
+    const abortController = new AbortController();
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const binding = await value.createModelBinding();
+      try {
+        if (value.systemPrompt.length === 0) {
+          await emitSummary(value);
+          return { status: 'completed' as const };
+        }
+        return { status: 'completed' as const };
+      } finally {
+        await binding.dispose();
+      }
+    });
+    const { value, createModelBinding, dispose } = createAutoSummaryInput();
+    value.signal = abortController.signal;
+    value.handleHostEvent = (event) => {
+      if (event.event === GraphEvents.ON_SUMMARIZE_COMPLETE) {
+        abortController.abort();
+      }
+    };
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(dispatch(value)).resolves.toMatchObject({ status: 'cancelled' });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(createModelBinding).toHaveBeenCalledTimes(1);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not start the primary turn if the summary phase returns no completed summary', async () => {
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const binding = await value.createModelBinding();
+      await binding.dispose();
+      return { status: 'completed' as const };
+    });
+    const { value } = createAutoSummaryInput();
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(dispatch(value)).rejects.toBeInstanceOf(PiAutomaticSummaryFailedError);
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });
 

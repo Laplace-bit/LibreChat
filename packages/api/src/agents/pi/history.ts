@@ -17,7 +17,9 @@ import type {
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
 
 export type PiHistoryMessage = Exclude<Message, { role: 'system' }>;
-export type PiHistoryModel = Pick<NonNullable<AgentSession['model']>, 'api' | 'provider' | 'id'>;
+export type PiHistoryModel = Pick<NonNullable<AgentSession['model']>, 'api' | 'provider' | 'id'> & {
+  contextWindow?: number;
+};
 export type PiHistoryCompatibilityCode =
   | 'missing_current_user'
   | 'system_message_order'

@@ -6234,6 +6234,45 @@ class AgentClient extends BaseClient {
               summaryTokens: continuationSummary?.tokenCount,
             },
             ...(piContextPruning == null ? {} : { contextPruning: piContextPruning }),
+            ...(!isCompactionTurn &&
+            summarizationConfig?.enabled !== false &&
+            piContextPruning != null
+              ? {
+                  autoSummary: {
+                    enabled: true,
+                    agentId: this.options.agent.id,
+                    agentProvider: this.options.agent.provider,
+                    agentModel:
+                      this.options.agent.model_parameters?.model ??
+                      this.options.agent.model ??
+                      undefined,
+                    configuration: summarizationConfig,
+                    trigger: summarizationConfig?.trigger,
+                    retainRecent: summarizationConfig?.retainRecent,
+                    previousSummary: continuationSummary?.text,
+                    semanticIndex: this.compactionSemanticIndexSnapshot,
+                    summaryVersion: getNextPiSummaryVersion(payload),
+                    countSummaryTokens: (text) =>
+                      getPiSummaryCarrierTokenCount(text, (carrier) =>
+                        tokenCounter(new HumanMessage(carrier)),
+                      ),
+                    buildPrimaryMessages: ({
+                      summaryText,
+                      summaryTokenCount,
+                      retainedMessages,
+                    }) => {
+                      const systemPrompt = buildPiSystemPrompt({
+                        agent: this.options.agent,
+                        summary: { text: summaryText, tokenCount: summaryTokenCount },
+                      });
+                      return [
+                        ...(systemPrompt.length > 0 ? [new SystemMessage(systemPrompt)] : []),
+                        ...retainedMessages,
+                      ];
+                    },
+                  },
+                }
+              : {}),
             ...(piCompactionSettings == null
               ? {}
               : {

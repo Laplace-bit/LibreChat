@@ -216,7 +216,12 @@ describe('createPiContentEventTranslator summarize-only mapping', () => {
     countSummaryTokens: jest.fn(() => 23),
   };
 
-  function createTranslator(overrides: Partial<typeof summaryOnly> = {}) {
+  function createTranslator(
+    overrides: Partial<typeof summaryOnly> & {
+      coverage?: { retainedFromMessageId: string };
+      onComplete?: (summaryText: string, summaryTokenCount: number) => void;
+    } = {},
+  ) {
     return createPiContentEventTranslator({
       createStepIdentity: () => ({
         id: 'summary-step-1',
@@ -310,6 +315,41 @@ describe('createPiContentEventTranslator summarize-only mapping', () => {
         data: expect.objectContaining({ usage_type: 'summarization', provider: 'openAI' }),
       },
     ]);
+  });
+
+  it('persists an explicit retained-message coverage anchor for automatic compaction', () => {
+    const onComplete = jest.fn();
+    const translate = createTranslator({
+      coverage: { retainedFromMessageId: 'user-retained-1' },
+      onComplete,
+    });
+    translate({ type: 'message_start', message: assistantMessage() });
+    translate({
+      type: 'message_update',
+      message: assistantMessage(),
+      assistantMessageEvent: {
+        type: 'text_delta',
+        contentIndex: 0,
+        delta: 'Checkpoint text',
+        partial: assistantMessage(),
+      },
+    });
+
+    const completed = translate({
+      type: 'agent_end',
+      messages: [assistantMessage()],
+      willRetry: false,
+    });
+
+    expect(completed[0]).toMatchObject({
+      event: GraphEvents.ON_SUMMARIZE_COMPLETE,
+      data: {
+        summary: {
+          coverage: { retainedFromMessageId: 'user-retained-1' },
+        },
+      },
+    });
+    expect(onComplete).toHaveBeenCalledWith('Checkpoint text', 23);
   });
 
   it('withholds deltas when configured and persists a typed empty-output failure', () => {

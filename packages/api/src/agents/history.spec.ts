@@ -5,6 +5,37 @@ import type { TPayload } from '@librechat/agents';
 import { buildRunToolSet } from './tools';
 
 describe('agent tool history formatting', () => {
+  it('uses a persisted summary coverage anchor to keep the exact retained tail', () => {
+    const payload: TPayload = [
+      { role: 'user', messageId: 'user-covered', content: 'Covered question' },
+      { role: 'assistant', messageId: 'assistant-covered', content: 'Covered answer' },
+      { role: 'user', messageId: 'user-retained', content: 'Retained question' },
+      {
+        role: 'assistant',
+        messageId: 'assistant-summary',
+        content: [
+          {
+            type: ContentTypes.SUMMARY,
+            content: [{ type: ContentTypes.TEXT, text: 'Checkpoint' }],
+            tokenCount: 12,
+            summaryVersion: 1,
+            coverage: { retainedFromMessageId: 'user-retained' },
+            boundary: { messageId: 'summary-step', contentIndex: 0 },
+          },
+        ],
+      },
+      { role: 'user', messageId: 'user-current', content: 'Current question' },
+    ];
+
+    const { messages } = formatAgentMessages(payload);
+    const formattedText = JSON.stringify(messages);
+
+    expect(formattedText).not.toContain('Covered question');
+    expect(formattedText).not.toContain('Covered answer');
+    expect(formattedText).toContain('Retained question');
+    expect(formattedText).toContain('Current question');
+  });
+
   it('preserves handoff and destination-agent calls as structured pairs', () => {
     const primary = {
       edges: [{ from: 'primary', to: 'researcher', edgeType: 'handoff' as const }],

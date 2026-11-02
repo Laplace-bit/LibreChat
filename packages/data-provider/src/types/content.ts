@@ -227,6 +227,8 @@ export type SummaryContentPart = {
    *  automatic detour firing on context pressure. */
   initiatedBy?: 'user';
   summaryVersion?: number;
+  /** First persisted message retained verbatim after this summary's coverage. */
+  coverage?: { retainedFromMessageId: string };
   model?: string;
   provider?: string;
   createdAt?: string;

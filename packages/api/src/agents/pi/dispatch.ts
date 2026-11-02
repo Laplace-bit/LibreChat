@@ -1,13 +1,19 @@
 import { UsageEvents } from 'librechat-data-provider';
+import { HumanMessage } from '@librechat/agents/langchain/messages';
+import type {
+  CompactionSemanticIndexSnapshot,
+  LCTool,
+  SummarizationTrigger,
+  ToolExecuteResult,
+} from '@librechat/agents';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
-import type { LCTool, ToolExecuteResult } from '@librechat/agents';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
+import type { PiManualCompactionConfiguration, PiManualCompactionSettings } from './compaction';
 import type { PiCallerToolCall, PiCallerToolDefinition } from './callerTools';
 import type { PiContentEventTranslatorOptions, PiHostEvent } from './events';
 import type { PiContextUsageProjectionInput } from './contextUsage';
 import type { UsageMetadata } from '~/stream/interfaces/IJobStore';
 import type { PiActionToolSchemaRegistry } from './actionSchema';
-import type { PiManualCompactionSettings } from './compaction';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
@@ -26,9 +32,13 @@ import {
   createPiTools,
   PiToolCompatibilityError,
 } from './tools';
+import {
+  buildPiManualCompactionInstruction,
+  PiCompactionConfigurationError,
+  resolvePiManualCompactionSettings,
+} from './compaction';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 import { createPiCallerToolDefinitions } from './callerTools';
-import { PiCompactionConfigurationError } from './compaction';
 import { createPiHostToolExecutor } from './toolExecution';
 import { createPiContentEventTranslator } from './events';
 import { appendPiToolResultContinuation } from './resume';
@@ -49,6 +59,36 @@ export class PiContextUsageUnavailableError extends Error {
     super('Pi could not produce the required host context-usage snapshot.');
     this.name = 'PiContextUsageUnavailableError';
   }
+}
+
+export class PiAutomaticSummaryFailedError extends Error {
+  readonly code = 'PI_AUTOMATIC_SUMMARY_FAILED';
+  readonly status = 503;
+  readonly statusCode = 503;
+
+  constructor() {
+    super('Pi could not create a complete conversation summary. The answer was not started.');
+    this.name = 'PiAutomaticSummaryFailedError';
+  }
+}
+
+export interface PiAutomaticSummaryInput {
+  enabled: boolean;
+  agentId: string;
+  agentProvider?: string;
+  agentModel?: string;
+  configuration?: PiManualCompactionConfiguration;
+  trigger?: SummarizationTrigger;
+  retainRecent?: { turns?: number; tokens?: number };
+  previousSummary?: string;
+  semanticIndex?: CompactionSemanticIndexSnapshot;
+  summaryVersion: number;
+  countSummaryTokens(text: string): number;
+  buildPrimaryMessages(input: {
+    summaryText: string;
+    summaryTokenCount: number;
+    retainedMessages: BaseMessage[];
+  }): BaseMessage[];
 }
 
 export interface PiGenerationDispatchInput {
@@ -81,6 +121,8 @@ export interface PiGenerationDispatchInput {
     messagesToRefineCount: number;
     summaryVersion: number;
     countSummaryTokens(text: string): number;
+    coverage?: { retainedFromMessageId: string };
+    onComplete?(summaryText: string, summaryTokenCount: number): void;
   };
   /** Host-generated identities for LibreChat tool call steps. */
   createToolStepIdentity?(): PiMessageStepIdentity;
@@ -93,6 +135,8 @@ export interface PiGenerationDispatchInput {
   contextUsage?: Omit<PiContextUsageProjectionInput, 'messages' | 'model' | 'provider'>;
   /** Existing host tool-result caps for an ordinary, non-resumed provider projection. */
   contextPruning?: PiHistoryPruningOptions;
+  /** Host-owned automatic summary configuration and compacted-prompt builder. */
+  autoSummary?: PiAutomaticSummaryInput;
   /** Exact approved tool exchange to continue without replaying the user prompt. */
   resumeToolResult?: {
     continuation: PiToolResultContinuation;
@@ -127,7 +171,9 @@ export function createPiGenerationDispatcher(
 ): (input: PiGenerationDispatchInput) => Promise<PiGenerationDispatchResult> {
   const execute = dependencies.execute ?? createPiGenerationExecutor();
 
-  return async (input) => {
+  const dispatch = async (
+    input: PiGenerationDispatchInput,
+  ): Promise<PiGenerationDispatchResult> => {
     if (input.signal?.aborted) {
       return { status: 'cancelled', usage: [] };
     }
@@ -274,6 +320,15 @@ export function createPiGenerationDispatcher(
               model: modelBinding.model,
               tokenCounter: input.contextUsage.tokenCounter,
               pruning: input.contextPruning,
+              ...(input.autoSummary?.enabled === true &&
+              input.autoSummary.configuration?.enabled !== false
+                ? {
+                    automaticCompaction: {
+                      trigger: input.autoSummary.trigger,
+                      retainRecent: input.autoSummary.retainRecent,
+                    },
+                  }
+                : {}),
             })
           : {
               messages: input.messages,
@@ -283,6 +338,116 @@ export function createPiGenerationDispatcher(
               }),
               pruned: false,
             };
+      const automaticCompactionPlan =
+        'compactionPlan' in historyProjection ? historyProjection.compactionPlan : undefined;
+
+      if (
+        automaticCompactionPlan != null &&
+        input.autoSummary != null &&
+        input.contextUsage != null
+      ) {
+        const settings = resolvePiManualCompactionSettings({
+          agentProvider: input.autoSummary.agentProvider,
+          agentModel: input.autoSummary.agentModel,
+          configured: input.autoSummary.configuration,
+        });
+        const summaryInstruction = buildPiManualCompactionInstruction({
+          settings,
+          previousSummary: input.autoSummary.previousSummary,
+          semanticIndex: input.autoSummary.semanticIndex,
+        });
+        const summaryMessages = [
+          ...automaticCompactionPlan.systemMessages,
+          ...automaticCompactionPlan.messagesToSummarize,
+          new HumanMessage(summaryInstruction),
+        ];
+        if (
+          projectPiContextUsage({
+            messages: summaryMessages,
+            model: modelBinding.model,
+            ...input.contextUsage,
+            provider: input.usageAttribution?.provider,
+          }) == null
+        ) {
+          throw new PiContextUsageUnavailableError();
+        }
+        let summaryBindingAvailable = true;
+        let summaryResult: { text: string; tokenCount: number } | undefined;
+        const summaryOutcome = await dispatch({
+          ...input,
+          messages: summaryMessages,
+          createModelBinding: async () => {
+            if (summaryBindingAvailable) {
+              summaryBindingAvailable = false;
+              bindingTransferred = true;
+              return modelBinding;
+            }
+            return input.createModelBinding();
+          },
+          toolDefinitions: [],
+          clientToolDefinitions: [],
+          mcpToolSchemas: undefined,
+          actionToolSchemas: undefined,
+          executeHostToolCall: undefined,
+          getCodeSessionContext: undefined,
+          initialToolUsageCounts: undefined,
+          toolExecutionGate: undefined,
+          askUserQuestionEnabled: false,
+          contextUsage: undefined,
+          contextPruning: undefined,
+          autoSummary: undefined,
+          resumeToolResult: undefined,
+          onTurnEnd: undefined,
+          summaryOnly: {
+            settings,
+            agentId: input.autoSummary.agentId,
+            messagesToRefineCount: automaticCompactionPlan.messagesToSummarize.length,
+            summaryVersion: input.autoSummary.summaryVersion,
+            countSummaryTokens: input.autoSummary.countSummaryTokens,
+            coverage: automaticCompactionPlan.coverage,
+            onComplete: (text, tokenCount) => {
+              summaryResult = { text, tokenCount };
+            },
+          },
+        });
+
+        if (summaryBindingAvailable) {
+          await disposeUntransferredBinding();
+        }
+        if (summaryOutcome.status !== 'completed') {
+          return {
+            ...summaryOutcome,
+            usage: [...usage, ...summaryOutcome.usage],
+          };
+        }
+        if (summaryResult == null || summaryResult.text.length === 0) {
+          throw new PiAutomaticSummaryFailedError();
+        }
+        if (input.signal?.aborted) {
+          return { status: 'cancelled', usage: [...usage, ...summaryOutcome.usage] };
+        }
+
+        const primaryMessages = input.autoSummary.buildPrimaryMessages({
+          summaryText: summaryResult.text,
+          summaryTokenCount: summaryResult.tokenCount,
+          retainedMessages: automaticCompactionPlan.retainedMessages,
+        });
+        const primaryOutcome = await dispatch({
+          ...input,
+          messages: primaryMessages,
+          contextPruning: undefined,
+          autoSummary: undefined,
+          contextUsage: {
+            ...input.contextUsage,
+            summaryTokens: summaryResult.tokenCount,
+          },
+        });
+        return {
+          ...primaryOutcome,
+          usage: [...usage, ...summaryOutcome.usage, ...primaryOutcome.usage],
+        };
+      }
+
       const { conversion } = historyProjection;
       const translateEvent = createPiContentEventTranslator({
         createStepIdentity: input.createStepIdentity,
@@ -305,6 +470,12 @@ export function createPiGenerationDispatcher(
                 summaryVersion: input.summaryOnly.summaryVersion,
                 streamDeltas: input.summaryOnly.settings.streamDeltas,
                 countSummaryTokens: input.summaryOnly.countSummaryTokens,
+                ...(input.summaryOnly.coverage == null
+                  ? {}
+                  : { coverage: input.summaryOnly.coverage }),
+                ...(input.summaryOnly.onComplete == null
+                  ? {}
+                  : { onComplete: input.summaryOnly.onComplete }),
               },
             }),
       });
@@ -404,6 +575,8 @@ export function createPiGenerationDispatcher(
       throw error;
     }
   };
+
+  return dispatch;
 }
 
 export const executePiGeneration: ReturnType<typeof createPiGenerationDispatcher> =

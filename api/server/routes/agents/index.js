@@ -21,6 +21,7 @@ const {
   isPrivateTextChatSubmission,
   isPreDenialTextSubmission,
   createPiRegenerationAdmission,
+  isPiRegenerationAdmissionCandidate,
   saveAbortedUserMessage,
   isAgentTriggerRequest,
   exemptAgentTriggerFromIpLimiter,
@@ -79,6 +80,8 @@ const { v1 } = require('./v1');
 const chat = require('./chat');
 
 const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
+const useMessageIpLimiter = isEnabled(LIMIT_MESSAGE_IP);
+const useMessageUserLimiter = isEnabled(LIMIT_MESSAGE_USER);
 
 /** Applies `limiter` unless this trusted loopback request should skip it. */
 const unless = (isExempt, limiter) => (req, res, next) =>
@@ -170,12 +173,57 @@ const privateTextIngress = createPrivateTextIngress({
   getKey: () => process.env.CREDS_KEY ?? '',
 });
 const chatConfigMiddleware = unless((req) => req.config != null, configMiddleware);
+const runForPiRegenerationAdmission = (middleware) => (req, res, next) =>
+  isPiRegenerationAdmissionCandidate(req) ? middleware(req, res, next) : next();
+const piRegenerationAdmissionLimiters = [];
+if (useMessageIpLimiter || useMessageUserLimiter) {
+  piRegenerationAdmissionLimiters.push(runForPiRegenerationAdmission(chatConfigMiddleware));
+  piRegenerationAdmissionLimiters.push(
+    runForPiRegenerationAdmission(
+      unless(
+        (req) => exemptAgentTriggerFromIpLimiter(req) || exemptScheduleFromUserLimiter(req),
+        generationRetryProbeLimiter,
+      ),
+    ),
+  );
+  piRegenerationAdmissionLimiters.push(runForPiRegenerationAdmission(detectGenerationRetry));
+  piRegenerationAdmissionLimiters.push(
+    runForPiRegenerationAdmission(
+      unless(
+        (req) => exemptAgentTriggerFromIpLimiter(req) || exemptScheduleFromUserLimiter(req),
+        generationRetryLimiter,
+      ),
+    ),
+  );
+}
+if (useMessageIpLimiter) {
+  piRegenerationAdmissionLimiters.push(
+    runForPiRegenerationAdmission(unless(exemptAgentTriggerFromIpLimiter, messageIpLimiter)),
+  );
+}
+if (useMessageUserLimiter) {
+  piRegenerationAdmissionLimiters.push(
+    runForPiRegenerationAdmission(
+      unless(
+        (req) => exemptScheduleFromUserLimiter(req) || isConfirmedGenerationRetry(req),
+        messageUserLimiter,
+      ),
+    ),
+  );
+}
+const markPiRegenerationAdmissionLimitersRun = (req, _res, next) => {
+  req._piRegenerationAdmissionLimitersRun =
+    piRegenerationAdmissionLimiters.length > 0 && isPiRegenerationAdmissionCandidate(req);
+  next();
+};
 /** Restore the original turn before the private-text ingress sees submitted content. */
 const restorePiRegeneration = createPiRegenerationAdmission({
-  getMessages: (filter) => getMessages(filter, '+privateTextTokens', { limit: 2 }),
+  getMessages: (filter) => getMessages(filter, '+privateTextTokens'),
 });
 router.use(
   '/chat',
+  markPiRegenerationAdmissionLimitersRun,
+  ...piRegenerationAdmissionLimiters,
   restorePiRegeneration,
   unless((req) => !isPreDenialTextSubmission(req), configMiddleware),
   unless((req) => !isPrivateTextChatSubmission(req), privateTextIngress),
@@ -1231,33 +1279,48 @@ router.delete(
 router.use('/', v1);
 
 const chatRouter = express.Router();
-const useMessageIpLimiter = isEnabled(LIMIT_MESSAGE_IP);
-const useMessageUserLimiter = isEnabled(LIMIT_MESSAGE_USER);
 chatRouter.use(chatConfigMiddleware);
 if (useMessageIpLimiter || useMessageUserLimiter) {
   chatRouter.use(
     unless(
-      (req) => exemptAgentTriggerFromIpLimiter(req) || exemptScheduleFromUserLimiter(req),
+      (req) =>
+        req._piRegenerationAdmissionLimitersRun === true ||
+        exemptAgentTriggerFromIpLimiter(req) ||
+        exemptScheduleFromUserLimiter(req),
       generationRetryProbeLimiter,
     ),
   );
-  chatRouter.use(detectGenerationRetry);
+  chatRouter.use(
+    unless((req) => req._piRegenerationAdmissionLimitersRun === true, detectGenerationRetry),
+  );
   chatRouter.use(
     unless(
-      (req) => exemptAgentTriggerFromIpLimiter(req) || exemptScheduleFromUserLimiter(req),
+      (req) =>
+        req._piRegenerationAdmissionLimitersRun === true ||
+        exemptAgentTriggerFromIpLimiter(req) ||
+        exemptScheduleFromUserLimiter(req),
       generationRetryLimiter,
     ),
   );
 }
 
 if (useMessageIpLimiter) {
-  chatRouter.use(unless(exemptAgentTriggerFromIpLimiter, messageIpLimiter));
+  chatRouter.use(
+    unless(
+      (req) =>
+        req._piRegenerationAdmissionLimitersRun === true || exemptAgentTriggerFromIpLimiter(req),
+      messageIpLimiter,
+    ),
+  );
 }
 
 if (useMessageUserLimiter) {
   chatRouter.use(
     unless(
-      (req) => exemptScheduleFromUserLimiter(req) || isConfirmedGenerationRetry(req),
+      (req) =>
+        req._piRegenerationAdmissionLimitersRun === true ||
+        exemptScheduleFromUserLimiter(req) ||
+        isConfirmedGenerationRetry(req),
       messageUserLimiter,
     ),
   );

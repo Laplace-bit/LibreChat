@@ -427,35 +427,23 @@ describe('BaseClient', () => {
         shouldSummarize: false,
         addPreviousAttachments: async (messages) => messages,
       });
-      getMessages.mockResolvedValueOnce([
-        {
-          user: 'user-1',
-          tenantId: 'tenant-1',
-          conversationId: 'convo-1',
-          messageId: 'source-user',
-          parentMessageId: 'source-parent',
-          isCreatedByUser: true,
-          text: 'stored input',
-        },
-      ]);
-
       await expect(
         client.loadHistory('convo-1', 'source-user', {
           isPiRegenerate: true,
           request,
           userMessageId: 'source-user',
         }),
-      ).rejects.toMatchObject({ code: 'PI_REGENERATION_SOURCE_CHANGED', statusCode: 409 });
+      ).rejects.toMatchObject({ code: 'PI_HISTORY_CONFLICT', statusCode: 409, retryable: true });
     });
 
-    test('fails closed when the source changes after regeneration admission', async () => {
+    test('uses the confirmed tenant-scoped history snapshot without a third database read', async () => {
       const { createPiRegenerationAdmission } = require('@librechat/api');
       const source = {
         user: 'user-1',
         tenantId: 'tenant-1',
         conversationId: 'convo-1',
         messageId: 'source-user',
-        parentMessageId: 'source-parent',
+        parentMessageId: Constants.NO_PARENT,
         isCreatedByUser: true,
         text: 'stored input',
         files: [],
@@ -490,26 +478,163 @@ describe('BaseClient', () => {
         addPreviousAttachments: async (messages) => messages,
         onHistoryLoaded: jest.fn(),
       });
-      getMessages.mockResolvedValueOnce([{ ...source, text: 'changed after admission' }]);
+      const messages = await client.loadHistory(source.conversationId, source.messageId, {
+        isPiRegenerate: true,
+        request,
+        userMessageId: source.messageId,
+      });
 
+      expect(messages.map((message) => message.text)).toEqual(['stored input']);
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(client.onHistoryLoaded).toHaveBeenCalledTimes(1);
       await expect(
         client.loadHistory(source.conversationId, source.messageId, {
           isPiRegenerate: true,
           request,
           userMessageId: source.messageId,
         }),
-      ).rejects.toMatchObject({ code: 'PI_REGENERATION_SOURCE_CHANGED', statusCode: 409 });
-      expect(client.onHistoryLoaded).not.toHaveBeenCalled();
+      ).rejects.toMatchObject({ code: 'PI_HISTORY_CONFLICT', statusCode: 409, retryable: true });
+      expect(client.onHistoryLoaded).toHaveBeenCalledTimes(1);
     });
 
-    test('fails closed when the source disappears after regeneration admission', async () => {
+    test('uses the confirmed ancestor snapshot when the stored ancestor later changes', async () => {
+      const { createPiRegenerationAdmission } = require('@librechat/api');
+      const ancestor = {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: 'convo-1',
+        messageId: 'ancestor',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: false,
+        text: 'prior context',
+      };
+      const source = {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: 'convo-1',
+        messageId: 'source-user',
+        parentMessageId: ancestor.messageId,
+        isCreatedByUser: true,
+        text: 'stored input',
+        files: [],
+      };
+      const request = {
+        method: 'POST',
+        path: '/',
+        body: {
+          isRegenerate: true,
+          conversationId: source.conversationId,
+          parentMessageId: source.parentMessageId,
+          overrideParentMessageId: source.messageId,
+        },
+        user: { id: source.user, tenantId: source.tenantId },
+      };
+      const persistedRows = [ancestor, source];
+      const admission = createPiRegenerationAdmission({
+        getMessages: async () => structuredClone(persistedRows),
+      });
+      await new Promise((resolve, reject) => {
+        admission(request, { status: jest.fn().mockReturnThis(), json: jest.fn() }, (error) =>
+          error ? reject(error) : resolve(),
+        );
+      });
+      const client = Object.assign(Object.create(BaseClientClass.prototype), {
+        user: source.user,
+        options: { req: request },
+        getMessageMapMethod: null,
+        shouldSummarize: false,
+        addPreviousAttachments: async (messages) => messages,
+        onHistoryLoaded: jest.fn(),
+      });
+      const messages = await client.loadHistory(source.conversationId, source.messageId, {
+        isPiRegenerate: true,
+        request,
+        userMessageId: source.messageId,
+      });
+
+      persistedRows[0].text = 'changed after admission';
+      expect(messages.map((message) => message.text)).toEqual(['prior context', 'stored input']);
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(client.onHistoryLoaded).toHaveBeenCalledTimes(1);
+    });
+
+    test('keeps sibling messages out of client history state', async () => {
+      const { createPiRegenerationAdmission } = require('@librechat/api');
+      const ancestor = {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: 'convo-1',
+        messageId: 'ancestor',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: false,
+        text: 'prior context',
+      };
+      const source = {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: 'convo-1',
+        messageId: 'source-user',
+        parentMessageId: ancestor.messageId,
+        isCreatedByUser: true,
+        text: 'stored input',
+        files: [],
+      };
+      const sibling = {
+        ...source,
+        messageId: 'sibling-user',
+        text: 'another branch',
+      };
+      const request = {
+        method: 'POST',
+        path: '/',
+        body: {
+          isRegenerate: true,
+          conversationId: source.conversationId,
+          parentMessageId: source.parentMessageId,
+          overrideParentMessageId: source.messageId,
+        },
+        user: { id: source.user, tenantId: source.tenantId },
+      };
+      const admission = createPiRegenerationAdmission({
+        getMessages: async () => [ancestor, source, sibling],
+      });
+      await new Promise((resolve, reject) => {
+        admission(request, { status: jest.fn().mockReturnThis(), json: jest.fn() }, (error) =>
+          error ? reject(error) : resolve(),
+        );
+      });
+      const client = Object.assign(Object.create(BaseClientClass.prototype), {
+        user: source.user,
+        options: { req: request },
+        getMessageMapMethod: null,
+        shouldSummarize: false,
+        addPreviousAttachments: async (messages) => messages,
+        onHistoryLoaded: jest.fn(),
+      });
+      const messages = await client.loadHistory(source.conversationId, source.messageId, {
+        isPiRegenerate: true,
+        request,
+        userMessageId: source.messageId,
+      });
+
+      expect(messages.map((message) => message.messageId)).toEqual(['ancestor', 'source-user']);
+      expect(messages.some((message) => message.messageId === 'sibling-user')).toBe(false);
+      expect(client.onHistoryLoaded).toHaveBeenCalledWith([ancestor, source]);
+      expect(getMessages).not.toHaveBeenCalled();
+      expect(client.onHistoryLoaded).toHaveBeenCalledTimes(1);
+    });
+
+    test.each([
+      ['message', 'convo-1', 'different-message'],
+      ['conversation', 'other-convo', 'source-user'],
+    ])('rejects a history walk with a mismatched %s', async (_field, conversationId, messageId) => {
       const { createPiRegenerationAdmission } = require('@librechat/api');
       const source = {
         user: 'user-1',
         tenantId: 'tenant-1',
         conversationId: 'convo-1',
         messageId: 'source-user',
-        parentMessageId: 'source-parent',
+        parentMessageId: Constants.NO_PARENT,
         isCreatedByUser: true,
         text: 'stored input',
         files: [],
@@ -541,15 +666,14 @@ describe('BaseClient', () => {
         addPreviousAttachments: async (messages) => messages,
         onHistoryLoaded: jest.fn(),
       });
-      getMessages.mockResolvedValueOnce([]);
 
       await expect(
-        client.loadHistory(source.conversationId, source.messageId, {
+        client.loadHistory(conversationId, messageId, {
           isPiRegenerate: true,
           request,
           userMessageId: source.messageId,
         }),
-      ).rejects.toMatchObject({ code: 'PI_REGENERATION_SOURCE_CHANGED', statusCode: 409 });
+      ).rejects.toMatchObject({ code: 'PI_HISTORY_CONFLICT', statusCode: 409, retryable: true });
       expect(client.onHistoryLoaded).not.toHaveBeenCalled();
     });
 

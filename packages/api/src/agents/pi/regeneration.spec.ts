@@ -1,8 +1,10 @@
 import express from 'express';
 import request from 'supertest';
+import { Constants } from 'librechat-data-provider';
 import {
   createPiRegenerationAdmission,
   isPiRegenerationRequest,
+  matchesPiRegenerationHistory,
   matchesPiRegenerationSnapshot,
   preparePiRegenerationRequest,
   resolvePiRegenerationUser,
@@ -28,7 +30,7 @@ describe('Pi regeneration admission', () => {
     tenantId: 'tenant-1',
     conversationId: 'conversation-1',
     messageId: 'user-message',
-    parentMessageId: 'parent-message',
+    parentMessageId: Constants.NO_PARENT,
     isCreatedByUser: true,
     text: 'saved input',
     files: [{ file_id: 'saved-file', filename: 'saved.txt' }],
@@ -62,6 +64,20 @@ describe('Pi regeneration admission', () => {
       res.json({
         body: req.body,
         snapshotMatches: matchesPiRegenerationSnapshot(req, row),
+        historyMatches: matchesPiRegenerationHistory(
+          req,
+          [row],
+          row.messageId,
+          row.conversationId,
+          row.user,
+        ),
+        wrongUserHistoryMatches: matchesPiRegenerationHistory(
+          req,
+          [row],
+          row.messageId,
+          row.conversationId,
+          'other-user',
+        ),
         changedMatches: matchesPiRegenerationSnapshot(req, {
           ...row,
           text: 'changed concurrently',
@@ -87,8 +103,8 @@ describe('Pi regeneration admission', () => {
       user: 'user-1',
       tenantId: 'tenant-1',
       conversationId: row.conversationId,
-      messageId: row.messageId,
     });
+    expect(getMessages).toHaveBeenCalledTimes(1);
     expect(response.body.body).toMatchObject({
       text: row.text,
       files: row.files,
@@ -98,10 +114,173 @@ describe('Pi regeneration admission', () => {
       reasoningOverride: row.reasoningOverride,
     });
     expect(response.body.snapshotMatches).toBe(true);
+    expect(response.body.historyMatches).toBe(true);
+    expect(response.body.wrongUserHistoryMatches).toBe(false);
     expect(response.body.changedMatches).toBe(false);
     expect(response.body.changedFileMatches).toBe(false);
     expect(response.body.changedContentMatches).toBe(false);
     expect(response.body.changedRoleMatches).toBe(false);
+  });
+
+  it('pins the branch returned by one scoped admission read', async () => {
+    const ancestor = {
+      user: row.user,
+      tenantId: row.tenantId,
+      conversationId: row.conversationId,
+      messageId: 'parent-message',
+      parentMessageId: Constants.NO_PARENT,
+      isCreatedByUser: false,
+      text: 'prior context',
+    };
+    const branchRow = { ...row, parentMessageId: ancestor.messageId };
+    const persistedRows = [ancestor, branchRow];
+    const getMessages = jest.fn(async () => structuredClone(persistedRows));
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: branchRow.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages,
+    });
+
+    expect(result.kind).toBe('ready');
+    if (result.kind !== 'ready') throw new Error('expected admission');
+    persistedRows[0].text = 'changed after admission';
+    expect((result.history[0] as { text: string }).text).toBe('prior context');
+    expect(getMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps siblings out of the admitted branch', async () => {
+    const ancestor = {
+      user: row.user,
+      tenantId: row.tenantId,
+      conversationId: row.conversationId,
+      messageId: 'parent-message',
+      parentMessageId: Constants.NO_PARENT,
+      isCreatedByUser: false,
+      text: 'prior context',
+    };
+    const branchRow = { ...row, parentMessageId: ancestor.messageId };
+    const sibling = {
+      ...branchRow,
+      messageId: 'sibling-user',
+      parentMessageId: ancestor.messageId,
+      text: 'other branch',
+    };
+    const getMessages = jest.fn().mockResolvedValue([ancestor, branchRow, sibling]);
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: branchRow.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages,
+    });
+
+    expect(result.kind).toBe('ready');
+    if (result.kind !== 'ready') throw new Error('expected admission');
+    expect(result.history.map((message) => (message as { messageId: string }).messageId)).toEqual([
+      ancestor.messageId,
+      branchRow.messageId,
+    ]);
+    expect(getMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an incomplete parent chain', async () => {
+    const brokenRow = { ...row, parentMessageId: 'missing-parent' };
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: brokenRow.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages: async () => [brokenRow],
+    });
+
+    expect(result).toEqual({ kind: 'unavailable' });
+  });
+
+  it('treats an absent ancestor parent as a root message', async () => {
+    const ancestor = {
+      user: row.user,
+      tenantId: row.tenantId,
+      conversationId: row.conversationId,
+      messageId: 'legacy-root',
+      isCreatedByUser: false,
+      text: 'prior context',
+    };
+    const source = { ...row, parentMessageId: ancestor.messageId };
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: source.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages: async () => [ancestor, source],
+    });
+
+    expect(result.kind).toBe('ready');
+    if (result.kind !== 'ready') throw new Error('expected admission');
+    expect(result.history.map((message) => (message as { messageId: string }).messageId)).toEqual([
+      ancestor.messageId,
+      source.messageId,
+    ]);
+  });
+
+  it('rejects a cyclic parent chain', async () => {
+    const source = { ...row, parentMessageId: 'cycle-parent' };
+    const cycleParent = {
+      user: row.user,
+      tenantId: row.tenantId,
+      conversationId: row.conversationId,
+      messageId: 'cycle-parent',
+      parentMessageId: source.messageId,
+      isCreatedByUser: false,
+      text: 'cycle',
+    };
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: source.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages: async () => [source, cycleParent],
+    });
+
+    expect(result).toEqual({ kind: 'unavailable' });
+  });
+
+  it('rejects duplicate message IDs in the scoped history', async () => {
+    const ancestor = {
+      user: row.user,
+      tenantId: row.tenantId,
+      conversationId: row.conversationId,
+      messageId: 'parent-message',
+      parentMessageId: Constants.NO_PARENT,
+      isCreatedByUser: false,
+      text: 'prior context',
+    };
+    const source = { ...row, parentMessageId: ancestor.messageId };
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: source.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages: async () => [ancestor, source, { ...ancestor, text: 'duplicate row' }],
+    });
+
+    expect(result).toEqual({ kind: 'unavailable' });
+  });
+
+  it('rejects an ancestor returned from another tenant', async () => {
+    const ancestor = {
+      user: row.user,
+      tenantId: 'tenant-2',
+      conversationId: row.conversationId,
+      messageId: 'parent-message',
+      parentMessageId: Constants.NO_PARENT,
+      isCreatedByUser: false,
+      text: 'other tenant context',
+    };
+    const branchRow = { ...row, parentMessageId: ancestor.messageId };
+    const result = await preparePiRegenerationRequest({
+      body: { ...body, parentMessageId: branchRow.parentMessageId },
+      userId: row.user,
+      tenantId: row.tenantId,
+      getMessages: async () => [ancestor, branchRow],
+    });
+
+    expect(result).toEqual({ kind: 'unavailable' });
   });
 
   it.each([

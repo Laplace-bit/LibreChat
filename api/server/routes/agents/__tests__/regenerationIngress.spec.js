@@ -1,12 +1,40 @@
 const express = require('express');
 const request = require('supertest');
 
+const mockEvents = [];
 const mockGetMessages = jest.fn();
-const mockPrivateIngress = jest.fn((req, _res, next) => next());
+const mockPrivateIngress = jest.fn((req, _res, next) => {
+  mockEvents.push('private-text');
+  next();
+});
+const mockMessageIpLimiter = jest.fn((_req, _res, next) => {
+  mockEvents.push('message-ip');
+  next();
+});
+const mockRetryProbeLimiter = (_req, _res, next) => {
+  mockEvents.push('retry-probe');
+  next();
+};
+const mockDetectGenerationRetry = (_req, _res, next) => {
+  mockEvents.push('detect-retry');
+  next();
+};
+const mockGenerationRetryLimiter = (_req, _res, next) => {
+  mockEvents.push('retry-limit');
+  next();
+};
+
+const originalMessageIpLimit = process.env.LIMIT_MESSAGE_IP;
+const originalMessageUserLimit = process.env.LIMIT_MESSAGE_USER;
+process.env.LIMIT_MESSAGE_IP = 'true';
+process.env.LIMIT_MESSAGE_USER = 'false';
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
-  isEnabled: () => false,
+  isEnabled: (value) => value === 'true',
+  generationRetryProbeLimiter: mockRetryProbeLimiter,
+  detectGenerationRetry: mockDetectGenerationRetry,
+  generationRetryLimiter: mockGenerationRetryLimiter,
   createPrivateTextIngress: () => mockPrivateIngress,
 }));
 jest.mock('~/models', () => ({ getMessages: (...args) => mockGetMessages(...args) }));
@@ -19,6 +47,7 @@ jest.mock('~/server/middleware', () => ({
     req.config = {};
     next();
   },
+  messageIpLimiter: mockMessageIpLimiter,
   checkBan: (_req, _res, next) => next(),
   uaParser: (_req, _res, next) => next(),
   moderateText: (_req, _res, next) => next(),
@@ -54,6 +83,16 @@ jest.mock('~/server/services/Schedules', () => ({
 }));
 
 const router = require('../index');
+if (originalMessageIpLimit == null) {
+  delete process.env.LIMIT_MESSAGE_IP;
+} else {
+  process.env.LIMIT_MESSAGE_IP = originalMessageIpLimit;
+}
+if (originalMessageUserLimit == null) {
+  delete process.env.LIMIT_MESSAGE_USER;
+} else {
+  process.env.LIMIT_MESSAGE_USER = originalMessageUserLimit;
+}
 const app = express();
 app.use(express.json());
 app.use('/api/agents', router);
@@ -85,7 +124,22 @@ describe('Pi regeneration ingress', () => {
   };
   beforeEach(() => {
     jest.clearAllMocks();
-    mockGetMessages.mockResolvedValue([row]);
+    mockEvents.length = 0;
+    mockGetMessages.mockImplementation(async () => {
+      mockEvents.push('messages');
+      return [
+        {
+          user: row.user,
+          tenantId: row.tenantId,
+          conversationId: row.conversationId,
+          messageId: row.parentMessageId,
+          parentMessageId: null,
+          isCreatedByUser: false,
+          text: 'prior context',
+        },
+        row,
+      ];
+    });
   });
 
   it('restores the authorized saved content before private-text ingress', async () => {
@@ -96,11 +150,13 @@ describe('Pi regeneration ingress', () => {
         user: row.user,
         tenantId: row.tenantId,
         conversationId: row.conversationId,
-        messageId: row.messageId,
       },
       expect.any(String),
-      { limit: 2 },
     );
+    expect(mockGetMessages).toHaveBeenCalledTimes(1);
+    expect(mockMessageIpLimiter).toHaveBeenCalledTimes(1);
+    expect(mockEvents.indexOf('message-ip')).toBeLessThan(mockEvents.indexOf('messages'));
+    expect(mockEvents.indexOf('messages')).toBeLessThan(mockEvents.indexOf('private-text'));
     expect(mockPrivateIngress).toHaveBeenCalledTimes(1);
     expect(mockPrivateIngress.mock.calls[0][0].body).toMatchObject({
       text: row.text,

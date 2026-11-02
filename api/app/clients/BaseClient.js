@@ -41,6 +41,8 @@ const {
   persistedReasoningOverrideFields,
   isTemporaryTurn,
   resolvePiRegenerationUser,
+  consumePiRegenerationHistory,
+  matchesPiRegenerationHistory,
   matchesPiRegenerationSnapshot,
 } = require('@librechat/api');
 const {
@@ -1294,24 +1296,47 @@ class BaseClient {
   async loadHistory(conversationId, parentMessageId = null, regeneration = undefined) {
     logger.debug('[BaseClient] Loading history:', { conversationId, parentMessageId });
 
+    const isPiRegenerate = regeneration?.isPiRegenerate === true;
+    if (isPiRegenerate && parentMessageId !== regeneration.userMessageId) {
+      consumePiRegenerationHistory(regeneration.request);
+      throw Object.assign(
+        new Error('The conversation changed. Refresh the conversation and try again.'),
+        { statusCode: 409, code: 'PI_HISTORY_CONFLICT', retryable: true },
+      );
+    }
+
     /** No message has the root sentinel as its id, so the chain walk from it is empty. */
-    if (parentMessageId === Constants.NO_PARENT) {
+    if (parentMessageId === Constants.NO_PARENT && !isPiRegenerate) {
       return [];
     }
 
-    const messages =
-      (await db.getMessages({ conversationId, user: this.user }, '+privateTextTokens')) ?? [];
-    if (regeneration?.isPiRegenerate === true) {
+    const messages = isPiRegenerate
+      ? consumePiRegenerationHistory(regeneration.request)
+      : ((await db.getMessages({ conversationId, user: this.user }, '+privateTextTokens')) ?? []);
+    if (isPiRegenerate && !Array.isArray(messages)) {
+      throw Object.assign(
+        new Error('The source message changed. Refresh the conversation and try again.'),
+        { statusCode: 409, code: 'PI_HISTORY_CONFLICT', retryable: true },
+      );
+    }
+    if (isPiRegenerate) {
       const sourceRows = messages.filter(
         (message) => message.messageId === regeneration.userMessageId,
       );
       if (
         sourceRows.length !== 1 ||
-        !matchesPiRegenerationSnapshot(regeneration.request, sourceRows[0])
+        !matchesPiRegenerationSnapshot(regeneration.request, sourceRows[0]) ||
+        !matchesPiRegenerationHistory(
+          regeneration.request,
+          messages,
+          regeneration.userMessageId,
+          conversationId,
+          this.user,
+        )
       ) {
         throw Object.assign(
-          new Error('The source message changed. Refresh the conversation and try again.'),
-          { statusCode: 409, code: 'PI_REGENERATION_SOURCE_CHANGED' },
+          new Error('The conversation changed. Refresh the conversation and try again.'),
+          { statusCode: 409, code: 'PI_HISTORY_CONFLICT', retryable: true },
         );
       }
     }

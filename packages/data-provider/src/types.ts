@@ -147,6 +147,8 @@ export type TPayload = Partial<TMessage> &
   Partial<TEndpointOption> & {
     isContinued: boolean;
     isRegenerate?: boolean;
+    /** Exact saved assistant response to continue. The server authorizes and reloads it. */
+    continuationTargetMessageId?: string;
     /** Manual context compaction: summarize the branch up to `parentMessageId`
      *  and end without a reply. No user message is created. */
     compact?: boolean;
@@ -205,6 +207,8 @@ export type TSubmission = {
   userMessage: TMessage;
   isEdited?: boolean;
   isContinued?: boolean;
+  /** Exact saved assistant response selected for continuation. */
+  continuationTargetMessageId?: string;
   isTemporary: boolean;
   messages: TMessage[];
   /** Client-only full message context used to restore branch siblings after scoped regenerate. */

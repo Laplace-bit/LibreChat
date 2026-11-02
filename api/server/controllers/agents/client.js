@@ -68,6 +68,7 @@ const {
   canAgentGraphPause,
   buildToolApprovalHooks,
   collectAttachedCodeEnvironmentAgentIds,
+  collectDirectAttachedCodeEnvironmentAgentIds,
   collectAttachedCodeApprovalPolicies,
   resolvePersistedCodeApprovalMode,
   getCodeApprovalPreservedFields,
@@ -2266,9 +2267,14 @@ class AgentClient extends BaseClient {
 
     const agentsEConfig = this.options.req.config?.endpoints?.[EModelEndpoint.agents];
     const topLevelAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
+    const isPiRuntime = this.options.agentRuntime?.engine === 'pi';
+    const codeApprovalPolicyRoots = isPiRuntime ? [this.options.agent] : topLevelAgents;
+    const codeApprovalPolicies = collectAttachedCodeApprovalPolicies(codeApprovalPolicyRoots, {
+      includeSubagents: !isPiRuntime,
+    });
     const codeApprovalMode = resolvePersistedCodeApprovalMode({
       requested: this.options.req.body.codeApprovalMode,
-      policies: collectAttachedCodeApprovalPolicies(topLevelAgents),
+      policies: codeApprovalPolicies,
       approvalsEnabled: agentsEConfig?.toolApproval?.enabled !== false,
     });
     const persistedCodeEnvironmentDecision = resolvePersistableCodeEnvironmentDecision({
@@ -2301,10 +2307,14 @@ class AgentClient extends BaseClient {
 
   getTurnConversationFields(options, conversationId, endpointOptions, context) {
     const topLevelAgents = [options.agent, ...(this.agentConfigs?.values() ?? [])];
+    const isPiRuntime = options.agentRuntime?.engine === 'pi';
+    const codeApprovalPolicyRoots = isPiRuntime ? [options.agent] : topLevelAgents;
     return {
       ...super.getTurnConversationFields(options, conversationId, endpointOptions, context),
       preservedFields: getCodeApprovalPreservedFields(
-        collectAttachedCodeApprovalPolicies(topLevelAgents),
+        collectAttachedCodeApprovalPolicies(codeApprovalPolicyRoots, {
+          includeSubagents: !isPiRuntime,
+        }),
         options.req?.config?.endpoints?.[EModelEndpoint.agents]?.toolApproval?.enabled !== false,
       ),
     };
@@ -2683,14 +2693,16 @@ class AgentClient extends BaseClient {
     }
   }
 
-  async loadHistory(conversationId, parentMessageId = null) {
+  async loadHistory(conversationId, parentMessageId = null, regeneration = undefined) {
     if (this.eventActorContinuation === 'warm') {
       logger.debug('[AgentClient] Skipping durable history for compatible event actor', {
         conversationId,
       });
       return [];
     }
-    return super.loadHistory(conversationId, parentMessageId);
+    return regeneration === undefined
+      ? super.loadHistory(conversationId, parentMessageId)
+      : super.loadHistory(conversationId, parentMessageId, regeneration);
   }
 
   async buildMessages(messages, parentMessageId, _buildOptions, opts) {
@@ -5528,8 +5540,11 @@ class AgentClient extends BaseClient {
       /** @type {AppConfig['endpoints']['agents']} */
       const agentsEConfig = appConfig.endpoints?.[EModelEndpoint.agents];
       const topLevelAgents = [this.options.agent, ...(this.agentConfigs?.values() ?? [])];
-      const attachedCodeEnvironmentAgentIds =
-        collectAttachedCodeEnvironmentAgentIds(topLevelAgents);
+      const isPiRuntime = this.options.agentRuntime?.engine === 'pi';
+      const codeApprovalPolicyAgents = isPiRuntime ? [this.options.agent] : topLevelAgents;
+      const attachedCodeEnvironmentAgentIds = isPiRuntime
+        ? collectDirectAttachedCodeEnvironmentAgentIds(codeApprovalPolicyAgents)
+        : collectAttachedCodeEnvironmentAgentIds(codeApprovalPolicyAgents);
       const effectiveToolApprovalPolicy = resolveToolApprovalPolicy({
         endpoint: agentsEConfig?.toolApproval,
         attachedCodeEnvironment: attachedCodeEnvironmentAgentIds.size > 0,
@@ -5801,13 +5816,26 @@ class AgentClient extends BaseClient {
           this.eventActorContinuation == null &&
           this.eventActorInvocationId == null &&
           this.eventActorCheckpointId == null;
+        const piOrdinaryTriggerEligible =
+          request?._piOrdinaryTriggerInvocationEligible === true &&
+          request?._isAgentTrigger === true &&
+          request?._agentEventBindingId == null &&
+          request?._agentEventBindingParentConversationId == null &&
+          request?._agentEventBindingParentAgentId == null &&
+          request?.resolvedConversation?.agentEventBinding == null &&
+          request?.body?.agentEventDelivery == null;
         if (
           this.eventActorContinuation != null ||
           this.eventActorInvocationId != null ||
           this.eventActorCheckpointId != null ||
           ((request?._isAgentTrigger === true ||
-            request?._agentEventBindingParentConversationId != null) &&
-            !piHistoryEventActorEligible)
+            request?._agentEventBindingId != null ||
+            request?._agentEventBindingParentConversationId != null ||
+            request?._agentEventBindingParentAgentId != null ||
+            request?.resolvedConversation?.agentEventBinding != null ||
+            request?.body?.agentEventDelivery != null) &&
+            !piHistoryEventActorEligible &&
+            !piOrdinaryTriggerEligible)
         ) {
           unsupportedModes.push('event_actor');
         }
@@ -5832,10 +5860,6 @@ class AgentClient extends BaseClient {
         ) {
           unsupportedModes.push('steer');
         }
-        if (attachedCodeEnvironmentAgentIds.size > 0) {
-          unsupportedModes.push('code_api_environment');
-        }
-
         const internalToolNames = new Set(['conditional_transfer']);
         askUserQuestionEnabled =
           !isCompactionTurn &&
@@ -5897,9 +5921,18 @@ class AgentClient extends BaseClient {
         }
         if (request?._isScheduledFire === true && !GenerationJobManager.isRedis) {
           const pluginHookSource = getPluginHookSource();
+          const scheduledAdmissionAgents = [
+            this.options.agent,
+            ...new Set(
+              [...(piSubagentPlan?.targets.values() ?? [])]
+                .filter(({ self }) => !self)
+                .map(({ agent }) => agent),
+            ),
+          ];
           const scheduledRunMayPause = canAgentGraphPause({
             policy: effectiveToolApprovalPolicy,
-            agents,
+            agents: scheduledAdmissionAgents,
+            includeSubagents: false,
             hostGeneratedToolNames:
               this.options.subagentTasks == null ? [] : [Constants.CHECK_BACKGROUND_TASK],
             resolvedProgrammaticHooks: resolvedToolApprovalHooks ?? [],
@@ -6627,7 +6660,10 @@ class AgentClient extends BaseClient {
       ) {
         unsupportedModes.push('unsupported_resume_context');
       }
-      if (collectAttachedCodeEnvironmentAgentIds(agents).size > 0) {
+      if (
+        piHasCodeExecutionTools &&
+        collectDirectAttachedCodeEnvironmentAgentIds(agents).size > 0
+      ) {
         unsupportedModes.push('code_api_environment');
       }
       if (piHasCodeExecutionTools && !isPiManagedCodeExecutionCompatible(this.options.agent)) {

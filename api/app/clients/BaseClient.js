@@ -41,6 +41,7 @@ const {
   persistedReasoningOverrideFields,
   isTemporaryTurn,
   resolvePiRegenerationUser,
+  matchesPiRegenerationSnapshot,
 } = require('@librechat/api');
 const {
   Constants,
@@ -479,7 +480,15 @@ class BaseClient {
     if (opts.isPiRegenerate === true) {
       head = userMessageId;
     }
-    this.currentMessages = (await this.loadHistory(conversationId, head)) ?? [];
+    const historyPromise =
+      opts.isPiRegenerate === true
+        ? this.loadHistory(conversationId, head, {
+            isPiRegenerate: true,
+            request: this.options?.req,
+            userMessageId,
+          })
+        : this.loadHistory(conversationId, head);
+    this.currentMessages = (await historyPromise) ?? [];
     this.conversationId = conversationId;
 
     if (isEdited && !isContinued) {
@@ -1282,7 +1291,7 @@ class BaseClient {
     return responseMessage;
   }
 
-  async loadHistory(conversationId, parentMessageId = null) {
+  async loadHistory(conversationId, parentMessageId = null, regeneration = undefined) {
     logger.debug('[BaseClient] Loading history:', { conversationId, parentMessageId });
 
     /** No message has the root sentinel as its id, so the chain walk from it is empty. */
@@ -1292,6 +1301,20 @@ class BaseClient {
 
     const messages =
       (await db.getMessages({ conversationId, user: this.user }, '+privateTextTokens')) ?? [];
+    if (regeneration?.isPiRegenerate === true) {
+      const sourceRows = messages.filter(
+        (message) => message.messageId === regeneration.userMessageId,
+      );
+      if (
+        sourceRows.length !== 1 ||
+        !matchesPiRegenerationSnapshot(regeneration.request, sourceRows[0])
+      ) {
+        throw Object.assign(
+          new Error('The source message changed. Refresh the conversation and try again.'),
+          { statusCode: 409, code: 'PI_REGENERATION_SOURCE_CHANGED' },
+        );
+      }
+    }
     /** A client that reads beyond the walk below (which stops at a checkpoint
      *  summary) receives every row here; the rest keep nothing. */
     this.onHistoryLoaded?.(messages);

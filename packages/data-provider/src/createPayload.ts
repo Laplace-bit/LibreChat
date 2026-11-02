@@ -17,6 +17,7 @@ export default function createPayload(submission: t.TSubmission) {
     addedConvo,
     userMessage,
     isContinued,
+    continuationTargetMessageId,
     isTemporary,
     isRegenerate,
     compact,
@@ -61,6 +62,11 @@ export default function createPayload(submission: t.TSubmission) {
     editedContent,
     conversationId,
     isContinued: !!(isEdited && isContinued),
+    ...(isEdited &&
+      isContinued &&
+      continuationTargetMessageId != null && {
+        continuationTargetMessageId,
+      }),
     ephemeralAgent: s.isAssistantsEndpoint(endpoint) ? undefined : ephemeralAgent,
     manualSkills: s.isAssistantsEndpoint(endpoint) ? undefined : manualSkills,
     codeApprovalMode: s.isAssistantsEndpoint(endpoint) ? undefined : codeApprovalMode,

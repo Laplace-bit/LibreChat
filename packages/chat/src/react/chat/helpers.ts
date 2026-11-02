@@ -117,6 +117,7 @@ export default function useChatHelpers(index = 0, paramId?: string): ChatContrac
           isContinued: true,
           isRegenerate: true,
           isEdited: true,
+          targetResponseMessageId: currentLatest.messageId,
           overrideManualSkills: parentMessage.manualSkills,
           overrideQuotes: parentMessage.quotes,
           overrideReasoning: parentMessage.reasoningOverride ?? null,

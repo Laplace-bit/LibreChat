@@ -84,6 +84,7 @@ type CodeEnvironmentPolicyAgent = {
 
 function collectCodeEnvironmentPolicyAgents(
   roots: readonly (CodeEnvironmentPolicyAgent | null | undefined)[],
+  includeSubagents = true,
 ): CodeEnvironmentPolicyAgent[] {
   const agents: CodeEnvironmentPolicyAgent[] = [];
   const visited = new Set<CodeEnvironmentPolicyAgent>();
@@ -95,6 +96,7 @@ function collectCodeEnvironmentPolicyAgents(
     }
     visited.add(agent);
     agents.push(agent);
+    if (!includeSubagents) continue;
     pending.push(...(agent.subagentAgentConfigs ?? []));
     pending.push(...(agent.lazySubagentConfigs ?? []));
     pending.push(...(agent.subagentGraphMemberMetadata ?? []));
@@ -207,6 +209,23 @@ export function collectAttachedCodeEnvironmentAgentIds(
   return attachedAgentIds;
 }
 
+/** Collect only explicitly supplied agents, without traversing inactive graph metadata. */
+export function collectDirectAttachedCodeEnvironmentAgentIds(
+  agents: readonly (CodeEnvironmentPolicyAgent | null | undefined)[],
+): Set<string> {
+  const attachedAgentIds = new Set<string>();
+  for (const agent of agents) {
+    if (agent == null) continue;
+    const routable = agent.codeExecutionChoices?.some(
+      (choice) => choice.environmentType === 'attached',
+    );
+    if (agent.id && (agent.codeExecutionContext?.environmentType === 'attached' || routable)) {
+      attachedAgentIds.add(agent.id);
+    }
+  }
+  return attachedAgentIds;
+}
+
 export function collectAttachedCodeEnvironmentPolicySettings(
   roots: readonly (CodeEnvironmentPolicyAgent | null | undefined)[],
 ): Map<string, AttachedCodeEnvironmentPolicySettings> {
@@ -229,9 +248,10 @@ export function collectAttachedCodeEnvironmentPolicySettings(
  */
 export function collectAttachedCodeRoutePolicies(
   roots: readonly (CodeEnvironmentPolicyAgent | null | undefined)[],
+  options: { includeSubagents?: boolean } = {},
 ): Map<string, AttachedCodeEnvironmentPolicySettings[]> {
   const policiesByAgentId = new Map<string, AttachedCodeEnvironmentPolicySettings[]>();
-  for (const agent of collectCodeEnvironmentPolicyAgents(roots)) {
+  for (const agent of collectCodeEnvironmentPolicyAgents(roots, options.includeSubagents)) {
     const policies = [agent.codeExecutionContext, ...(agent.codeExecutionChoices ?? [])]
       .filter((context) => context?.environmentType === 'attached')
       .map((context) => ({
@@ -249,8 +269,9 @@ export function collectAttachedCodeRoutePolicies(
 /** Every attached-machine policy the run may execute under, for validating the requested mode. */
 export function collectAttachedCodeApprovalPolicies(
   roots: readonly (CodeEnvironmentPolicyAgent | null | undefined)[],
+  options: { includeSubagents?: boolean } = {},
 ): AttachedCodeEnvironmentPolicySettings[] {
-  return [...collectAttachedCodeRoutePolicies(roots).values()].flat();
+  return [...collectAttachedCodeRoutePolicies(roots, options).values()].flat();
 }
 
 function permissionDecision(

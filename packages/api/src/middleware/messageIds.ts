@@ -15,6 +15,7 @@ export function validateChatMessageIds(req: Request, res: Response, next: NextFu
   for (const field of [
     'messageId',
     'responseMessageId',
+    'continuationTargetMessageId',
     'parentMessageId',
     'overrideUserMessageId',
     'overrideParentMessageId',
@@ -28,6 +29,7 @@ export function validateChatMessageIds(req: Request, res: Response, next: NextFu
       maxLength = MAX_OVERRIDE_MESSAGE_ID_LENGTH;
     } else if (
       field === 'responseMessageId' ||
+      field === 'continuationTargetMessageId' ||
       field === 'parentMessageId' ||
       (field === 'messageId' && req.body?.compact === true)
     ) {

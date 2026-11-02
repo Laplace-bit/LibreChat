@@ -1,7 +1,28 @@
 import { actionDelimiter, Constants } from 'librechat-data-provider';
-import { assertPiCompatible, isPiManagedCodeExecutionCompatible } from './compatibility';
+import {
+  assertPiCompatible,
+  isPiManagedCodeExecutionCompatible,
+  isPiOrdinaryTriggerCandidate,
+} from './compatibility';
 import { PI_SUBAGENT_TOOL_NAME, PI_SUPPORTED_HOST_TOOLS } from './toolNames';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
+
+describe('isPiOrdinaryTriggerCandidate', () => {
+  it('admits only authenticated triggers without Event Actor state', () => {
+    const ordinary = { authenticatedTrigger: true };
+    expect(isPiOrdinaryTriggerCandidate(ordinary)).toBe(true);
+    expect(isPiOrdinaryTriggerCandidate({ authenticatedTrigger: false })).toBe(false);
+    for (const actorField of [
+      'bindingId',
+      'parentConversationId',
+      'parentAgentId',
+      'conversationBinding',
+      'rawEventDelivery',
+    ]) {
+      expect(isPiOrdinaryTriggerCandidate({ ...ordinary, [actorField]: {} })).toBe(false);
+    }
+  });
+});
 
 describe('assertPiCompatible', () => {
   const supported = {

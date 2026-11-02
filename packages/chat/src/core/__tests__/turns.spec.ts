@@ -171,6 +171,30 @@ describe('buildTurn', () => {
     expect(turn.fileEffects?.clearComposer).toBe(true);
   });
 
+  it('carries the exact saved response identity when continuing a response', () => {
+    const savedResponse = { ...response, messageId: 'response__' };
+    const turn = buildTurn(
+      input({
+        latestMessage: savedResponse,
+        cachedMessages: [user, savedResponse],
+        params: {
+          text: user.text,
+          messageId: user.messageId,
+          parentMessageId: Constants.NO_PARENT as string,
+        },
+        options: {
+          isRegenerate: true,
+          isContinued: true,
+          isEdited: true,
+          targetResponseMessageId: savedResponse.messageId,
+        },
+      }),
+    );
+
+    expect(turn.submission.continuationTargetMessageId).toBe('response__');
+    expect(turn.submission.userMessage.responseMessageId).toBe('response_');
+  });
+
   it('edits a content part on a copy, leaving the cached response untouched', () => {
     const turn = buildTurn(
       input({

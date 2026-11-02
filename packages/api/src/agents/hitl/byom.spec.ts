@@ -3,6 +3,7 @@ import {
   assertAttachedCodeEnvironmentApprovalSupported,
   buildAttachedCodeEnvironmentAdmissionHooks,
   collectAttachedCodeEnvironmentAgentIds,
+  collectDirectAttachedCodeEnvironmentAgentIds,
   collectAttachedCodeApprovalPolicies,
   collectAttachedCodeRoutePolicies,
   collectAttachedCodeEnvironmentPolicySettings,
@@ -597,6 +598,24 @@ describe('collectAttachedCodeEnvironmentAgentIds', () => {
       skillAuthoringAvailable: true,
     });
   });
+
+  test('can inspect explicitly active roots without treating nested graph metadata as active', () => {
+    const agents = [
+      {
+        id: 'root',
+        codeExecutionContext: { environmentType: 'managed' },
+        subagentAgentConfigs: [
+          { id: 'disabled-child', codeExecutionContext: { environmentType: 'attached' } },
+        ],
+      },
+      {
+        id: 'active-root',
+        codeExecutionChoices: [{ environmentType: 'attached' }],
+      },
+    ];
+
+    expect(collectDirectAttachedCodeEnvironmentAgentIds(agents)).toEqual(new Set(['active-root']));
+  });
 });
 
 describe('collectAttachedCodeApprovalPolicies', () => {
@@ -605,6 +624,28 @@ describe('collectAttachedCodeApprovalPolicies', () => {
     codeEnvironmentConfigSchema: fullAccessSettings.configSchema,
     codeEnvironmentSettings: { permissions: { fileWrite: 'allow' as const } },
   };
+
+  test('can skip inactive nested graph metadata while keeping recursive legacy admission', () => {
+    const agents: Parameters<typeof collectAttachedCodeApprovalPolicies>[0] = [
+      {
+        id: 'root',
+        subagentGraphMemberMetadata: [
+          {
+            id: 'inactive-member',
+            codeExecutionContext: {
+              environmentType: 'attached',
+              codeEnvironmentConfigSchema: {
+                permissions: { fileWrite: { allowed: ['ask'], default: 'ask' } },
+              },
+            },
+          },
+        ],
+      },
+    ];
+
+    expect(collectAttachedCodeApprovalPolicies(agents)).toHaveLength(1);
+    expect(collectAttachedCodeApprovalPolicies(agents, { includeSubagents: false })).toEqual([]);
+  });
 
   test('validates a mode against a fallback-routable child by its per-call machines', () => {
     const agents = [

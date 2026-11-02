@@ -438,6 +438,10 @@ export function buildTurn({
     isEdited: isEditOrContinue,
     isContinued,
     isRegenerate: regenerateShaped,
+    ...(isContinued &&
+      targetResponseMessage != null && {
+        continuationTargetMessageId: targetResponseMessage.messageId,
+      }),
     ...(compact && { compact: true }),
     initialResponse,
     isTemporary,

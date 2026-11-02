@@ -57,6 +57,7 @@ const {
   resolvePersistableCodeEnvironmentDecision,
   AgentRuntimeUnavailableError,
   assertAgentRuntimeCompatibleGraph,
+  isPiOrdinaryTriggerCandidate,
   selectAgentRuntimeForAgent,
   getFailedTurnTraceFields,
   resolveFailedTurnContent,
@@ -72,6 +73,7 @@ const {
   createDisconnectSnapshotQueue,
   isTemporaryTurn,
   getPreliminaryResponseMessageId,
+  isPiRegenerationRequest,
 } = require('@librechat/api');
 const { disposeClient } = require('~/server/cleanup');
 const {
@@ -796,16 +798,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   const userId = req.user.id;
   const tenantId = req.user.tenantId;
   const isCompaction = req.body?.compact === true;
-  const isPiRegenerate =
-    isRegenerate === true &&
-    !isCompaction &&
-    isContinued !== true &&
-    req.body?.isEdited !== true &&
-    editedContent == null &&
-    req.body?.overrideUserMessageId == null &&
-    req.body?.overrideConvoId == null &&
-    typeof overrideParentMessageId === 'string' &&
-    overrideParentMessageId.length > 0;
+  const isPiRegenerate = isPiRegenerationRequest(req.body);
   if (isCompaction) {
     const rejection = getCompactionRejection(req, {
       conversationId: reqConversationId,
@@ -1671,6 +1664,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     req._recoveredSteerId == null &&
     req.body?.steerId == null &&
     req.body?.steer == null;
+  const isPiOrdinaryTrigger = isPiOrdinaryTriggerCandidate({
+    authenticatedTrigger: req._isAgentTrigger === true,
+    bindingId: req._agentEventBindingId,
+    parentConversationId: req._agentEventBindingParentConversationId,
+    parentAgentId: req._agentEventBindingParentAgentId,
+    conversationBinding: req.resolvedConversation?.agentEventBinding,
+    rawEventDelivery: rawAgentEventDelivery,
+  });
   try {
     const selectedAgentRuntime = selectAgentRuntimeForAgent();
     if (
@@ -1679,9 +1680,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         req.body?.isContinued === true ||
         ((isTriggerContinuation ||
           req._isAgentTrigger === true ||
+          req._agentEventBindingId != null ||
           req._agentEventBindingParentConversationId != null ||
-          agentEventDelivery != null) &&
-          !isPiBoundHistoryEventActorCandidate))
+          req._agentEventBindingParentAgentId != null ||
+          req.resolvedConversation?.agentEventBinding != null ||
+          rawAgentEventDelivery != null) &&
+          !isPiBoundHistoryEventActorCandidate &&
+          !isPiOrdinaryTrigger))
     ) {
       // Compaction and scheduling use the existing GenerationJobManager lifecycle.
       // Only authenticated bound Event Actor history turns are considered below;
@@ -2236,6 +2241,14 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
        * and the resolved turn plan. AgentClient treats it as the sole permission
        * to run a Pi history Event Actor; request data cannot set it. */
       Object.defineProperty(req, '_piEventActorHistoryInvocationEligible', {
+        configurable: false,
+        enumerable: false,
+        value: true,
+        writable: false,
+      });
+    }
+    if (selectedAgentRuntime.engine === 'pi' && isPiOrdinaryTrigger) {
+      Object.defineProperty(req, '_piOrdinaryTriggerInvocationEligible', {
         configurable: false,
         enumerable: false,
         value: true,

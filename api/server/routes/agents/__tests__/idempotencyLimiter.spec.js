@@ -53,6 +53,7 @@ jest.mock('@librechat/api', () => ({
       (...args) =>
         mockIngress(...args),
   ),
+  createPiRegenerationAdmission: jest.fn(() => (_req, _res, next) => next()),
   isPreDenialTextSubmission: (req) => req.method === 'POST' && typeof req.body?.text === 'string',
   isPrivateTextChatSubmission: (req) =>
     req.method === 'POST' &&

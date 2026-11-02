@@ -206,6 +206,44 @@ describe('AgentClient code approval persistence', () => {
     ).toMatchObject({ codeApprovalMode: 'ask' });
   });
 
+  it('ignores inactive legacy attached-machine metadata when a Pi run persists approval mode', () => {
+    const inactiveAttachedAgent = {
+      id: 'inactive-attached-agent',
+      codeExecutionContext: {
+        environmentId: 'inactive-vm',
+        environmentType: 'attached',
+        codeEnvironmentConfigSchema: {
+          permissions: { fileWrite: { allowed: ['ask'], default: 'ask' } },
+        },
+      },
+    };
+    const agent = { id: 'terra', subagentGraphMemberMetadata: [inactiveAttachedAgent] };
+    const client = noWorkspaceClient({ requested: 'fullAccess', stored: 'fullAccess', agent });
+    client.options.agentRuntime = { engine: 'pi' };
+
+    const write = turnWrite(client);
+    expect(write.endpointOptions).not.toHaveProperty('codeApprovalMode');
+    expect(write.preservedFields).toEqual(['codeApprovalMode']);
+  });
+
+  it('keeps recursive attached-machine policy validation for non-Pi runs', () => {
+    const inactiveAttachedAgent = {
+      id: 'inactive-attached-agent',
+      codeExecutionContext: {
+        environmentId: 'inactive-vm',
+        environmentType: 'attached',
+        codeEnvironmentConfigSchema: {
+          permissions: { fileWrite: { allowed: ['ask'], default: 'ask' } },
+        },
+      },
+    };
+    const agent = { id: 'terra', subagentGraphMemberMetadata: [inactiveAttachedAgent] };
+
+    expect(() =>
+      noWorkspaceClient({ requested: 'fullAccess', stored: 'fullAccess', agent }).getSaveOptions(),
+    ).toThrow('not permitted');
+  });
+
   it('never writes its run-start decision over a stored one a move replaced', () => {
     const client = Object.create(AgentClient.prototype);
     client.agentConfigs = new Map();
@@ -372,6 +410,28 @@ describe('AgentClient - event actor history adapter', () => {
     ]);
     expect(loadHistory).toHaveBeenCalledWith('conversation-1', 'message-1');
     loadHistory.mockRestore();
+  });
+
+  it('passes the admitted regeneration snapshot to the base history loader', async () => {
+    const loadHistory = jest
+      .spyOn(BaseClient.prototype, 'loadHistory')
+      .mockResolvedValue([{ messageId: 'message-1' }]);
+    const client = Object.create(AgentClient.prototype);
+    client.eventActorContinuation = 'cold';
+    const regeneration = {
+      isPiRegenerate: true,
+      request: {},
+      userMessageId: 'message-1',
+    };
+
+    try {
+      await expect(
+        client.loadHistory('conversation-1', 'message-1', regeneration),
+      ).resolves.toEqual([{ messageId: 'message-1' }]);
+      expect(loadHistory).toHaveBeenCalledWith('conversation-1', 'message-1', regeneration);
+    } finally {
+      loadHistory.mockRestore();
+    }
   });
 
   it('resolves and caches the exact durable Skill manifest before warming', async () => {
@@ -1087,7 +1147,7 @@ describe('AgentClient - interrupt discovery persistence', () => {
     client.options.agentRuntime = PINNED_PI_AGENT_RUNTIME;
     client.options.agent.tools = [{ name: Tools.file_search }];
     client.options.agent.toolDefinitions = [resumeToolDefinition];
-    client.loadHistory = jest.fn().mockResolvedValue([
+    const historyRows = [
       {
         messageId: 'parent-pi-resume',
         parentMessageId: Constants.NO_PARENT,
@@ -1095,7 +1155,11 @@ describe('AgentClient - interrupt discovery persistence', () => {
         role: 'user',
         text: 'Continue the file search.',
       },
-    ]);
+    ];
+    client.loadHistory = jest.fn(async () => {
+      client.onHistoryLoaded(historyRows);
+      return historyRows;
+    });
     client.buildMessages = jest.fn().mockResolvedValue({ prompt: [] });
     client.getBuildMessagesOptions = jest.fn(() => ({}));
     client.isCompactionTurn = jest.fn(() => false);
@@ -2506,7 +2570,7 @@ describe('AgentClient - startup telemetry', () => {
     'bounds ordinary-chat admission before provider startup (legacy=%s)',
     async (legacy) => {
       const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
-      const name = 'q' + '_mcp_z'.repeat(legacy ? 4000 : 80);
+      const name = 'q' + '_mcp_z'.repeat(legacy ? 4000 : 120);
       const tool_options = Object.fromEntries(
         Array.from({ length: legacy ? 1 : 100 }, (_, i) => [
           `${i}_${name}`,
@@ -2529,8 +2593,18 @@ describe('AgentClient - startup telemetry', () => {
           endpoint: EModelEndpoint.openAI,
           provider: EModelEndpoint.openAI,
           model_parameters: { model: 'gpt-4' },
-          tools: [],
-          lazySubagentConfigs: [{ id: 'child', tools: ['other_mcp_unknown'], tool_options }],
+          tools: [{ name: Constants.SUBAGENT }],
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['child'] },
+          lazySubagentConfigs: [
+            {
+              id: 'child',
+              configId: 'child:1',
+              tools: ['other_mcp_unknown'],
+              tool_options,
+              resolve: jest.fn(),
+              settle: jest.fn((_context, resolveInputs) => resolveInputs()),
+            },
+          ],
         },
         endpointTokenConfig: {},
         eventHandlers: {},
@@ -2655,8 +2729,8 @@ describe('AgentClient - startup telemetry', () => {
       subagentAgentConfigs: undefined,
     },
     {
-      name: 'dontAsk denied attached-code lazy graph member',
-      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['read_file'] },
+      name: 'dontAsk with inactive attached-code lazy graph metadata',
+      toolApproval: { enabled: true, mode: 'dontAsk', allow: ['read_file', 'safe_mcp_db'] },
       primaryTools: [{ name: Tools.web_search }],
       subagentAgentConfigs: [
         {
@@ -2792,13 +2866,6 @@ describe('AgentClient - startup telemetry', () => {
       tool_options: { db_query_mcp_db: { approval_mode: 'chat' } },
       mcpToolAliases: [{ name: 'query_mcp_db', aliasName: 'db_query_mcp_db' }],
     },
-    {
-      name: 'unresolved lazy review-gated child',
-      tools: [{ name: 'read_file' }],
-      lazySubagentConfigs: [
-        { id: 'lazy-agent', tool_options: { query_mcp_db: { approval_mode: 'always' } } },
-      ],
-    },
   ])(
     'rejects scheduled memory-store runs with a $name before provider execution',
     async (surface) => {
@@ -2842,6 +2909,60 @@ describe('AgentClient - startup telemetry', () => {
     },
   );
 
+  it('fails closed for an active lazy Pi child that requires tool approval', async () => {
+    const piDispatchBefore = mockExecutePiGeneration.mock.calls.length;
+    const childId = 'lazy-agent';
+    const client = createPiStartupClient({
+      req: {
+        user: { id: 'user-123' },
+        body: {},
+        config: {
+          endpoints: {
+            [EModelEndpoint.agents]: {
+              toolApproval: { enabled: true, mode: 'bypass', agentModes: true },
+            },
+          },
+        },
+        _isScheduledFire: true,
+        _resumableStreamId: 'scheduled-agent-mode',
+      },
+      res: {},
+      agent: {
+        id: 'agent-123',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        tools: [{ name: Constants.SUBAGENT }],
+        subagents: { enabled: true, allowSelf: false, agent_ids: [childId] },
+        lazySubagentConfigs: [
+          {
+            id: childId,
+            configId: `${childId}:1`,
+            tools: ['query_mcp_db'],
+            tool_options: { query_mcp_db: { approval_mode: 'always' } },
+            resolve: jest.fn(),
+            settle: jest.fn((_context, resolveInputs) => resolveInputs()),
+          },
+        ],
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.conversationId = 'scheduled-agent-mode';
+    client.responseMessageId = 'scheduled-agent-mode-response';
+    client.parentMessageId = 'scheduled-agent-mode-parent';
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
+    expect(client.contentParts).toContainEqual(
+      expect.objectContaining({ type: ContentTypes.ERROR }),
+    );
+  });
+
   it.each(['db', 'Db', 'dB', 'DB'])(
     'refuses unresolved %s legacy-hook schedules before provider startup under canonical dontAsk allow',
     async (prefix) => {
@@ -2875,8 +2996,18 @@ describe('AgentClient - startup telemetry', () => {
           endpoint: EModelEndpoint.openAI,
           provider: EModelEndpoint.openAI,
           model_parameters: { model: 'gpt-4' },
-          tools: [{ name: 'subagent' }],
-          lazySubagentConfigs: [{ id: 'lazy-child', tools: ['query_mcp_db'] }],
+          tools: [{ name: Constants.SUBAGENT }],
+          subagents: { enabled: true, allowSelf: false, agent_ids: ['lazy-child'] },
+          lazySubagentConfigs: [
+            {
+              id: 'lazy-child',
+              configId: 'lazy-child:1',
+              tools: ['query_mcp_db'],
+              mcpToolAliases: [{ name: 'query_mcp_db', aliasName: `${prefix}_query_mcp_db` }],
+              resolve: jest.fn(),
+              settle: jest.fn((_context, resolveInputs) => resolveInputs()),
+            },
+          ],
         },
         endpointTokenConfig: {},
         eventHandlers: {},
@@ -2888,11 +3019,12 @@ describe('AgentClient - startup telemetry', () => {
       client.responseMessageId = 'scheduled-legacy-hook-response';
       client.parentMessageId = 'scheduled-legacy-hook-parent';
       try {
-        await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
-          code: 'SCHEDULED_HITL_REQUIRES_SHARED_STORE',
-        });
+        await client.chatCompletion({ payload: [] });
         expect(mockExecutePiGeneration).toHaveBeenCalledTimes(piDispatchBefore);
         expect(mockCreateRun).not.toHaveBeenCalled();
+        expect(client.contentParts).toContainEqual(
+          expect.objectContaining({ type: ContentTypes.ERROR }),
+        );
         expect(hook).not.toHaveBeenCalled();
       } finally {
         unregister();
@@ -4155,6 +4287,49 @@ describe('AgentClient - startup telemetry', () => {
     await client.chatCompletion({ payload: [] });
 
     expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['scheduled fire', { _isScheduledFire: true }, true],
+    ['queued continuation', {}, true],
+    ['unadmitted trigger', { _piOrdinaryTriggerInvocationEligible: false }, false],
+    ['Event Actor delivery', { body: { agentEventDelivery: {} } }, false],
+    ['Event Actor binding', { _agentEventBindingId: 'binding-1' }, false],
+  ])('checks the admitted ordinary Pi trigger boundary: %s', async (_name, fields, allowed) => {
+    jest.clearAllMocks();
+    const req = {
+      user: { id: 'user-123' },
+      body: {},
+      config: { endpoints: { [EModelEndpoint.agents]: {} } },
+      _isAgentTrigger: true,
+      _piOrdinaryTriggerInvocationEligible: true,
+      _resumableStreamId: 'conversation-pi-trigger',
+      ...fields,
+    };
+    const client = createPiStartupClient({
+      req,
+      res: {},
+      agent: {
+        id: 'agent-pi-trigger',
+        endpoint: EModelEndpoint.openAI,
+        provider: EModelEndpoint.openAI,
+        model_parameters: { model: 'gpt-4' },
+        toolDefinitions: [],
+      },
+      endpointTokenConfig: {},
+      eventHandlers: {},
+      contentParts: [],
+      collectedUsage: [],
+      artifactPromises: [],
+    });
+    client.conversationId = 'conversation-pi-trigger';
+    client.responseMessageId = 'response-pi-trigger';
+    client.parentMessageId = 'parent-pi-trigger';
+
+    await client.chatCompletion({ payload: [] });
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(allowed ? 1 : 0);
     expect(mockCreateRun).not.toHaveBeenCalled();
   });
 
@@ -10705,6 +10880,18 @@ describe('AgentClient - Pi generation dispatch', () => {
       toolApproval,
       agentOverrides: {
         codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
+        tools: [{ name: 'bash_tool' }],
+        toolDefinitions: [
+          {
+            name: 'bash_tool',
+            description: 'Run a command in the managed code environment.',
+            parameters: {
+              type: 'object',
+              properties: { command: { type: 'string' } },
+              required: ['command'],
+            },
+          },
+        ],
       },
       eventHandlers: { [GraphEvents.ON_TOOL_EXECUTE]: toolExecuteHandler },
     });
@@ -10717,6 +10904,18 @@ describe('AgentClient - Pi generation dispatch', () => {
     expect(client.contentParts).toContainEqual(
       expect.objectContaining({ type: ContentTypes.ERROR }),
     );
+  });
+
+  it('allows a non-code Pi tool when an attached code environment is not callable', async () => {
+    const client = createPiFileSearchClient({
+      agentOverrides: {
+        codeExecutionContext: { environmentId: 'attached-vm', environmentType: 'attached' },
+      },
+    });
+
+    await client.chatCompletion({ payload: [] });
+    expect(mockGetAgentPiModelBindingFactory).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
   it('routes Pi file_search through the current authorized ON_TOOL_EXECUTE handler', async () => {
@@ -13043,7 +13242,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
     expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
   });
 
-  it('fails closed before resolving a lazy resume agent', async () => {
+  it('fails closed before resolving an invalid active lazy resume target with shared files', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -13071,6 +13270,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
     const context = makeContext(undefined);
     context.options.agent.endpoint = 'openAI';
     context.options.agent.lazySubagentConfigs = [descriptor];
+    context.options.agent.subagents = {
+      enabled: true,
+      allowSelf: false,
+      agent_ids: [descriptor.id],
+    };
     context.options.attachments = [sharedFile];
     context.options.req.config.fileConfig = {
       endpoints: {
@@ -13082,7 +13286,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
     expect(resolveLazy).not.toHaveBeenCalled();
   });
 
-  it('fails closed before resolving a lazy agent with steer files', async () => {
+  it('fails closed before resolving an invalid active lazy resume target with steer files', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -13110,6 +13314,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
     const context = makeContext(undefined);
     context.options.agent.endpoint = 'openAI';
     context.options.agent.lazySubagentConfigs = [descriptor];
+    context.options.agent.subagents = {
+      enabled: true,
+      allowSelf: false,
+      agent_ids: [descriptor.id],
+    };
     context.options.attachments = [steerFile];
     context.options.req.config.fileConfig = {
       endpoints: {
@@ -13121,7 +13330,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
     expect(resolveLazy).not.toHaveBeenCalled();
   });
 
-  it('rejects lazy Pi resume after preparing only root scoped context', async () => {
+  it('fails closed before scoped context loading for an invalid active lazy resume target', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -13141,6 +13350,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
     const context = makeContext(undefined);
     context.options.agent.endpoint = 'openAI';
     context.options.agent.lazySubagentConfigs = [descriptor];
+    context.options.agent.subagents = {
+      enabled: true,
+      allowSelf: false,
+      agent_ids: [descriptor.id],
+    };
     context.options.req.config.fileConfig = {
       fileContextSizeLimit: 0.0001,
       endpoints: {
@@ -13173,7 +13387,7 @@ describe('AgentClient - resumeCompletion content protection', () => {
     );
   });
 
-  it('fails closed before loading scoped context for a lazy resume agent', async () => {
+  it('fails closed before loading context for an invalid active lazy resume target', async () => {
     mockGetAgentCheckpointer.mockResolvedValue({
       getTuple: jest.fn().mockResolvedValue({
         checkpoint: { channel_values: { messages: [] } },
@@ -13202,6 +13416,11 @@ describe('AgentClient - resumeCompletion content protection', () => {
     };
     const context = makeContext(undefined);
     context.options.agent.lazySubagentConfigs = [descriptor];
+    context.options.agent.subagents = {
+      enabled: true,
+      allowSelf: false,
+      agent_ids: [descriptor.id],
+    };
     await expectPiResumeToFailClosed(context);
 
     expect(resolvedChild.additional_instructions).toBeUndefined();

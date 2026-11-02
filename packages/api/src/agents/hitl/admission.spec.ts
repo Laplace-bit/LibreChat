@@ -59,6 +59,25 @@ describe('canAgentGraphPause', () => {
     ).toBe(true);
   });
 
+  test('can restrict admission to explicit roots after the caller resolves reachability', () => {
+    const agents = [
+      {
+        tools: ['subagent'],
+        subagentAgentConfigs: [
+          {
+            id: 'child',
+            tools: ['write_file'],
+            tool_options: { write_file: { approval_mode: 'ask' as const } },
+          },
+        ],
+      },
+    ];
+    const policy = { enabled: true, mode: 'bypass' as const };
+
+    expect(canAgentGraphPause({ policy, agents })).toBe(true);
+    expect(canAgentGraphPause({ policy, agents, includeSubagents: false })).toBe(false);
+  });
+
   test('fails closed for an unresolved lazy tool surface that could pause', () => {
     expect(
       canAgentGraphPause({

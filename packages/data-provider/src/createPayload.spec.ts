@@ -25,6 +25,30 @@ const previewedResponse = {
 } as unknown as TMessage;
 
 describe('createPayload', () => {
+  it('sends the exact saved response identity only for a continued turn', () => {
+    const submission = {
+      userMessage: {
+        messageId: 'user-1',
+        conversationId: 'convo-1',
+        parentMessageId: '00000000-0000-0000-0000-000000000000',
+        isCreatedByUser: true,
+        text: 'build it',
+      },
+      conversation: { conversationId: 'convo-1', endpoint: EModelEndpoint.agents },
+      endpointOption: { endpoint: EModelEndpoint.agents, agent_id: 'agent_1' },
+      messages: [previewedResponse],
+      isEdited: true,
+      isContinued: true,
+      isTemporary: false,
+      continuationTargetMessageId: 'response__',
+    } as unknown as TSubmission;
+
+    expect(createPayload(submission).payload.continuationTargetMessageId).toBe('response__');
+    expect(
+      createPayload({ ...submission, isContinued: false }).payload.continuationTargetMessageId,
+    ).toBeUndefined();
+  });
+
   it.each([
     ['regenerate', { isRegenerate: true }],
     ['continue', { isEdited: true, isContinued: true }],

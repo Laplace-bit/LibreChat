@@ -21,6 +21,25 @@ export interface PiCompatibilityInput {
   allowPiSubagent?: boolean;
 }
 
+/** The signed trigger host also runs ordinary scheduled and queued turns. */
+export function isPiOrdinaryTriggerCandidate(input: {
+  authenticatedTrigger: boolean;
+  bindingId?: unknown;
+  parentConversationId?: unknown;
+  parentAgentId?: unknown;
+  conversationBinding?: unknown;
+  rawEventDelivery?: unknown;
+}): boolean {
+  return (
+    input.authenticatedTrigger &&
+    input.bindingId == null &&
+    input.parentConversationId == null &&
+    input.parentAgentId == null &&
+    input.conversationBinding == null &&
+    input.rawEventDelivery == null
+  );
+}
+
 /** Pi Code API support is limited to an explicitly configured managed endpoint. */
 export function isPiManagedCodeExecutionCompatible(
   agent: unknown,

@@ -157,6 +157,8 @@ export interface ToolApprovalAdmissionInput {
   readonly resolvedProgrammaticHooks?: readonly ResolvedToolApprovalHook[];
   readonly pluginHookSource?: PluginHookSource;
   readonly askUserQuestionAdminDisabled?: boolean;
+  /** Limit admission to the supplied roots when the caller has resolved graph reachability. */
+  readonly includeSubagents?: boolean;
   /** Tools the conversation remembers; folded in exactly as `createRun` folds them. */
   readonly toolApprovalAllows?: readonly string[];
 }
@@ -322,7 +324,10 @@ function agentHasTool(agent: ToolApprovalAdmissionAgent, toolName: string): bool
   );
 }
 
-function collectApprovalAgents(roots: readonly (ToolApprovalAdmissionAgent | null | undefined)[]): {
+function collectApprovalAgents(
+  roots: readonly (ToolApprovalAdmissionAgent | null | undefined)[],
+  includeSubagents = true,
+): {
   agents: ToolApprovalAdmissionAgent[];
   lazyAgentIds: Set<string | undefined>;
   lazyAgents: Set<ToolApprovalAdmissionAgent>;
@@ -340,6 +345,7 @@ function collectApprovalAgents(roots: readonly (ToolApprovalAdmissionAgent | nul
     }
     visited.add(agent);
     agents.push(agent);
+    if (!includeSubagents) continue;
     pending.push(...(agent.subagentAgentConfigs ?? []));
     if ((agent.lazySubagentConfigs?.length ?? 0) > 0) {
       for (const lazyAgent of agent.lazySubagentConfigs ?? []) {
@@ -374,6 +380,7 @@ export function canAgentGraphPause({
   resolvedProgrammaticHooks = [],
   pluginHookSource,
   askUserQuestionAdminDisabled = false,
+  includeSubagents = true,
   toolApprovalAllows,
 }: ToolApprovalAdmissionInput): boolean {
   const asksUserQuestion =
@@ -385,7 +392,7 @@ export function canAgentGraphPause({
   }
 
   const consume = createAdmissionWork();
-  const approvalGraph = collectApprovalAgents(agents);
+  const approvalGraph = collectApprovalAgents(agents, includeSubagents);
   const toolOwners = new Map<string, Set<string | undefined>>();
   const reviewGatedTools = new Set<string>();
   let unresolvedModeCanAsk = false;

@@ -20,6 +20,7 @@ const {
   createPrivateTextIngress,
   isPrivateTextChatSubmission,
   isPreDenialTextSubmission,
+  createPiRegenerationAdmission,
   saveAbortedUserMessage,
   isAgentTriggerRequest,
   exemptAgentTriggerFromIpLimiter,
@@ -169,8 +170,13 @@ const privateTextIngress = createPrivateTextIngress({
   getKey: () => process.env.CREDS_KEY ?? '',
 });
 const chatConfigMiddleware = unless((req) => req.config != null, configMiddleware);
+/** Restore the original turn before the private-text ingress sees submitted content. */
+const restorePiRegeneration = createPiRegenerationAdmission({
+  getMessages: (filter) => getMessages(filter, '+privateTextTokens', { limit: 2 }),
+});
 router.use(
   '/chat',
+  restorePiRegeneration,
   unless((req) => !isPreDenialTextSubmission(req), configMiddleware),
   unless((req) => !isPrivateTextChatSubmission(req), privateTextIngress),
 );

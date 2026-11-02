@@ -266,6 +266,14 @@ jest.mock('@librechat/api', () => ({
   assertAgentRuntimeCompatibleGraph: jest.requireActual(
     '../../../../../packages/api/src/agents/runtime/selection',
   ).assertAgentRuntimeCompatibleGraph,
+  isPiOrdinaryTriggerCandidate: (...args) =>
+    jest
+      .requireActual('../../../../../packages/api/src/agents/pi/compatibility')
+      .isPiOrdinaryTriggerCandidate(...args),
+  isPiRegenerationRequest: (...args) =>
+    jest
+      .requireActual('../../../../../packages/api/src/agents/pi/regeneration')
+      .isPiRegenerationRequest(...args),
   getPreliminaryResponseMessageId: jest.requireActual(
     '../../../../../packages/api/src/utils/message',
   ).getPreliminaryResponseMessageId,
@@ -1167,6 +1175,69 @@ describe('ResumableAgentController resume metadata', () => {
     );
   });
 
+  it('passes an authenticated scheduled trigger to Pi with server-owned eligibility', async () => {
+    const conversationId = 'scheduled-pi-trigger';
+    mockGenerationJobManager.claimGeneration.mockResolvedValue(
+      wonGenerationClaim({ streamId: conversationId, conversationId }),
+    );
+    const req = {
+      _isAgentTrigger: true,
+      _isScheduledFire: true,
+      user: { id: 'user-123' },
+      body: {
+        text: 'Run the digest.',
+        messageId: 'scheduled-user',
+        clientRequestId: 'sched:pi:20261101T120000Z',
+        conversationId: 'new',
+        newConversationId: conversationId,
+        scheduleId: 'schedule-pi',
+        scheduledFor: '2026-11-01T12:00:00.000Z',
+        endpointOption: { endpoint: 'agents', agent_id: 'agent-pi' },
+      },
+      config: {},
+    };
+    let seenEligibility;
+    const sendMessage = jest.fn(() => {
+      seenEligibility = req._piOrdinaryTriggerInvocationEligible;
+      return new Promise(() => {});
+    });
+    const initializeClient = jest.fn().mockResolvedValue({
+      client: { options: { agent: { id: 'agent-pi' } }, sendMessage },
+    });
+
+    await AgentController(req, createResumableResponse(), jest.fn(), initializeClient, null);
+    await nextTick();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(seenEligibility).toBe(true);
+    expect(Object.getOwnPropertyDescriptor(req, '_piOrdinaryTriggerInvocationEligible')).toEqual(
+      expect.objectContaining({ writable: false, enumerable: false }),
+    );
+  });
+
+  it('rejects an unmatched Event Actor delivery on the ordinary trigger path', async () => {
+    const req = {
+      _isAgentTrigger: true,
+      user: { id: 'user-123' },
+      body: {
+        text: 'Run the event.',
+        messageId: 'event-user',
+        clientRequestId: 'expected-delivery',
+        conversationId: 'conversation-123',
+        agentEventDelivery: { deliveryKey: 'different-delivery', event: { type: 'test.event' } },
+        endpointOption: { endpoint: 'agents', agent_id: 'agent-pi' },
+      },
+      config: {},
+    };
+    const initializeClient = jest.fn();
+
+    await AgentController(req, createResumableResponse(), jest.fn(), initializeClient, null);
+
+    expect(initializeClient).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
+    expect(req._piOrdinaryTriggerInvocationEligible).toBeUndefined();
+  });
+
   it('fails closed when a Pi generation loads a connected-agent graph', async () => {
     const sendMessage = jest.fn().mockResolvedValue(undefined);
     const initializeClient = jest.fn().mockResolvedValue({
@@ -1493,13 +1564,20 @@ describe('ResumableAgentController resume metadata', () => {
       },
       config: {},
     };
-    const sendMessage = jest.fn(() => new Promise(() => {}));
-    const initializeClient = jest.fn().mockResolvedValue({ client: { options: {}, sendMessage } });
+    let seenEligibility;
+    const sendMessage = jest.fn(() => {
+      seenEligibility = req._piOrdinaryTriggerInvocationEligible;
+      return new Promise(() => {});
+    });
+    const initializeClient = jest
+      .fn()
+      .mockResolvedValue({ client: { options: { agent: { id: 'agent-123' } }, sendMessage } });
     const res = createResumableResponse();
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
     await nextTick();
 
+    expect(seenEligibility).toBe(true);
     expect(mockSettleAgentQueuedTurnExecutionAdmission).toHaveBeenCalledWith(admissionSource, {
       userId: 'user-123',
       tenantId: 'tenant-1',
@@ -1542,7 +1620,9 @@ describe('ResumableAgentController resume metadata', () => {
       config: {},
     };
     const sendMessage = jest.fn(() => new Promise(() => {}));
-    const initializeClient = jest.fn().mockResolvedValue({ client: { options: {}, sendMessage } });
+    const initializeClient = jest
+      .fn()
+      .mockResolvedValue({ client: { options: { agent: { id: 'agent-123' } }, sendMessage } });
     const res = createResumableResponse();
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
@@ -1711,7 +1791,7 @@ describe('ResumableAgentController resume metadata', () => {
     const initializeClient = jest.fn(async ({ req }) => {
       req.body.codeEnvironmentMode = 'without_attached';
       delete req.body.codeWorkspaces;
-      return { client: { options: {}, sendMessage } };
+      return { client: { options: { agent: { id: 'agent-123' } }, sendMessage } };
     });
     const req = {
       user: { id: 'user-123' },
@@ -3067,7 +3147,7 @@ describe('ResumableAgentController resume metadata', () => {
       },
     };
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       sendMessage: jest.fn().mockRejectedValue(new Error(`Provider echoed ${privateValue}`)),
     };
     const initializeClient = jest.fn().mockResolvedValue({ client });
@@ -3118,7 +3198,7 @@ describe('ResumableAgentController resume metadata', () => {
       config: {},
     };
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       sendMessage: jest.fn().mockRejectedValue(new Error(rawMessage)),
     };
     const initializeClient = jest.fn().mockResolvedValue({ client });
@@ -3161,7 +3241,7 @@ describe('ResumableAgentController resume metadata', () => {
       },
     };
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       sendMessage: jest.fn().mockRejectedValue(new Error(typedError)),
     };
     const initializeClient = jest.fn().mockResolvedValue({ client });
@@ -3203,7 +3283,7 @@ describe('ResumableAgentController resume metadata', () => {
       config: {},
     };
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       sendMessage: jest.fn(() =>
         encodeAndFormatImages(
           req,
@@ -3602,7 +3682,7 @@ describe('ResumableAgentController resume metadata', () => {
 
   it('fails closed when a recovered-turn client derives skipSaveUserMessage', async () => {
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       skipSaveUserMessage: true,
       sendMessage: jest.fn(),
     };
@@ -3658,7 +3738,7 @@ describe('ResumableAgentController resume metadata', () => {
       signalFinished(args);
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
         options.onStart(userMessage, 'response-msg');
@@ -3726,7 +3806,7 @@ describe('ResumableAgentController resume metadata', () => {
       return true;
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       pendingApproval: { actionId: 'action-paused-save-fails' },
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -3801,7 +3881,7 @@ describe('ResumableAgentController resume metadata', () => {
       return true;
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       pendingApproval: { actionId: 'action-normal-user-falsy' },
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -3881,7 +3961,7 @@ describe('ResumableAgentController resume metadata', () => {
         return true;
       });
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         pendingApproval: { actionId: 'action-base-client-retry-falsy' },
         skipSaveUserMessage: false,
         skipSaveConvo: false,
@@ -3947,7 +4027,7 @@ describe('ResumableAgentController resume metadata', () => {
       return false;
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       jobCreatedAt: 1000,
       pendingApproval: { actionId: 'action-replaced-before-pause-save' },
       skipSaveUserMessage: true,
@@ -4022,7 +4102,7 @@ describe('ResumableAgentController resume metadata', () => {
     const completedResponseWrite = jest.fn();
     const exposePendingApproval = jest.fn().mockResolvedValue(undefined);
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       jobCreatedAt: 1000,
       pendingApproval: { actionId: 'action-pause-barrier' },
       exposePendingApproval,
@@ -4235,7 +4315,7 @@ describe('ResumableAgentController resume metadata', () => {
           fragmentPath: '/text',
         });
         const client = {
-          options: {},
+          options: { agent: { id: 'agent-123' } },
           sendMessage: jest.fn(async () => {
             throw rejection;
           }),
@@ -4378,7 +4458,7 @@ describe('ResumableAgentController resume metadata', () => {
 
     it('persists failures raised before generation saves any message', async () => {
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         sendMessage: jest.fn().mockRejectedValue(new Error('provider exploded')),
       };
 
@@ -4554,7 +4634,7 @@ describe('ResumableAgentController resume metadata', () => {
         isCreatedByUser: true,
       };
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         sendMessage: jest.fn(async (_text, options) => {
           options.onStart(serverUserMessage, 'server-response-uuid');
           throw new Error('failed after onStart');
@@ -4642,7 +4722,7 @@ describe('ResumableAgentController resume metadata', () => {
     it('tells the trace lookup when a failure came before the run was created', async () => {
       mockGetFailedTurnTraceFields.mockResolvedValue({});
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         sendMessage: jest.fn(async (_text, options) => {
           options.onStart(
             { messageId: 'server-user', conversationId, isCreatedByUser: true, text: 'Hi' },
@@ -5284,6 +5364,7 @@ describe('ResumableAgentController resume metadata', () => {
     });
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 1000,
+      metadata: { agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' } },
       readyPromise: Promise.resolve(),
       abortController,
       emitter: { on: jest.fn() },
@@ -5294,7 +5375,7 @@ describe('ResumableAgentController resume metadata', () => {
         resolveCompletion = resolve;
       });
     });
-    const client = { options: {} };
+    const client = { options: { agent: { id: 'agent-123' } } };
     const initializeClient = jest.fn(async ({ signal }) => {
       expect(signal).toBe(abortController.signal);
       abortController.abort();
@@ -5347,7 +5428,7 @@ describe('ResumableAgentController resume metadata', () => {
       });
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       sendMessage: jest.fn().mockRejectedValue(generationError),
     };
     const initializeClient = jest.fn().mockResolvedValue({ client });
@@ -5413,7 +5494,7 @@ describe('ResumableAgentController resume metadata', () => {
     });
     mockGenerationJobManager.finishTerminalJob.mockImplementation(async () => signalFinished());
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       savedMessageIds: new Set(),
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -5515,7 +5596,7 @@ describe('ResumableAgentController resume metadata', () => {
       });
       mockGenerationJobManager.finishTerminalJob.mockImplementation(async () => signalFinished());
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         savedMessageIds: new Set(['response-msg']),
         skipSaveUserMessage: false,
         ...(run && { run }),
@@ -5588,7 +5669,11 @@ describe('ResumableAgentController resume metadata', () => {
     let allSubscribersLeftHandler;
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 1000,
-      metadata: { providerExecutionId: 'provider-segment-1', providerDrained: true },
+      metadata: {
+        agentRuntime: { engine: 'pi', sdkVersion: '1.4.0' },
+        providerExecutionId: 'provider-segment-1',
+        providerDrained: true,
+      },
       readyPromise: Promise.resolve(),
       abortController: new AbortController(),
       emitter: {
@@ -5645,7 +5730,7 @@ describe('ResumableAgentController resume metadata', () => {
       return message?.unfinished === true ? {} : undefined;
     });
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       savedMessageIds: new Set(['response-msg']),
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -5732,7 +5817,7 @@ describe('ResumableAgentController resume metadata', () => {
     );
     let observedHookResult;
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       savedMessageIds: new Set(),
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -5815,7 +5900,7 @@ describe('ResumableAgentController resume metadata', () => {
     });
     mockGenerationJobManager.finishTerminalJob.mockImplementation(async () => signalFinished());
     const client = {
-      options: {},
+      options: { agent: { id: 'agent-123' } },
       savedMessageIds: new Set(),
       skipSaveUserMessage: false,
       sendMessage: jest.fn(async (_text, options) => {
@@ -5956,6 +6041,13 @@ describe('ResumableAgentController resume metadata', () => {
         clientRequestId: 'req-event',
         agentEventDelivery: {
           deliveryKey: 'req-event',
+          event: {
+            id: 'first-event',
+            type: 'test.event',
+            occurredAt: Date.now(),
+            source: { id: 'test', type: 'api' },
+            payload: {},
+          },
           expectedAction: {
             toolName: 'submit_move',
             argumentSubset: { gameId: 'game-1', expectedPly: 7 },
@@ -6578,6 +6670,7 @@ describe('ResumableAgentController resume metadata', () => {
     const client = {
       options: {
         agent: {
+          id: 'agent-123',
           toolDefinitions: [],
           backgroundToolNames: ['submit_move'],
         },
@@ -6653,6 +6746,7 @@ describe('ResumableAgentController resume metadata', () => {
     const client = {
       options: {
         agent: {
+          id: 'agent-123',
           toolDefinitions: [],
           backgroundToolNames: ['submit_move'],
         },
@@ -6722,6 +6816,7 @@ describe('ResumableAgentController resume metadata', () => {
     const client = {
       options: {
         agent: {
+          id: 'agent-123',
           toolDefinitions: [],
           backgroundToolNames: ['submit_move'],
         },
@@ -6804,6 +6899,7 @@ describe('ResumableAgentController resume metadata', () => {
     const client = {
       options: {
         agent: {
+          id: 'agent-123',
           toolDefinitions: [],
           backgroundToolNames: ['submit_move'],
         },
@@ -7054,7 +7150,7 @@ describe('ResumableAgentController resume metadata', () => {
 
       let turnConversationId;
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         savedMessageIds: new Set(),
         skipSaveUserMessage: false,
         ...clientOverrides,
@@ -7236,7 +7332,7 @@ describe('ResumableAgentController resume metadata', () => {
         const runPausedFirstTurn = async ({ clientOverrides } = {}) => {
           mockGenerationJobManager.approvals.ownsPausePersistence.mockResolvedValue(true);
           const client = {
-            options: {},
+            options: { agent: { id: 'agent-123' } },
             savedMessageIds: new Set(),
             skipSaveUserMessage: false,
             pendingApproval: { actionId: 'action-paused-reference' },
@@ -7356,7 +7452,7 @@ describe('ResumableAgentController resume metadata', () => {
         });
 
       const client = {
-        options: {},
+        options: { agent: { id: 'agent-123' } },
         savedMessageIds: new Set(),
         skipSaveUserMessage: false,
         ...(run && { run }),

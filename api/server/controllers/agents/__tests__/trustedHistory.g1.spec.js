@@ -2,7 +2,7 @@
  * 等待 G1 实现，禁止在此分支改生产代码。
  *
  * Waiting for the G1 trusted-history implementation described in
- * docs/agent-platform/pi-trusted-history.md. Do not change production request,
+ * docs/agent-platform/pi-g1-trusted-history.md. Do not change production request,
  * history-loading, or agent-initialization code on this branch to make these
  * tests pass. A red result is the expected signal until that contract exists.
  */
@@ -287,6 +287,54 @@ describe('G1 trusted regeneration history', () => {
       modelCalls: 0,
       leaked: false,
     });
+  });
+
+  it('does not call the model when another branch message changes during the read', async () => {
+    const admitted = savedRow();
+    const req = {
+      method: 'POST',
+      path: '/',
+      body: regenerateBody(),
+      user: { id: 'user-1', tenantId: 'tenant-1' },
+    };
+    const admission = createPiRegenerationAdmission({
+      getMessages: async () => [savedRow()],
+    });
+    await new Promise((resolve, reject) => {
+      admission(req, { status: jest.fn().mockReturnThis(), json: jest.fn() }, (error) =>
+        error ? reject(error) : resolve(),
+      );
+    });
+    getHistoryMessages.mockResolvedValue([
+      {
+        user: 'user-1',
+        tenantId: 'tenant-1',
+        conversationId: admitted.conversationId,
+        messageId: 'parent-message',
+        parentMessageId: Constants.NO_PARENT,
+        isCreatedByUser: false,
+        text: CHANGED_TEXT,
+        updatedAt: '2026-01-01T00:00:01.000Z',
+        __v: 9,
+      },
+      admitted,
+    ]);
+    const client = createHistoryClient(req);
+    client.buildMessages = jest.fn();
+
+    await expect(
+      client.loadHistory(admitted.conversationId, admitted.messageId, {
+        isPiRegenerate: true,
+        request: req,
+        userMessageId: admitted.messageId,
+      }),
+    ).rejects.toMatchObject({
+      code: 'PI_HISTORY_CONFLICT',
+      retryable: true,
+      statusCode: 409,
+    });
+    expect(client.onHistoryLoaded).not.toHaveBeenCalled();
+    expect(client.buildMessages).not.toHaveBeenCalled();
   });
 
   it.each([

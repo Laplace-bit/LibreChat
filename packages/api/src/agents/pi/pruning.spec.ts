@@ -153,7 +153,7 @@ describe('projectPiHistory', () => {
     expect(JSON.stringify(messages.map((message) => message.toDict()))).toBe(originalSnapshot);
   });
 
-  it('does not plan compaction when the configured trigger has not fired', () => {
+  it('uses a safe pruned suffix when the configured summary trigger has not fired', () => {
     const messages = [
       new HumanMessage({ content: 'older question '.repeat(8), id: 'user-old' }),
       new AIMessage({ content: 'older answer '.repeat(8), id: 'assistant-old' }),
@@ -176,6 +176,30 @@ describe('projectPiHistory', () => {
     });
 
     expect(projection.compactionPlan).toBeUndefined();
+    expect(projection.pruned).toBe(true);
+    expect(projection.messages).not.toBe(messages);
+    expect(projection.messages).toEqual([messages[2]]);
+    expect(projection.conversion.prompt.text).toBe('current question');
+  });
+
+  it('keeps the original transcript when a fired summary trigger has no durable boundary', () => {
+    const messages = [
+      new HumanMessage('older question '.repeat(8)),
+      new AIMessage('older answer '.repeat(8)),
+      new HumanMessage('current question'),
+    ];
+    const pruning = createPruningOptions(messages, 0, 100);
+
+    const projection = projectPiHistory({
+      messages,
+      model,
+      tokenCounter,
+      pruning,
+      automaticCompaction: { retainRecent: { turns: 1 } },
+    });
+
+    expect(projection.compactionPlan).toBeUndefined();
+    expect(projection.pruned).toBe(false);
     expect(projection.messages).toBe(messages);
   });
 

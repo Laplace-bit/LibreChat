@@ -642,6 +642,34 @@ describe('createPiGenerationDispatcher automatic summarization', () => {
     return { value, createModelBinding, dispose };
   }
 
+  it('sends the safe pruned suffix when the summary trigger is not met', async () => {
+    const { value } = createAutoSummaryInput();
+    if (value.autoSummary == null) {
+      throw new Error('automatic summary test input must include a summary configuration');
+    }
+    value.autoSummary = {
+      ...value.autoSummary,
+      trigger: { type: 'messages_to_refine', value: 100 },
+    };
+    const execute = jest.fn(async (executorInput: PiGenerationExecutorInput) => {
+      const binding = await executorInput.createModelBinding();
+      try {
+        expect(executorInput.operation).toEqual({
+          kind: 'ordered_prompt',
+          content: [{ type: 'text', text: 'current user question' }],
+        });
+        return { status: 'completed' as const };
+      } finally {
+        await binding.dispose();
+      }
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(dispatch(value)).resolves.toMatchObject({ status: 'completed' });
+
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('summarizes once, persists coverage, then starts the primary turn with the retained user prompt', async () => {
     const order: string[] = [];
     const execute = jest.fn(async (value: PiGenerationExecutorInput) => {

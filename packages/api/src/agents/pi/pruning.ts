@@ -158,6 +158,25 @@ function isExactPrefixSuffixPartition(input: {
   return expectedIndex === messages.length;
 }
 
+function isSafeProviderProjection(input: {
+  messages: readonly BaseMessage[];
+  prefix: readonly BaseMessage[];
+  suffix: readonly BaseMessage[];
+  indices: ReturnType<typeof getMessageIndices>;
+}): boolean {
+  const { messages, prefix, suffix, indices } = input;
+  // Tool-result caps can clone a message that has no durable ID. When the
+  // pruner dropped nothing, equal lengths let its stable-order projection map
+  // those clones by position. A dropped prefix still needs identity proof.
+  if (prefix.length === 0 && suffix.length === messages.length) {
+    return suffix.every((message, index) => {
+      const resolvedIndex = resolveMessageIndex(message, indices);
+      return resolvedIndex == null || resolvedIndex === index;
+    });
+  }
+  return isExactPrefixSuffixPartition(input);
+}
+
 /**
  * Produces an automatic-compaction plan only when the SDK pruner yields a
  * provable contiguous prefix/suffix split and the original latest user message
@@ -169,7 +188,6 @@ function createCompactionPlan(input: {
   model: PiHistoryModel;
   tokenCounter: PiContextUsageProjectionInput['tokenCounter'];
   pruning: PiHistoryPruningOptions;
-  trigger?: SummarizationTrigger;
   retainRecent?: { turns?: number; tokens?: number };
   systemMessageCount: number;
   conversationMessages: BaseMessage[];
@@ -177,19 +195,7 @@ function createCompactionPlan(input: {
   instructionTokens: number;
 }): PiHistoryCompactionPlan | undefined {
   const { messagesToRefine = [], context } = input.projection;
-  if (
-    messagesToRefine.length === 0 ||
-    !shouldTriggerSummarization({
-      trigger: input.trigger,
-      maxContextTokens: input.pruning.maxContextTokens,
-      prePruneContextTokens:
-        input.projection.prePruneContextTokens == null
-          ? undefined
-          : input.projection.prePruneContextTokens + input.instructionTokens,
-      remainingContextTokens: input.projection.remainingContextTokens,
-      messagesToRefineCount: messagesToRefine.length,
-    })
-  ) {
+  if (messagesToRefine.length === 0) {
     return undefined;
   }
 
@@ -335,27 +341,69 @@ export function projectPiHistory(input: PiHistoryProjectionInput): PiHistoryProj
     messages: [...conversationMessages],
     canonicalMessages: conversationMessages,
   });
+  const automaticCompaction = input.automaticCompaction;
+  const summaryTriggerFired =
+    automaticCompaction != null &&
+    shouldTriggerSummarization({
+      trigger: automaticCompaction.trigger,
+      maxContextTokens: effectivePruning.maxContextTokens,
+      prePruneContextTokens:
+        projection.prePruneContextTokens == null
+          ? undefined
+          : projection.prePruneContextTokens + instructionTokens,
+      remainingContextTokens: projection.remainingContextTokens,
+      messagesToRefineCount: projection.messagesToRefine?.length ?? 0,
+    });
   const compactionPlan =
-    input.automaticCompaction == null
-      ? undefined
-      : createCompactionPlan({
+    summaryTriggerFired && automaticCompaction != null
+      ? createCompactionPlan({
           messages: input.messages,
           model: input.model,
           tokenCounter: input.tokenCounter,
           pruning: effectivePruning,
-          trigger: input.automaticCompaction.trigger,
-          retainRecent: input.automaticCompaction.retainRecent,
+          retainRecent: automaticCompaction.retainRecent,
           systemMessageCount,
           conversationMessages,
           projection,
           instructionTokens,
-        });
+        })
+      : undefined;
   const compaction = compactionPlan == null ? {} : { compactionPlan };
 
+  if (summaryTriggerFired) {
+    return {
+      messages: input.messages,
+      conversion: originalConversion,
+      pruned: false,
+      ...compaction,
+    };
+  }
+
+  const isUnchanged =
+    projection.context.length === conversationMessages.length &&
+    projection.context.every((message, index) => message === conversationMessages[index]);
+  const indices = getMessageIndices(conversationMessages);
+  const retainedStartIndex =
+    projection.context.length === 0
+      ? undefined
+      : resolveMessageIndex(projection.context[0], indices);
+  let latestUserIndex = -1;
+  for (const [index, message] of conversationMessages.entries()) {
+    if (HumanMessage.isInstance(message)) {
+      latestUserIndex = index;
+    }
+  }
+
   if (
-    projection.context.length !== conversationMessages.length ||
-    (projection.messagesToRefine?.length ?? 0) > 0 ||
-    projection.context.every((message, index) => message === conversationMessages[index])
+    isUnchanged ||
+    retainedStartIndex == null ||
+    latestUserIndex < retainedStartIndex ||
+    !isSafeProviderProjection({
+      messages: conversationMessages,
+      prefix: projection.messagesToRefine ?? [],
+      suffix: projection.context,
+      indices,
+    })
   ) {
     return {
       messages: input.messages,

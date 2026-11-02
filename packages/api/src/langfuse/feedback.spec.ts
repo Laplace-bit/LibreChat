@@ -3,14 +3,16 @@ import type { AppConfig } from '@librechat/data-schemas';
 process.env.CREDS_KEY =
   process.env.CREDS_KEY ?? '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
+const mockLangfuseLogger = {
+  debug: jest.fn(),
+  error: jest.fn(),
+  warn: jest.fn(),
+};
+
 jest.mock(
   '@librechat/data-schemas',
   () => ({
-    logger: {
-      debug: jest.fn(),
-      error: jest.fn(),
-      warn: jest.fn(),
-    },
+    logger: mockLangfuseLogger,
     decryptV3: jest.fn((value: string) => {
       if (value === 'v3:test:tenant-secret-key') {
         return 'tenant-secret-key';
@@ -67,9 +69,12 @@ function enableTenantFanout() {
   process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://collector:4318';
 }
 
-async function loadFeedback(): Promise<typeof import('./feedback')> {
+async function loadFeedback(): Promise<
+  typeof import('./feedback') & { logger: typeof mockLangfuseLogger }
+> {
   jest.resetModules();
-  return import('./feedback');
+  const feedback = await import('./feedback');
+  return { ...feedback, logger: mockLangfuseLogger };
 }
 
 function getFetchMock(): jest.SpiedFunction<typeof fetch> {
@@ -1142,8 +1147,7 @@ describe('Langfuse feedback scores', () => {
     fetchMock
       .mockResolvedValueOnce(new Response('central down', { status: 500 }))
       .mockResolvedValueOnce(new Response(null, { status: 200 }));
-    const { sendFeedbackScore } = await loadFeedback();
-    const { logger } = await import('@librechat/data-schemas');
+    const { sendFeedbackScore, logger } = await loadFeedback();
 
     await expect(
       sendFeedbackScore({
@@ -1171,8 +1175,7 @@ describe('Langfuse feedback scores', () => {
     fetchMock
       .mockResolvedValueOnce(new Response(null, { status: 200 }))
       .mockResolvedValueOnce(new Response('tenant down', { status: 503 }));
-    const { sendFeedbackScore } = await loadFeedback();
-    const { logger } = await import('@librechat/data-schemas');
+    const { sendFeedbackScore, logger } = await loadFeedback();
 
     await expect(
       sendFeedbackScore({

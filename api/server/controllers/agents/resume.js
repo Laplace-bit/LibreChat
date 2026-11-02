@@ -854,6 +854,13 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       generationProtocolVersion,
     );
   }
+  const requestEventBindingId = req._agentEventBindingId;
+  const eventActorHistoryToken = job.metadata?.agentEventLegacyTurnToken;
+  const hasEventActorResumeContext =
+    job.metadata?.agentEventBindingId != null ||
+    eventActorHistoryToken != null ||
+    requestEventBindingId != null ||
+    req._agentEventBindingParentConversationId != null;
 
   // The resume must rebuild the SAME agent/endpoint that paused. Require an EXACT
   // agent_id match when the paused job had one — a request that omits agent_id (or
@@ -1003,6 +1010,46 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
       res,
       409,
       { error: 'This decision targets a stale action' },
+      generationProtocolVersion,
+    );
+  }
+
+  /**
+   * A Pi Event Actor can resume only the ordinary history adapter. The token is
+   * written by the server before the original Pi turn starts and remains live
+   * while that turn is paused. Check the current binding and reject checkpoint,
+   * expected-action, and detached-completion jobs before the approval CAS spends
+   * the user's decision.
+   */
+  const piHistoryEventActorResumeEligible =
+    runtimeResolution.status === 'available' &&
+    job.metadata?.agentRuntime?.engine === 'pi' &&
+    job.metadata?.agentEventBindingId === requestEventBindingId &&
+    typeof requestEventBindingId === 'string' &&
+    requestEventBindingId.length > 0 &&
+    req._isAgentTrigger !== true &&
+    typeof req._agentEventBindingParentConversationId === 'string' &&
+    req._agentEventBindingParentConversationId.length > 0 &&
+    typeof req._agentEventBindingParentAgentId === 'string' &&
+    req._agentEventBindingParentAgentId.length > 0 &&
+    (req._agentEventBindingTenantId ?? undefined) === (job.metadata?.tenantId ?? undefined) &&
+    typeof job.metadata?.agentEventDeliveryKey === 'string' &&
+    job.metadata.agentEventDeliveryKey.length > 0 &&
+    typeof eventActorHistoryToken === 'string' &&
+    eventActorHistoryToken.length > 0 &&
+    job.metadata?.agentEventExpectedAction == null &&
+    job.metadata?.agentEventSuspension == null &&
+    job.metadata?.agentEventInvocationKey == null &&
+    job.metadata?.agentEventInvocationGenerationCreatedAt == null &&
+    job.metadata?.agentEventDetachedActionProducerRequired !== true;
+  if (hasEventActorResumeContext && !piHistoryEventActorResumeEligible) {
+    return sendGenerationJson(
+      res,
+      503,
+      {
+        code: 'EVENT_ACTOR_PI_RESUME_UNAVAILABLE',
+        error: 'This Event Actor pause cannot be resumed by the Pi runtime.',
+      },
       generationProtocolVersion,
     );
   }
@@ -1533,6 +1580,61 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         await releaseScheduleFence();
         await decrementPendingRequest(userId);
         return sendGenerationJson(res, 409, eventActorRejection, generationProtocolVersion);
+      }
+      if (piHistoryEventActorResumeEligible) {
+        let actorSnapshot;
+        try {
+          actorSnapshot = await getAgentEventActorSnapshot({
+            user: userId,
+            conversationId,
+            ...(req._agentEventBindingTenantId == null
+              ? {}
+              : { tenantId: req._agentEventBindingTenantId }),
+          });
+        } catch (error) {
+          logger.warn(
+            '[ResumeAgentController] Failed to verify Pi history Event Actor token',
+            getSafeErrorMetadata(error),
+          );
+          const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+          await rollbackUnconsumedScheduleClaim(currentJob);
+          await releaseScheduleFence();
+          await decrementPendingRequest(userId);
+          res.set('Retry-After', '1');
+          return sendGenerationJson(
+            res,
+            503,
+            {
+              code: 'EVENT_ACTOR_NOT_READY',
+              error: 'The event actor history is temporarily unavailable.',
+            },
+            generationProtocolVersion,
+          );
+        }
+        if (actorSnapshot?.legacyTurn?.token !== eventActorHistoryToken) {
+          const currentJob = await GenerationJobManager.getJob(streamId).catch(() => null);
+          await rollbackUnconsumedScheduleClaim(currentJob);
+          await releaseScheduleFence();
+          await decrementPendingRequest(userId);
+          return sendGenerationJson(
+            res,
+            409,
+            {
+              code: 'EVENT_ACTOR_TURN_STALE',
+              error: 'This event actor continuation is no longer current.',
+            },
+            generationProtocolVersion,
+          );
+        }
+        /** Server-only proof carried from the owned Pi job and matching live
+         * Conversation token. The Pi adapter may now resume from durable message
+         * history without loading EventActor/LangGraph checkpoint state. */
+        Object.defineProperty(req, '_piEventActorHistoryResumeEligible', {
+          configurable: false,
+          enumerable: false,
+          value: true,
+          writable: false,
+        });
       }
       /** Missing means this pause was produced by a pre-durable-suspension
        * replica and must retain the legacy resume path during rolling deploys.

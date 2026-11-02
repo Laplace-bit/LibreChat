@@ -6507,15 +6507,29 @@ describe('ResumableAgentController resume metadata', () => {
       undefined,
     ],
     [
-      'pre-capability pause consumer fleet',
+      'pre-capability pause consumer fleet with expected action',
       { toolDefinitions: [] },
       { toolApproval: { enabled: true } },
       undefined,
       undefined,
       1,
     ],
+    [
+      'ordinary pause-capable history',
+      { toolDefinitions: [] },
+      { toolApproval: { enabled: true } },
+      undefined,
+      undefined,
+    ],
+    [
+      'ordinary ask-user history',
+      { toolDefinitions: [{ name: 'ask_user_question' }] },
+      {},
+      undefined,
+      undefined,
+    ],
   ])(
-    'allows only history-strategy %s event actors onto Pi',
+    'admits only actionless bound history Event Actors onto Pi: %s',
     async (_label, agent, config, agentConfigs, clientOptions, generationProtocolVersion = 2) => {
       mockGenerationJobManager.claimGeneration.mockResolvedValue(
         wonGenerationClaim({
@@ -6553,7 +6567,10 @@ describe('ResumableAgentController resume metadata', () => {
         }),
       };
       const shouldUseHistory =
-        _label === 'memory-checkpointer' || _label === 'pre-capability pause consumer fleet';
+        _label === 'ordinary pause-capable history' || _label === 'ordinary ask-user history';
+      const expectedStrategy =
+        _label === 'background-capable expected action' ? 'checkpoint' : 'history';
+      const expectedAction = shouldUseHistory ? undefined : { toolName: 'submit_move' };
       eventRequest = {
         user: { id: 'user-123', tenantId: 'tenant-1' },
         body: {
@@ -6565,7 +6582,7 @@ describe('ResumableAgentController resume metadata', () => {
           agentEventDelivery: {
             deliveryKey: 'req-event-hitl',
             target: { bindingId: 'binding-1' },
-            expectedAction: { toolName: 'submit_move' },
+            ...(expectedAction == null ? {} : { expectedAction }),
             event: {
               id: 'event-hitl',
               type: 'test.event',
@@ -6596,7 +6613,7 @@ describe('ResumableAgentController resume metadata', () => {
       await nextTick();
 
       expect(mockResolveAgentTurnExecutionPlan.mock.results.at(-1)?.value.strategy).toBe(
-        shouldUseHistory ? 'history' : 'checkpoint',
+        expectedStrategy,
       );
       expect(mockExecuteAgentEventActor).not.toHaveBeenCalled();
 
@@ -6687,7 +6704,6 @@ describe('ResumableAgentController resume metadata', () => {
         agentEventDelivery: {
           deliveryKey: 'req-event-metadata-failure',
           target: { bindingId: 'binding-1' },
-          expectedAction: { toolName: 'submit_move' },
           event: {
             id: 'event-metadata-failure',
             type: 'test.event',
@@ -6763,7 +6779,6 @@ describe('ResumableAgentController resume metadata', () => {
         agentEventDelivery: {
           deliveryKey: 'req-event-fence-lost',
           target: { bindingId: 'binding-1' },
-          expectedAction: { toolName: 'submit_move' },
           event: {
             id: 'event-fence-lost',
             type: 'test.event',
@@ -6835,7 +6850,6 @@ describe('ResumableAgentController resume metadata', () => {
         agentEventDelivery: {
           deliveryKey: 'req-event-error-persistence',
           target: { bindingId: 'binding-1' },
-          expectedAction: { toolName: 'submit_move' },
           event: {
             id: 'event-error-persistence',
             type: 'test.event',
@@ -6918,7 +6932,6 @@ describe('ResumableAgentController resume metadata', () => {
         agentEventDelivery: {
           deliveryKey: 'req-event-stale-legacy',
           target: { bindingId: 'binding-1' },
-          expectedAction: { toolName: 'submit_move' },
           event: {
             id: 'event-stale-legacy',
             type: 'test.event',

@@ -1645,10 +1645,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   req._agentEventTriggerProjection = getAgentEventTriggerProjection(agentEventDelivery);
 
   /** A Pi Event Actor may use the ordinary durable-history path only when the
-   * authenticated delivery is bound to this conversation. Checkpoint turns
-   * need a Pi-owned durable continuation and are rejected after their resolved
-   * turn plan is available below. Internal detached completions are resumes,
-   * not new Event Actor invocations. */
+   * authenticated delivery is bound to this conversation. Checkpoint turns and
+   * expected-action continuations need Pi-owned action state and are rejected
+   * after their resolved turn plan is available below. Internal detached
+   * completions are resumes, not new Event Actor invocations. */
   const isPiBoundHistoryEventActorCandidate =
     req._isAgentTrigger === true &&
     isTriggerContinuation &&
@@ -2226,20 +2226,22 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             }
           : undefined,
       canPause: eventActorMayPause,
-      /** Old trusted producers can coexist during a direct rolling upgrade.
-       * Their immutable v1 request keeps pause-capable turns on the history
-       * adapter until every consumer understands durable suspensions. */
-      durableEventActorSuspensions: generationProtocolVersion >= GENERATION_PROTOCOL_V2,
+      /** Pi resumes from GenerationJobManager's durable history token; it does
+       * not consume EventActor/LangGraph checkpoint suspensions. */
+      durableEventActorSuspensions: false,
       checkpointerType: agentsConfig?.checkpointer?.type,
     });
 
     if (selectedAgentRuntime.engine === 'pi' && isPiBoundHistoryEventActorCandidate) {
-      if (turnExecutionPlan.strategy !== 'history') {
+      if (turnExecutionPlan.strategy !== 'history' || turnExecutionPlan.expectedAction != null) {
         throw new AgentRuntimeUnavailableError();
       }
       /** This marker is written only after authenticated binding/delivery checks
-       * and the resolved turn plan. AgentClient treats it as the sole permission
-       * to run a Pi history Event Actor; request data cannot set it. */
+       * and the resolved turn plan. The history adapter serializes ordinary Pi
+       * turns across pauses. Event actions that depend on checkpoint evidence or
+       * detached completion remain unavailable until Pi owns that lifecycle.
+       * AgentClient treats this as the sole permission to run a Pi history Event
+       * Actor; request data cannot set it. */
       Object.defineProperty(req, '_piEventActorHistoryInvocationEligible', {
         configurable: false,
         enumerable: false,

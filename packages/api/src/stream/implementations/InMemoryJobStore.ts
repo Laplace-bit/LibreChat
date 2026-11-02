@@ -40,6 +40,7 @@ import {
   PAUSE_PERSISTENCE_TIMEOUT_MS,
   PROVIDER_DRAIN_TIMEOUT_MS,
   PI_PROVIDER_OWNER_LOST_ERROR,
+  isConfirmedPiProviderOwnerLoss,
   isPendingActionStale,
   toWireRunSteps,
 } from '~/stream/interfaces/IJobStore';
@@ -1163,7 +1164,10 @@ export class InMemoryJobStore implements IJobStoreV2 {
       }
     } else if (ownerToken == null && leaseExpiresAt == null) {
       const startedAt = job.terminalPersistenceStartedAt ?? job.completedAt ?? job.createdAt;
-      if (!Number.isSafeInteger(startedAt) || startedAt < 0 || now - startedAt < legacyTimeoutMs) {
+      if (
+        !isConfirmedPiProviderOwnerLoss(job) &&
+        (!Number.isSafeInteger(startedAt) || startedAt < 0 || now - startedAt < legacyTimeoutMs)
+      ) {
         return false;
       }
     } else {

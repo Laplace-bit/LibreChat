@@ -84,6 +84,13 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
+jest.mock('~/admin/secrets', () => ({
+  ...jest.requireActual('~/admin/secrets'),
+  decryptConfigSecret: jest.fn((value: unknown) =>
+    value === 'v3:test:sk-tenant-1' ? 'sk-tenant-1' : undefined,
+  ),
+}));
+
 // Mock Run.create to capture the graphConfig it receives
 jest.mock('@librechat/agents', () => {
   const actual = jest.requireActual('@librechat/agents');

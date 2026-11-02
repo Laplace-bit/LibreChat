@@ -1,5 +1,8 @@
-const mockCreateRun = jest.fn();
-const mockRuntimeCounter = jest.fn((counter) => counter);
+const mockExecutePiGeneration = jest.fn();
+const mockGetAgentPiModelBindingFactory = jest.fn();
+const mockRuntimeCounter = jest.fn((counter, encoding) =>
+  jest.requireActual('@librechat/api').withRetainedAnswerTokenCounter(counter, encoding),
+);
 const mockCountFormattedMessageTokens = jest.fn(
   (message) => JSON.stringify(message?.content ?? '').length,
 );
@@ -26,7 +29,8 @@ jest.mock('@librechat/api', () => ({
       ...input,
       countTokens: (text) => mockCountFormattedMessageTokens({ role: 'user', content: text }),
     }),
-  createRun: (...args) => mockCreateRun(...args),
+  executePiGeneration: (...args) => mockExecutePiGeneration(...args),
+  getAgentPiModelBindingFactory: (...args) => mockGetAgentPiModelBindingFactory(...args),
   countFormattedMessageTokens: (...args) => mockCountFormattedMessageTokens(...args),
   countTokens: jest.fn((text) => Math.ceil(String(text ?? '').length / 4)),
   createCachedTokenCounter: jest.fn(async () => mockCountFormattedMessageTokens),
@@ -61,10 +65,12 @@ jest.mock('~/config', () => ({
   getMCPManager: jest.fn(() => ({ formatInstructionsForContext: mockFormatInstructions })),
 }));
 
-const { Constants, ContentTypes, EModelEndpoint } = require('librechat-data-provider');
+const { Constants, ContentTypes, EModelEndpoint, Tools } = require('librechat-data-provider');
+const { GraphEvents } = require('@librechat/agents');
 const { getMessages } = require('~/models');
 const AgentClient = require('../client');
-const { applyRetainedAnswers, GenerationJobManager } = jest.requireActual('@librechat/api');
+const { applyRetainedAnswers, GenerationJobManager, PINNED_PI_AGENT_RUNTIME } =
+  jest.requireActual('@librechat/api');
 const { formatAgentMessages } = jest.requireActual('@librechat/agents');
 
 async function buildPrompt(client, rows, parent) {
@@ -178,6 +184,7 @@ function makeClient(agentsConfig = {}) {
       config: { endpoints: { [EModelEndpoint.agents]: agentsConfig } },
     },
     res: {},
+    agentRuntime: PINNED_PI_AGENT_RUNTIME,
     agent: {
       id: 'agent-123',
       endpoint: EModelEndpoint.openAI,
@@ -213,6 +220,8 @@ describe('AgentClient retained answers', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockGetAgentPiModelBindingFactory.mockReturnValue(jest.fn());
+    mockExecutePiGeneration.mockResolvedValue({ status: 'completed', usage: [] });
     mockFormatInstructions.mockResolvedValue('');
     getMessages.mockResolvedValue([]);
   });
@@ -255,79 +264,135 @@ describe('AgentClient retained answers', () => {
   });
 
   it.each(['cold', 'warm'])(
-    'delivers the block through %s chatCompletion while memory receives the unmodified SDK transcript',
-    async (continuation) => {
+    'dispatches %s retained answers to Pi while memory receives the original transcript',
+    async (historyState) => {
       const client = makeClient();
       client.processMemory = jest.fn();
       client.runMemory = jest.fn().mockResolvedValue();
       client.user = 'user-123';
       getMessages.mockResolvedValue(compactedBranch());
-      const cut = await client.loadHistory('convo-123', 'u3');
-      const built = await client.buildMessages(cut, 'u3', {});
-      client.eventActorContinuation = continuation;
+      const built =
+        historyState === 'cold'
+          ? await client.buildMessages(await client.loadHistory('convo-123', 'u3'), 'u3', {})
+          : await client.buildMessages([latestUserMessage()], 'u3', {});
       mockFormatAgentMessages.mockImplementationOnce(formatAgentMessages);
-      const processStream = jest.fn().mockResolvedValue();
-      mockCreateRun.mockResolvedValueOnce({
-        Graph: null,
-        graphRunnable: { getState: jest.fn().mockResolvedValue({ values: { messages: [] } }) },
-        processStream,
-        getCalibrationRatio: jest.fn(() => 0),
-        getInterrupt: jest.fn(() => undefined),
-      });
 
       await client.chatCompletion({ payload: built.prompt });
 
-      expect(mockCreateRun).toHaveBeenCalledTimes(1);
-      const input = mockCreateRun.mock.calls[0][0];
+      expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+      const [input] = mockExecutePiGeneration.mock.calls[0];
       expect(input.messages.map(contentText).join('\n')).toContain(ANSWER_LINE);
+      expect(input.messages.map(contentText).join('\n')).toContain(LATEST_TEXT);
       expect(mockRuntimeCounter).toHaveBeenCalledTimes(1);
-      expect(input.tokenCounter).toBe(mockRuntimeCounter.mock.results[0].value);
-      if (continuation === 'warm') {
-        expect(input.indexTokenCountMap).toEqual({});
-        expect(
-          input.tokenCounter(
-            input.messages.find((message) => message.id === 'librechat:retained-answers'),
-          ),
-        ).toBeGreaterThan(0);
-      } else {
-        expect(input.indexTokenCountMap[input.messages.length - 1]).toBe(built.tokenCountMap.u3);
-      }
-      expect(client.runMemory).toHaveBeenCalledTimes(1);
-      expect(contentText(client.runMemory.mock.calls[0][0].at(-1))).not.toContain(ANSWER_LINE);
-      expect(client.memoryPayload).toBeNull();
-      expect(processStream).toHaveBeenCalledTimes(1);
-      expect(processStream.mock.calls[0][0].messages.map(contentText).join('\n')).toContain(
-        ANSWER_LINE,
+      expect(input.contextUsage.tokenCounter).toBe(mockRuntimeCounter.mock.results[0].value);
+      const retainedMessage = input.messages.find((message) =>
+        message.additional_kwargs?.librechat_retained_answers?.includes(ANSWER_LINE),
       );
+      expect(retainedMessage).toBeDefined();
+      const retainedBlock = retainedMessage.additional_kwargs.librechat_retained_answers;
+      const messageWithoutRetainedBlock = new retainedMessage.constructor({
+        content: retainedMessage.content.replace(retainedBlock, ''),
+        additional_kwargs: retainedMessage.additional_kwargs,
+        id: retainedMessage.id,
+      });
+      expect(input.contextUsage.tokenCounter(retainedMessage)).toBeGreaterThan(
+        input.contextUsage.tokenCounter(messageWithoutRetainedBlock),
+      );
+      expect(client.runMemory).toHaveBeenCalledTimes(1);
+      const memoryMessages = client.runMemory.mock.calls[0][0];
+      expect(memoryMessages.map(contentText).join('\n')).not.toContain(ANSWER_LINE);
+      expect(contentText(memoryMessages.at(-1))).toContain(LATEST_TEXT);
+      expect(client.memoryPayload).toBeNull();
+      expect(client.run).toBeUndefined();
+      if (historyState === 'warm') {
+        expect(getMessages).toHaveBeenCalledWith(...ROW_QUERY);
+      }
     },
   );
 
-  it('passes the retained-aware runtime counter to checkpoint resumes', async () => {
+  it('passes the retained-aware token counter through a Pi approval resume', async () => {
     const client = makeClient();
     const job = await GenerationJobManager.createJob('convo-123', 'user-123', 'convo-123');
     client.jobCreatedAt = job.createdAt;
     const counter = jest.fn(() => 123);
     mockRuntimeCounter.mockReturnValueOnce(counter);
-    const resume = jest.fn().mockResolvedValue();
-    mockCreateRun.mockResolvedValueOnce({
-      Graph: null,
-      resume,
-      processStream: jest.fn().mockResolvedValue(),
-      getCalibrationRatio: jest.fn(() => 0),
-      getInterrupt: jest.fn(() => undefined),
+    mockExecutePiGeneration.mockImplementationOnce(async ({ onSessionCreated }) => {
+      onSessionCreated?.();
+      return { status: 'completed', usage: [] };
     });
+    client.options.req._resumableStreamId = 'convo-123';
+    client.options.req.body.agent_id = 'agent-123';
+    client.options.agent.tools = [{ name: Tools.file_search }];
+    client.options.agent.toolDefinitions = [
+      {
+        name: Tools.file_search,
+        description: 'Search the agent files.',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+        },
+      },
+    ];
+    client.options.eventHandlers = {
+      [GraphEvents.ON_TOOL_EXECUTE]: { handle: jest.fn() },
+    };
+    client.parentMessageId = 'resume-user-message';
+    const historyRows = [
+      {
+        messageId: 'resume-user-message',
+        parentMessageId: Constants.NO_PARENT,
+        sender: 'User',
+        text: 'Continue the search.',
+        isCreatedByUser: true,
+      },
+    ];
+    client.loadHistory = jest.fn(async () => {
+      client.onHistoryLoaded(historyRows);
+      return historyRows;
+    });
+    client.buildMessages = jest.fn().mockResolvedValue({
+      prompt: [{ role: 'user', content: 'Continue the search.' }],
+    });
+    client.getBuildMessagesOptions = jest.fn(() => ({}));
+    client.isCompactionTurn = jest.fn(() => false);
+    const continuation = {
+      version: 1,
+      actionId: 'action-retained-counter',
+      piToolCallId: 'pi-tool-retained-counter',
+      hostToolCallId: 'host-tool-retained-counter',
+      toolTurn: 0,
+      allowedDecisions: ['approve', 'reject'],
+      stepIdentity: {
+        id: 'step-retained-counter',
+        index: 0,
+        messageId: client.responseMessageId,
+        runId: client.responseMessageId,
+        agentId: client.options.agent.id,
+      },
+      stepCreatedAt: 100,
+      toolName: Tools.file_search,
+      args: { query: 'resume files' },
+    };
 
     await client.resumeCompletion({
-      resumeValue: { answer: 'staging' },
+      piApprovalContinuation: continuation,
+      piApprovalDecision: { kind: 'reject' },
       streamId: 'convo-123',
       checkpointNamespace: 'retained-counter',
     });
 
     expect(mockRuntimeCounter).toHaveBeenCalledTimes(1);
-    expect(mockCreateRun.mock.calls[0][0]).toEqual(
-      expect.objectContaining({ messages: [], tokenCounter: counter }),
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0].contextUsage.tokenCounter).toBe(counter);
+    expect(mockExecutePiGeneration.mock.calls[0][0].resumeToolResult.continuation).toEqual(
+      continuation,
     );
-    expect(resume).toHaveBeenCalledTimes(1);
+    expect(client.runtimeProgress).toMatchObject({
+      selection: { engine: 'pi', sdkVersion: '1.4.0' },
+      started: true,
+      status: 'completed',
+    });
   });
 
   it('reads nothing when the rows in memory already reach the branch root', async () => {

@@ -1,7 +1,12 @@
+import type { ContentPartsSlotProps } from '@librechat/chat/react';
+import type { ReactNode } from 'react';
 import type { MessagePartsHost } from '~/hooks/Chat/contract';
 
 /** The host slots drawn with app components that import the markdown stack. */
-export type AppPartRenderers = Pick<MessagePartsHost, 'renderMarkdown' | 'renderAgentIcon'>;
+export type AppPartRenderers = Pick<
+  MessagePartsHost,
+  'renderMarkdown' | 'renderAgentIcon' | 'renderImage' | 'renderFilePreview'
+>;
 
 let appPartRenderers: AppPartRenderers | null = null;
 
@@ -20,4 +25,20 @@ export function getAppPartRenderers(): AppPartRenderers {
     );
   }
   return appPartRenderers;
+}
+
+let appContentParts: ((props: ContentPartsSlotProps) => ReactNode) | null = null;
+
+/** Registers the app's content-parts renderer without importing the content stack into the host. */
+export function setAppContentParts(render: (props: ContentPartsSlotProps) => ReactNode): void {
+  appContentParts = render;
+}
+
+export function getAppContentParts(): (props: ContentPartsSlotProps) => ReactNode {
+  if (appContentParts == null) {
+    throw new Error(
+      'The content-parts renderer is registered by ~/components/Chat/Messages/Content/register.',
+    );
+  }
+  return appContentParts;
 }

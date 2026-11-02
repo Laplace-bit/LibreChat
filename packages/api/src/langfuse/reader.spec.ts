@@ -101,12 +101,14 @@ function setup({
   destinations = [central, connection],
   responses = [] as Array<Response | Error>,
   route,
+  createTraceReader = createLangfuseTraceReader,
 }: {
   refs?: ConversationTraceRefs;
   destinations?: LangfuseScoreDestination[];
   responses?: Array<Response | Error>;
   /** Answers each Langfuse request by what it asks for, instead of by arrival order. */
   route?: (request: RoutedRequest) => Response | Error;
+  createTraceReader?: typeof createLangfuseTraceReader;
 } = {}) {
   const fetchMock = jest.fn(async (url: string, _init: RequestInit): Promise<Response> => {
     const next = route ? route(routeOf(url)) : responses.shift();
@@ -162,7 +164,7 @@ function setup({
     ),
   );
   const resolveDestinations = jest.fn(async () => destinations);
-  const reader = createLangfuseTraceReader({
+  const reader = createTraceReader({
     getConversationTraceRefs,
     hasSampledTraceMessage,
     resolveDestinations,
@@ -273,18 +275,25 @@ describe('createLangfuseTraceReader', () => {
     });
 
     it('explains once when no destination can read traces at all', async () => {
-      const { reader, hasSampledTraceMessage } = setup({ destinations: [] });
-      const { logger } = jest.requireMock<{ logger: { warn: jest.Mock } }>(
-        '@librechat/data-schemas',
-      );
-      logger.warn.mockClear();
+      await jest.isolateModulesAsync(async () => {
+        const [{ createLangfuseTraceReader: isolatedReader }, { logger }] = await Promise.all([
+          import('./reader'),
+          import('@librechat/data-schemas'),
+        ]);
+        const { reader, hasSampledTraceMessage } = setup({
+          destinations: [],
+          createTraceReader: isolatedReader,
+        });
+        const warn = logger.warn as unknown as jest.Mock;
+        warn.mockClear();
 
-      await expect(reader.isAvailable(createQuery())).resolves.toEqual({ available: false });
-      await expect(reader.isAvailable(createQuery())).resolves.toEqual({ available: false });
+        await expect(reader.isAvailable(createQuery())).resolves.toEqual({ available: false });
+        await expect(reader.isAvailable(createQuery())).resolves.toEqual({ available: false });
 
-      expect(hasSampledTraceMessage).not.toHaveBeenCalled();
-      expect(logger.warn).toHaveBeenCalledTimes(1);
-      expect(logger.warn.mock.calls[0][0]).toContain('no destination with read credentials');
+        expect(hasSampledTraceMessage).not.toHaveBeenCalled();
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls[0][0]).toContain('no destination with read credentials');
+      });
     });
 
     it('answers from one existence query without loading every response or reading Langfuse', async () => {

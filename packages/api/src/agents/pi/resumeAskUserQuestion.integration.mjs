@@ -744,20 +744,36 @@ test('Pi ask-user pauses over SSE and resumes through POST /api/agents/chat/resu
             streamId: initializeInput.req._resumableStreamId,
             jobCreatedAt: initializeInput.jobCreatedAt,
             sseFrames,
-            parentMessageId: THREAD_PARENT_ID,
+            parentMessageId: USER_MESSAGE_ID,
           });
-          client.loadHistory = async () => [
-            {
-              messageId: USER_MESSAGE_ID,
-              conversationId: streamId,
-              parentMessageId: THREAD_PARENT_ID,
-              isCreatedByUser: true,
-              text: USER_PROMPT,
-              content: USER_PROMPT,
-              role: 'user',
-              user: USER_ID,
-            },
-          ];
+          client.loadHistory = async () => {
+            const rows = [
+              {
+                id: THREAD_PARENT_ID,
+                messageId: THREAD_PARENT_ID,
+                conversationId: streamId,
+                parentMessageId: null,
+                isCreatedByUser: false,
+                text: 'Earlier conversation context.',
+                content: 'Earlier conversation context.',
+                role: 'assistant',
+                user: USER_ID,
+              },
+              {
+                id: USER_MESSAGE_ID,
+                messageId: USER_MESSAGE_ID,
+                conversationId: streamId,
+                parentMessageId: THREAD_PARENT_ID,
+                isCreatedByUser: true,
+                text: USER_PROMPT,
+                content: USER_PROMPT,
+                role: 'user',
+                user: USER_ID,
+              },
+            ];
+            client.onHistoryLoaded(rows);
+            return rows;
+          };
           client.buildMessages = async () => ({
             prompt: [{ role: 'user', content: USER_PROMPT }],
           });

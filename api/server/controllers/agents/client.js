@@ -6639,11 +6639,18 @@ class AgentClient extends BaseClient {
         isPiCodeExecutionToolName(definition.name),
       );
       const unsupportedModes = [];
+      const piHistoryEventActorResumeEligible = req?._piEventActorHistoryResumeEligible === true;
       if (
         this.eventActorContinuation != null ||
         this.eventActorInvocationId != null ||
-        req?._isAgentTrigger === true ||
-        req?._agentEventBindingParentConversationId != null ||
+        this.eventActorCheckpointId != null ||
+        req?.body?.agentEventDelivery != null ||
+        ((req?._isAgentTrigger === true ||
+          req?._agentEventBindingId != null ||
+          req?._agentEventBindingParentConversationId != null ||
+          req?._agentEventBindingParentAgentId != null ||
+          req?.resolvedConversation?.agentEventBinding != null) &&
+          !piHistoryEventActorResumeEligible) ||
         this.agentConfigs?.size > 0 ||
         (this.options.agent?.edges?.length ?? 0) > 0 ||
         (this.options.agent?.subagents?.length ?? 0) > 0

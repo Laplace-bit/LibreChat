@@ -281,20 +281,26 @@ function makeToolApprovalJob(overrides = {}) {
 }
 
 /** A paused Pi host-tool call with the durable continuation and host projection it requires. */
-function makePiToolApprovalJob(overrides = {}) {
-  const args = { query: 'maintenance manual' };
+function makePiToolApprovalJob(
+  overrides = {},
+  {
+    allowedDecisions = ['approve', 'reject'],
+    args = { query: 'maintenance manual' },
+    stepIndex = 0,
+  } = {},
+) {
   const continuation = {
     version: 1,
     actionId: ACTION_ID,
     piToolCallId: 'pi-call-1',
     hostToolCallId: 'tc1',
-    toolTurn: 1,
+    toolTurn: stepIndex + 1,
     toolName: Tools.file_search,
     args,
-    allowedDecisions: ['approve', 'reject'],
+    allowedDecisions,
     stepIdentity: {
       id: 'pi-step-1',
-      index: 0,
+      index: stepIndex,
       messageId: RESPONSE_MSG_ID,
       runId: RESPONSE_MSG_ID,
       agentId: AGENT_ID,
@@ -317,7 +323,7 @@ function makePiToolApprovalJob(overrides = {}) {
             {
               action_name: Tools.file_search,
               tool_call_id: 'tc1',
-              allowed_decisions: ['approve', 'reject'],
+              allowed_decisions: allowedDecisions,
             },
           ],
         },
@@ -325,10 +331,17 @@ function makePiToolApprovalJob(overrides = {}) {
       },
     },
   });
+  mockGenerationJobManager.getResumeState.mockResolvedValue(
+    makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+  );
   return { job, continuation, args };
 }
 
-function makePiAskUserQuestionJob(questions) {
+function makePiToolApprovalJobRecord(overrides = {}, options) {
+  return makePiToolApprovalJob(overrides, options).job;
+}
+
+function makePiAskUserQuestionJob(questions, { hostToolCallId = 'tc1' } = {}) {
   const args = { questions };
   const [first] = questions;
   const continuation = {
@@ -336,7 +349,7 @@ function makePiAskUserQuestionJob(questions) {
     version: 1,
     actionId: ACTION_ID,
     piToolCallId: 'pi-ask-call-1',
-    hostToolCallId: 'tc1',
+    hostToolCallId,
     toolTurn: 0,
     toolName: 'ask_user_question',
     args,
@@ -365,11 +378,14 @@ function makePiAskUserQuestionJob(questions) {
           type: 'ask_user_question',
           question,
           questions,
-          tool_call_id: 'tc1',
+          tool_call_id: hostToolCallId,
         },
       },
     },
   });
+  mockGenerationJobManager.getResumeState.mockResolvedValue(
+    makePiAskUserQuestionResumeState(continuation),
+  );
   return { job, continuation, args };
 }
 
@@ -449,28 +465,36 @@ function makePiApprovalResumeState({ args, stepIdentity }) {
   };
 }
 
-/** A live, resolvable paused ask-user-question job. */
-function makeAskUserJob(overrides = {}) {
-  const job = makeToolApprovalJob(overrides);
-  job.metadata.pendingAction.payload = {
-    type: 'ask_user_question',
-    question: 'What should I name the file?',
-  };
-  return job;
+/** Add prior Pi output while keeping the pending host tool call exactly bound. */
+function setPiApprovalResumeHistory({ continuation, args, content = [], runSteps = [] }) {
+  const resumeState = makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity });
+  resumeState.aggregatedContent.unshift(...content);
+  resumeState.runSteps.unshift(...runSteps);
+  mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
+  return resumeState;
 }
 
-function makeAskUserBatchJob(overrides = {}) {
-  const job = makeToolApprovalJob(overrides);
-  job.metadata.pendingAction.payload = {
-    type: 'ask_user_question',
-    question: { question: 'Which environment?' },
-    questions: [
-      { id: 'environment', question: 'Which environment?' },
-      { id: 'window', question: 'Which time window?' },
-    ],
-    tool_call_id: 'tc1',
+function makeCompletedPiToolHistoryStep({ id, name, args, output, index = 0 }) {
+  const stepId = `pi-history-${id}`;
+  return {
+    content: {
+      type: 'tool_call',
+      tool_call: { id, stepId, name, args, output },
+    },
+    runStep: {
+      id: stepId,
+      runId: RESPONSE_MSG_ID,
+      agentId: AGENT_ID,
+      type: 'tool_calls',
+      index,
+      created_at: 90 + index,
+      status: 'completed',
+      stepDetails: {
+        type: 'tool_calls',
+        tool_calls: [{ id, type: 'tool_call', name, args }],
+      },
+    },
   };
-  return job;
 }
 
 /** A mock reconstructed client for the post-ACK path. */
@@ -691,13 +715,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         },
       },
     };
-    job.metadata.pendingAction.payload = {
-      type: 'tool_approval',
-      action_requests: [{ tool_call_id: 'tc1', name: 'search_mcp_github', arguments: {} }],
-      review_configs: [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'reject'], allow_always: true },
-      ],
-    };
+    const payload = job.metadata.pendingAction.payload;
+    payload.review_configs = payload.review_configs.map((reviewConfig) => ({
+      ...reviewConfig,
+      allow_always: true,
+    }));
     mockAddConvoToolApprovalAllows.mockResolvedValue(true);
     return job;
   };
@@ -720,453 +742,35 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     return expiredAt;
   };
 
+  const PI_EVENT_HISTORY_BINDING_ID = 'binding-pi-history';
+  const PI_EVENT_HISTORY_TOKEN = 'pi-history-turn-1';
+  const makePiEventHistoryApproval = (metadata = {}) =>
+    makePiToolApprovalJob({
+      metadata: {
+        agentEventBindingId: PI_EVENT_HISTORY_BINDING_ID,
+        agentEventDeliveryKey: 'delivery-pi-history-1',
+        agentEventLegacyTurnToken: PI_EVENT_HISTORY_TOKEN,
+        ...metadata,
+      },
+    });
+  const configurePiEventHistoryResume = (expiredAt) => {
+    const configuredExpiration = configureEventActorResume(expiredAt);
+    requestStateOverrides._agentEventBindingId = PI_EVENT_HISTORY_BINDING_ID;
+    mockGetAgentEventActorSnapshot.mockResolvedValue({
+      state: null,
+      epoch: 1,
+      legacyTurn: { token: PI_EVENT_HISTORY_TOKEN },
+      reconciliations: [],
+    });
+    return configuredExpiration;
+  };
+
   describe('event-bound actor resume lifecycle', () => {
-    it('claims a versioned Conversation suspension and recovers an ambiguous job projection ACK', async () => {
-      configureEventActorResume();
-      requestStateOverrides._agentEventBindingId = 'binding-1';
-      const expectedAction = { toolName: 'lookup' };
-      const suspension = {
-        version: 1,
-        suspensionId: 'suspension-1',
-        attempt: 0,
-        issuedAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        invocation: {
-          invocationId: 'trigger_event_delivery',
-          continuation: 'warm',
-          base: { actorThreadId: CONVO_ID, generation: 1 },
-          fork: {
-            threadId: CONVO_ID,
-            checkpointNs: 'event-actor',
-            checkpointId: 'checkpoint-paused',
-            invocationId: 'trigger_event_delivery',
-          },
-        },
-        checkpoint: {
-          threadId: CONVO_ID,
-          checkpointNs: 'event-actor',
-          checkpointId: 'checkpoint-paused',
-          invocationId: 'trigger_event_delivery',
-        },
-        interrupt: {
-          id: 'interrupt-1',
-          payload: {
-            type: 'tool_approval',
-            _librechatEventActor: { expectedAction },
-          },
-        },
-        suspensionDigest: 'signed-digest',
-      };
-      const pausedJob = makeToolApprovalJob({
-        metadata: {
-          idempotencyClientRequestId: 'trigger_event_delivery',
-          agentEventDeliveryKey: 'completion-delivery-1',
-          agentEventInvocationKey: 'trigger_event_delivery',
-          agentEventExpectedAction: expectedAction,
-          agentEventSuspension: {
-            version: 1,
-            suspensionId: suspension.suspensionId,
-            attempt: suspension.attempt,
-          },
-        },
-      });
-      pausedJob.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['respond'] },
-      ];
-      mockGenerationJobManager.getJob.mockResolvedValue(pausedJob);
-      const detachedSuspension = {
-        kind: 'internal_completion',
-        actionId: 'detached-action-next',
-      };
-      const repausedSuspension = {
-        ...suspension,
-        suspensionId: 'suspension-detached-next',
-        attempt: 1,
-      };
-      mockCreateAgentEventActorDetachedActionLifecycle.mockReturnValue({
-        readSuspension: () => detachedSuspension,
-      });
-      let projectedProviderExecutionId;
-      mockGenerationJobManager.approvals.resolve.mockImplementation(
-        async (_streamId, _actionId, resumePatch) => {
-          projectedProviderExecutionId = resumePatch.providerExecutionId;
-          mockGenerationJobManager.getJob.mockResolvedValue({
-            ...pausedJob,
-            status: 'running',
-            metadata: {
-              ...pausedJob.metadata,
-              providerExecutionId: resumePatch.providerExecutionId,
-            },
-          });
-          throw new Error('redis committed the CAS but lost its reply');
-        },
-      );
-      mockGetAgentEventActorSnapshot.mockResolvedValue({
-        state: null,
-        epoch: 1,
-        legacyTurn: null,
-        reconciliations: [],
-        suspension: {
-          suspension,
-          kind: 'internal_completion',
-          handlingGenerationCreatedAt: 500,
-          actionId: ACTION_ID,
-          jobCreatedAt: 1000,
-          status: 'pending',
-        },
-      });
-      const resumedClient = makeClient({
-        publishStagedApproval: jest.fn(),
-        contentParts: [makeToolCallContent({ output: 'human supplied output' })],
-        run: {
-          getRunSteps: () => [
-            {
-              type: 'tool_calls',
-              status: 'completed',
-              stepDetails: {
-                type: 'tool_calls',
-                tool_calls: [
-                  {
-                    id: 'tc1',
-                    name: 'lookup',
-                    args: {},
-                    output: 'human supplied output',
-                  },
-                ],
-              },
-            },
-          ],
-        },
-      });
-      mockInitializeClient.mockImplementation(async ({ req }) => {
-        expect(req._agentEventDetachedActionLifecycle).toBe(
-          mockCreateAgentEventActorDetachedActionLifecycle.mock.results[0].value,
-        );
-        return { client: resumedClient, userMCPAuthMap: {} };
-      });
-      mockResumeAgentEventActor.mockImplementation(async (input, dependencies) => {
-        expect(input.readSuspension()).toBe(detachedSuspension);
-        await dependencies.claimSuspension({
-          user: USER_ID,
-          tenantId: TENANT_ID,
-          conversationId: CONVO_ID,
-          suspensionId: suspension.suspensionId,
-          attempt: suspension.attempt,
-          actionId: ACTION_ID,
-          jobCreatedAt: 1000,
-          resumeAttemptId: input.resumeAttemptId,
-        });
-        expect(await input.claimProjection()).toBe(true);
-        expect(input.resumeAttemptId).toBe(projectedProviderExecutionId);
-        const value = await input.resume({
-          checkpointNamespace: 'event-actor',
-          checkpointId: 'checkpoint-paused',
-          invocationId: 'trigger_event_delivery',
-          continuation: 'warm',
-          signal: input.signal,
-        });
-        return {
-          value,
-          execution: { status: 'suspended', suspension: repausedSuspension },
-        };
-      });
-
-      const res = await post(
-        approveBody({
-          decisions: [
-            { tool_call_id: 'tc1', decision: 'respond', responseText: 'human supplied output' },
-          ],
-        }),
-      );
-      expect(res.status).toBe(200);
-      await settled;
-      await flush();
-
-      expect(mockGetAgentEventActorSnapshot).toHaveBeenCalledWith({
-        user: USER_ID,
-        tenantId: TENANT_ID,
-        conversationId: CONVO_ID,
-      });
-      expect(mockClaimAgentEventActorSuspension.mock.invocationCallOrder[0]).toBeLessThan(
-        mockGenerationJobManager.approvals.resolve.mock.invocationCallOrder[0],
-      );
-      expect(mockGenerationJobManager.getJob).toHaveBeenCalledTimes(2);
-      expect(mockGetAgentTriggerDelivery).not.toHaveBeenCalled();
-      expect(mockCreateAgentEventActorDetachedActionLifecycle).toHaveBeenCalledWith(
-        expect.objectContaining({
-          invocationId: 'trigger_event_delivery',
-          generationCreatedAt: 500,
-          turnCreatedAt: 1000,
-          expectedAction,
-        }),
-        expect.objectContaining({
-          reserveAgentEventActorDetachedAction: expect.any(Function),
-          markAgentEventActorDetachedActionRunning: expect.any(Function),
-          settleAgentEventActorDetachedAction: expect.any(Function),
-        }),
-      );
-      expect(
-        mockCreateAgentEventActorDetachedActionLifecycle.mock.invocationCallOrder[0],
-      ).toBeLessThan(mockInitializeClient.mock.invocationCallOrder[0]);
-      const lifecycleDependencies =
-        mockCreateAgentEventActorDetachedActionLifecycle.mock.calls[0][1];
-      expect(lifecycleDependencies.storeMode()).toBe('distributed');
-      mockGenerationJobManager.detachedAgentEventActionStoreMode = 'process_local';
-      expect(lifecycleDependencies.storeMode()).toBe('process_local');
-      expect(resumedClient.resumeCompletion).toHaveBeenCalledTimes(1);
-      expect(mockGenerationJobManager.updateMetadata).toHaveBeenCalledWith(
-        CONVO_ID,
-        {
-          agentEventSuspension: {
-            version: repausedSuspension.version,
-            suspensionId: repausedSuspension.suspensionId,
-            attempt: repausedSuspension.attempt,
-          },
-        },
-        1000,
-      );
-      expect(resumedClient.publishStagedApproval).not.toHaveBeenCalled();
-      expect(mockRecordAgentEventActorReconciliation).not.toHaveBeenCalled();
-    });
-
-    it('refuses a prior-head expected-action suspension before claiming it on an incapable replica', async () => {
-      configureEventActorResume();
-      requestStateOverrides._agentEventBindingId = 'binding-1';
-      const expectedAction = { toolName: 'submit_move' };
-      const suspension = {
-        version: 1,
-        suspensionId: 'suspension-producer-required',
-        attempt: 0,
-        issuedAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-        invocation: { invocationId: 'trigger_event_delivery' },
-        interrupt: {
-          id: 'interrupt-producer-required',
-          payload: {
-            type: 'tool_approval',
-            _librechatEventActor: { expectedAction },
-          },
-        },
-        suspensionDigest: 'signed-digest',
-      };
-      mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
-          metadata: {
-            idempotencyClientRequestId: 'trigger_event_delivery',
-            agentEventDeliveryKey: 'trigger_event_delivery',
-            agentEventExpectedAction: expectedAction,
-            agentEventSuspension: {
-              version: 1,
-              suspensionId: suspension.suspensionId,
-              attempt: suspension.attempt,
-            },
-          },
-        }),
-      );
-      mockGetAgentEventActorSnapshot.mockResolvedValue({
-        state: null,
-        epoch: 1,
-        legacyTurn: null,
-        reconciliations: [],
-        suspension: {
-          suspension,
-          kind: 'human_decision',
-          handlingGenerationCreatedAt: 1000,
-          actionId: ACTION_ID,
-          jobCreatedAt: 1000,
-          status: 'pending',
-        },
-      });
-      mockGenerationJobManager.isRedis = false;
-      mockGenerationJobManager.supportsDetachedAgentEventActions = false;
-
-      const res = await post(approveBody());
-
-      expect(res.status).toBe(503);
-      expect(res.body).toMatchObject({
-        code: 'EVENT_ACTOR_RESUME_CAPABILITY_UNAVAILABLE',
-      });
-      expect(res.headers['retry-after']).toBe('1');
-      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
-      expect(mockResumeAgentEventActor).not.toHaveBeenCalled();
-      expect(mockInitializeClient).not.toHaveBeenCalled();
-      expect(mockDecrementPendingRequest).toHaveBeenCalledTimes(1);
-      expect(mockReleaseEventChildLease).toHaveBeenCalledTimes(1);
-    });
-
-    it.each([
-      ['pre-feature expected-action', { toolName: 'lookup' }, undefined],
-      ['actionless PR-era', undefined, 1000],
-    ])(
-      'preserves a %s suspension when client reconstruction fails before continuation',
-      async (_case, expectedAction, handlingGenerationCreatedAt) => {
-        configureEventActorResume();
-        const suspension = {
-          version: 1,
-          suspensionId: 'suspension-init-failure',
-          attempt: 0,
-          issuedAt: Date.now(),
-          expiresAt: Date.now() + 60_000,
-          invocation: {
-            invocationId: 'trigger_event_delivery',
-            continuation: 'warm',
-            base: { actorThreadId: CONVO_ID, generation: 0 },
-            fork: {
-              threadId: CONVO_ID,
-              checkpointNs: 'event-actor',
-              checkpointId: 'checkpoint-paused',
-              invocationId: 'trigger_event_delivery',
-            },
-          },
-          checkpoint: {
-            threadId: CONVO_ID,
-            checkpointNs: 'event-actor',
-            checkpointId: 'checkpoint-paused',
-            invocationId: 'trigger_event_delivery',
-          },
-          interrupt: {
-            id: 'interrupt-init-failure',
-            payload: {
-              type: 'tool_approval',
-              _librechatEventActor: expectedAction == null ? {} : { expectedAction },
-            },
-          },
-          suspensionDigest: 'signed-digest',
-        };
-        mockGenerationJobManager.getJob.mockResolvedValue(
-          makeToolApprovalJob({
-            metadata: {
-              idempotencyClientRequestId: 'trigger_event_delivery',
-              ...(expectedAction == null ? {} : { agentEventExpectedAction: expectedAction }),
-              agentEventSuspension: {
-                version: 1,
-                suspensionId: suspension.suspensionId,
-                attempt: suspension.attempt,
-              },
-            },
-          }),
-        );
-        mockGetAgentEventActorSnapshot.mockResolvedValue({
-          state: null,
-          epoch: 1,
-          legacyTurn: null,
-          reconciliations: [],
-          suspension: {
-            suspension,
-            ...(handlingGenerationCreatedAt == null ? {} : { handlingGenerationCreatedAt }),
-            actionId: ACTION_ID,
-            jobCreatedAt: 1000,
-            status: 'pending',
-          },
-        });
-        mockGenerationJobManager.isRedis = false;
-        mockInitializeClient.mockRejectedValue(new Error('client reconstruction failed'));
-        mockResumeAgentEventActor.mockImplementation(async (input) => {
-          expect(await input.claimProjection()).toBe(true);
-          return input.resume({
-            checkpointNamespace: 'event-actor',
-            checkpointId: 'checkpoint-paused',
-            invocationId: 'trigger_event_delivery',
-            continuation: 'warm',
-            signal: input.signal,
-          });
-        });
-
-        const res = await post(approveBody());
-        expect(res.status).toBe(200);
-        await settled;
-        await flush();
-
-        expect(mockInitializeClient).toHaveBeenCalledTimes(1);
-        expect(mockCreateAgentEventActorDetachedActionLifecycle).not.toHaveBeenCalled();
-        expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
-        expect(mockGenerationJobManager.completeJob).toHaveBeenCalled();
-      },
-    );
-
-    it.each([null, 'pending_owned', 'claimed_owned'])(
-      'does not consume approval for an unsupported raw suspension state: %s',
-      async (status) => {
-        configureEventActorResume();
-        mockGenerationJobManager.getJob.mockResolvedValue(
-          makeToolApprovalJob({
-            metadata: {
-              agentEventSuspension: { version: 1, suspensionId: 'stale', attempt: 0 },
-            },
-          }),
-        );
-        mockGetAgentEventActorSnapshot.mockResolvedValue({
-          state: null,
-          epoch: 1,
-          legacyTurn: null,
-          reconciliations: [],
-          suspension:
-            status == null
-              ? null
-              : {
-                  status,
-                  actionId: ACTION_ID,
-                  jobCreatedAt: 1000,
-                  suspension: { suspensionId: 'stale', attempt: 0 },
-                },
-        });
-
-        const res = await post(approveBody());
-
-        expect(res.status).toBe(409);
-        expect(res.body).toMatchObject({ code: 'EVENT_ACTOR_SUSPENSION_STALE' });
-        expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
-        expect(mockResumeAgentEventActor).not.toHaveBeenCalled();
-      },
-    );
-
-    it('fails promptly when suspension validation rejects before the job claim callback', async () => {
-      configureEventActorResume();
-      const suspension = {
-        version: 1,
-        suspensionId: 'suspension-invalid-signature',
-        attempt: 0,
-        invocation: { invocationId: 'trigger_event_delivery' },
-        interrupt: {
-          payload: { _librechatEventActor: { expectedAction: { toolName: 'lookup' } } },
-        },
-      };
-      mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
-          metadata: {
-            idempotencyClientRequestId: 'trigger_event_delivery',
-            agentEventSuspension: {
-              version: 1,
-              suspensionId: suspension.suspensionId,
-              attempt: 0,
-            },
-          },
-        }),
-      );
-      mockGetAgentEventActorSnapshot.mockResolvedValue({
-        state: null,
-        epoch: 1,
-        legacyTurn: null,
-        reconciliations: [],
-        suspension: {
-          suspension,
-          actionId: ACTION_ID,
-          jobCreatedAt: 1000,
-          status: 'pending',
-        },
-      });
-      mockResumeAgentEventActor.mockRejectedValue(new Error('invalid signed suspension'));
-
-      const res = await post(approveBody());
-
-      expect(res.status).toBe(500);
-      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
-      expect(mockDecrementPendingRequest).toHaveBeenCalled();
-    });
+    // Pi checkpoint, expected-action, and detached-action resumes fail closed below.
 
     it('leaves the approval pending when the previous segment still owns the lease', async () => {
-      configureEventActorResume();
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      configurePiEventHistoryResume();
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiEventHistoryApproval().job);
       mockAcquireEventChildGenerationLease.mockResolvedValue(null);
 
       const res = await post(approveBody());
@@ -1179,8 +783,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('classifies an expired binding as ended when no lease can be acquired', async () => {
-      configureEventActorResume(new Date(Date.now() - 1));
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      configurePiEventHistoryResume(new Date(Date.now() - 1));
+      const { job, continuation, args } = makePiEventHistoryApproval();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
       mockAcquireEventChildGenerationLease.mockResolvedValue(null);
 
       const res = await post(approveBody());
@@ -1191,14 +799,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('owns the lease before consuming approval and preserves the inherited deadline', async () => {
-      const expiredAt = configureEventActorResume();
+      const expiredAt = configurePiEventHistoryResume();
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
-          metadata: {
-            isTemporary: true,
-            idempotencyClientRequestId: 'trigger_event_delivery',
-          },
-        }),
+        makePiEventHistoryApproval({
+          isTemporary: true,
+          idempotencyClientRequestId: 'trigger_event_delivery',
+        }).job,
       );
 
       const res = await post(approveBody());
@@ -1227,9 +833,9 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('preserves the inherited deadline when the resumed actor pauses again', async () => {
-      const expiredAt = configureEventActorResume();
+      const expiredAt = configurePiEventHistoryResume();
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { isTemporary: true } }),
+        makePiEventHistoryApproval({ isTemporary: true }).job,
       );
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
@@ -1254,8 +860,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('defers a resume when the owner admission fence is temporarily closed', async () => {
-      configureEventActorResume();
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      configurePiEventHistoryResume();
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiEventHistoryApproval().job);
       mockIsSubagentOwnerAdmissible.mockResolvedValue(false);
 
       const res = await post(approveBody());
@@ -1267,8 +873,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('rejects a binding that expires after the route guard but before approval consumption', async () => {
-      configureEventActorResume(new Date(Date.now() - 1));
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      configurePiEventHistoryResume(new Date(Date.now() - 1));
+      const { job, continuation, args } = makePiEventHistoryApproval();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
 
       const res = await post(approveBody());
 
@@ -1279,13 +889,15 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('uses the guard-normalized tenant for a legacy untenanted event actor', async () => {
-      const expiredAt = configureEventActorResume();
+      const expiredAt = configurePiEventHistoryResume();
       requestStateOverrides._agentEventBindingTenantId = undefined;
       mockGetConvo.mockResolvedValue({
         conversationId: 'parent-conversation',
         agent_id: 'parent-agent',
       });
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiEventHistoryApproval({ tenantId: undefined }).job,
+      );
 
       const res = await post(approveBody());
       expect(res.status).toBe(200);
@@ -1295,6 +907,127 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockAcquireEventChildGenerationLease).toHaveBeenCalledWith(
         expect.objectContaining({ tenantId: undefined, retentionExpiresAt: expiredAt }),
       );
+    });
+
+    describe('Pi durable-history continuation', () => {
+      const configureBoundHistory = () => {
+        configurePiEventHistoryResume();
+      };
+
+      it('resumes a Pi approval from bound history and seals the matching live turn after persistence', async () => {
+        configureBoundHistory();
+        const { job, continuation, args } = makePiEventHistoryApproval();
+        mockGenerationJobManager.getJob.mockResolvedValue(job);
+        mockGenerationJobManager.getResumeState.mockResolvedValue(
+          makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+        );
+        mockGetAgentEventActorSnapshot.mockResolvedValue({
+          state: null,
+          epoch: 3,
+          legacyTurn: { token: PI_EVENT_HISTORY_TOKEN },
+          reconciliations: [],
+        });
+        const resumedClient = makeClient();
+        let historyResumeMarker;
+        mockInitializeClient.mockImplementation(async ({ req }) => {
+          historyResumeMarker = Object.getOwnPropertyDescriptor(
+            req,
+            '_piEventActorHistoryResumeEligible',
+          );
+          return { client: resumedClient, userMCPAuthMap: {} };
+        });
+
+        const res = await post(approveBody());
+        expect(res.status).toBe(200);
+        await settled;
+        await flush();
+
+        expect(mockGetAgentEventActorSnapshot).toHaveBeenCalledWith({
+          user: USER_ID,
+          tenantId: TENANT_ID,
+          conversationId: CONVO_ID,
+        });
+        expect(historyResumeMarker).toEqual({
+          configurable: false,
+          enumerable: false,
+          value: true,
+          writable: false,
+        });
+        expect(resumedClient.resumeCompletion).toHaveBeenCalledWith(
+          expect.objectContaining({
+            piApprovalContinuation: continuation,
+            piApprovalDecision: { kind: 'execute', args },
+          }),
+        );
+        expect(mockResumeAgentEventActor).not.toHaveBeenCalled();
+        expect(mockSaveMessage).toHaveBeenCalled();
+        expect(mockCompleteAgentEventActorLegacyTurn).toHaveBeenCalledWith({
+          user: USER_ID,
+          tenantId: TENANT_ID,
+          conversationId: CONVO_ID,
+          token: PI_EVENT_HISTORY_TOKEN,
+        });
+        expect(mockSaveMessage.mock.invocationCallOrder[0]).toBeLessThan(
+          mockCompleteAgentEventActorLegacyTurn.mock.invocationCallOrder[0],
+        );
+      });
+
+      it.each([
+        ['a missing history token', { agentEventLegacyTurnToken: undefined }],
+        [
+          'a binding ID different from the request',
+          { agentEventBindingId: 'binding-from-another-event' },
+        ],
+        [
+          'a checkpoint-backed suspension',
+          {
+            agentEventSuspension: {
+              version: 1,
+              suspensionId: 'checkpoint-suspension',
+              attempt: 0,
+            },
+            agentEventExpectedAction: { toolName: 'lookup' },
+          },
+        ],
+        [
+          'a detached completion producer',
+          {
+            agentEventInvocationKey: 'invocation-pi-detached',
+            agentEventDetachedActionProducerRequired: true,
+          },
+        ],
+      ])('fails closed before claiming Pi approval for %s', async (_label, metadata) => {
+        configureBoundHistory();
+        mockGenerationJobManager.getJob.mockResolvedValue(makePiEventHistoryApproval(metadata).job);
+
+        const res = await post(approveBody());
+
+        expect(res.status).toBe(503);
+        expect(res.body).toMatchObject({ code: 'EVENT_ACTOR_PI_RESUME_UNAVAILABLE' });
+        expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+        expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+        expect(mockGetAgentEventActorSnapshot).not.toHaveBeenCalled();
+        expect(mockInitializeClient).not.toHaveBeenCalled();
+      });
+
+      it('rejects a history token that no longer matches the live Conversation turn before claim', async () => {
+        configureBoundHistory();
+        mockGenerationJobManager.getJob.mockResolvedValue(makePiEventHistoryApproval().job);
+        mockGetAgentEventActorSnapshot.mockResolvedValue({
+          state: null,
+          epoch: 4,
+          legacyTurn: { token: 'newer-live-token' },
+          reconciliations: [],
+        });
+
+        const res = await post(approveBody());
+
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({ code: 'EVENT_ACTOR_TURN_STALE' });
+        expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+        expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+        expect(mockInitializeClient).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -1307,7 +1040,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       invocationMode: 'delegated',
     };
     mockGenerationJobManager.getJob.mockResolvedValue(
-      makeToolApprovalJob({ metadata: { scheduleMCPCompletion: lineage } }),
+      makePiToolApprovalJobRecord({ metadata: { scheduleMCPCompletion: lineage } }),
     );
     const res = await post(
       approveBody({
@@ -1327,8 +1060,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('scheduled occurrence lifecycle', () => {
     const scheduledFor = '2026-08-17T12:00:00.000Z';
-    const makeScheduledJob = () =>
-      makeToolApprovalJob({
+    const makeScheduledJob = () => {
+      const { job } = makePiToolApprovalJob({
         metadata: {
           scheduleId: 'schedule-1',
           scheduledFor,
@@ -1336,6 +1069,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           checkpointNamespace: '1000',
         },
       });
+      return job;
+    };
 
     it('resumes a scheduled Pi approval under the same durable occurrence lease', async () => {
       const { job, continuation, args } = makePiToolApprovalJob({
@@ -1548,20 +1283,33 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('aborts a resume the schedule fence rejected after claiming its provenance', async () => {
-      const job = makeScheduledJob();
+      const { job, continuation } = makePiToolApprovalJob(
+        {
+          metadata: {
+            scheduleId: 'schedule-1',
+            scheduledFor,
+            scheduleConfigRevision: 4,
+            checkpointNamespace: '1000',
+          },
+        },
+        { allowedDecisions: ['approve', 'edit'] },
+      );
       job.metadata.userSubmittedPaths = ['/content/0/steer'];
       job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'edit'] },
+        {
+          action_name: Tools.file_search,
+          tool_call_id: 'tc1',
+          allowed_decisions: continuation.allowedDecisions,
+        },
       ];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [makeToolCallContent()],
-      });
       mockFinalizeScheduleResumeClaim.mockResolvedValue(false);
 
       const res = await post(
         approveBody({
-          decisions: [{ tool_call_id: 'tc1', decision: 'edit', editedArguments: { q: 'edit' } }],
+          decisions: [
+            { tool_call_id: 'tc1', decision: 'edit', editedArguments: { query: 'edit' } },
+          ],
         }),
       );
 
@@ -1778,7 +1526,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('temporal context restore', () => {
     it('restores the paused turn start from the durable job before initializeClient', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob({ createdAt: 1234 }));
+      const { job } = makePiToolApprovalJob({ createdAt: 1234 });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
       expect(res.status).toBe(200);
       await settled;
@@ -1792,7 +1541,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
      * client after the action is already spent.
      */
     it('answers the resume even when steering bookkeeping never settles', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
       let releaseRearm;
       mockGenerationJobManager.rearmQueuedPreempts.mockReturnValue(
         new Promise((resolve) => {
@@ -1813,7 +1566,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('content policy preflight', () => {
     it('preserves the default-off path without reading the durable checkpoint', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
       expect(res.status).toBe(200);
@@ -1825,7 +1578,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('passes isResume: true into initializeClient so recorded prompt-link usage is not doubled', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
       expect(res.status).toBe(200);
@@ -1847,7 +1600,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       mockGetAgentCheckpointer.mockRejectedValue(new Error('checkpoint unavailable'));
 
       const res = await post(approveBody());
@@ -1871,7 +1624,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         },
       };
       endpointAgent.instructions = 'Use sk-current-agent-secret when answering.';
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
 
@@ -1911,7 +1664,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         tools: [],
         edges: [],
       });
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
 
@@ -1957,7 +1710,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       ]);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
 
@@ -1983,7 +1736,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       mockGetUserMemories.mockResolvedValue([
         { key: 'credential', value: 'sk-current-memory-secret' },
       ]);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
 
@@ -2043,7 +1796,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         },
       ]);
       mockGetUserMemories.mockResolvedValue([{ key: 'preference', value: 'Likes tea.' }]);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody());
 
@@ -2058,7 +1811,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerDrained: true,
           providerExecutionId: expect.any(String),
         }),
@@ -2069,7 +1822,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockInitializeClient).toHaveBeenCalledTimes(1);
     });
 
-    it('blocks legacy checkpoint content before initializeClient', async () => {
+    it('blocks protected Pi history content before initializeClient', async () => {
       requestConfigOverrides = {
         filters: {
           messages: {
@@ -2080,16 +1833,10 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const { job } = makePiToolApprovalJob();
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
+      job.metadata.userMessage.text = 'sk-pi-history-secret';
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [{ role: 'user', content: 'sk-legacy-checkpoint-secret' }],
-          },
-        },
-      });
 
       const res = await post(approveBody());
       expect(res.status).toBe(400);
@@ -2100,16 +1847,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         }),
       );
 
-      expect(mockCheckpointGetTuple).toHaveBeenCalledWith({
-        configurable: {
-          thread_id: CONVO_ID,
-          checkpoint_ns: '',
-        },
-      });
-      expect(mockGetMessages).toHaveBeenCalledWith({
-        conversationId: CONVO_ID,
-        user: USER_ID,
-      });
+      expect(mockGenerationJobManager.getResumeState).toHaveBeenCalledWith(
+        CONVO_ID,
+        job.createdAt,
+        { validateEarlyBufferRecovery: true },
+      );
       expect(mockInitializeClient).not.toHaveBeenCalled();
       expect(mockCheckAndIncrementPendingRequest).not.toHaveBeenCalled();
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
@@ -2118,7 +1860,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
     });
 
-    it('blocks checkpoint-only content from the active generation namespace', async () => {
+    it('blocks protected Pi history from the paused generation namespace', async () => {
       requestConfigOverrides = {
         filters: {
           messages: {
@@ -2129,18 +1871,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob({
+      const { job } = makePiToolApprovalJob({
         metadata: { checkpointNamespace: 'generation-1000' },
       });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
+      job.metadata.userMessage.text = 'sk-pi-generation-history-secret';
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [{ role: 'user', content: 'sk-namespaced-checkpoint-secret' }],
-          },
-        },
-      });
 
       const res = await post(approveBody());
 
@@ -2151,18 +1887,16 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           source: 'message',
         }),
       );
-      expect(mockCheckpointGetTuple).toHaveBeenCalledWith({
-        configurable: {
-          thread_id: CONVO_ID,
-          checkpoint_ns: '',
-          __librechat_checkpoint_ns: 'generation-1000',
-        },
-      });
+      expect(mockGenerationJobManager.getResumeState).toHaveBeenCalledWith(
+        CONVO_ID,
+        job.createdAt,
+        { validateEarlyBufferRecovery: true },
+      );
       expect(mockInitializeClient).not.toHaveBeenCalled();
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
     });
 
-    it('keeps checkpoint tool arguments visible to files-only fail-close policy', async () => {
+    it('keeps Pi tool arguments visible to files-only fail-close policy', async () => {
       requestConfigOverrides = {
         filters: {
           files: {
@@ -2174,26 +1908,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const history = makeCompletedPiToolHistoryStep({
+        id: 'pi-file-history',
+        name: 'inspect_file',
+        args: { file_id: 'checkpoint-tool-file' },
+        index: 0,
+      });
+      const { job, continuation, args } = makePiToolApprovalJob({}, { stepIndex: 1 });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [
-              {
-                role: 'assistant',
-                content: 'inspect the attachment',
-                tool_calls: [
-                  {
-                    name: 'inspect_file',
-                    args: { file_id: 'checkpoint-tool-file' },
-                  },
-                ],
-              },
-            ],
-          },
-        },
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [history.content],
+        runSteps: [history.runStep],
       });
 
       const res = await post(approveBody());
@@ -2215,7 +1943,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
-    it('keeps structured checkpoint text metadata visible to files-only policy', async () => {
+    it('keeps Pi structured text metadata visible to files-only policy', async () => {
       requestConfigOverrides = {
         filters: {
           files: {
@@ -2227,28 +1955,21 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const { job, continuation, args } = makePiToolApprovalJob();
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: {
-                      value: 'inspect the attachment',
-                      annotations: [{ file_id: 'checkpoint-annotation-file' }],
-                    },
-                  },
-                ],
-              },
-            ],
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [
+          {
+            type: 'text',
+            text: {
+              value: 'inspect the attachment',
+              annotations: [{ file_id: 'checkpoint-annotation-file' }],
+            },
           },
-        },
+        ],
       });
 
       const res = await post(approveBody());
@@ -2270,7 +1991,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
-    it('blocks protected values nested in cyclic checkpoint tool arguments', async () => {
+    it('blocks protected values nested in Pi continuation tool arguments', async () => {
       requestConfigOverrides = {
         filters: {
           toolArguments: {
@@ -2281,23 +2002,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const cyclicArguments = { token: 'sk-cyclic-checkpoint-secret' };
-      cyclicArguments.self = cyclicArguments;
-      const job = makeToolApprovalJob();
+      const history = makeCompletedPiToolHistoryStep({
+        id: 'pi-nested-args-history',
+        name: 'lookup',
+        args: { lookup: { credentials: { token: 'sk-pi-continuation-secret' } } },
+        index: 0,
+      });
+      const { job, continuation, args } = makePiToolApprovalJob({}, { stepIndex: 1 });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [
-              {
-                role: 'assistant',
-                content: '',
-                tool_calls: [{ name: 'lookup', args: cyclicArguments }],
-              },
-            ],
-          },
-        },
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [history.content],
+        runSteps: [history.runStep],
       });
 
       const res = await post(approveBody());
@@ -2314,7 +2032,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
     });
 
-    it('fails closed when selected checkpoint tool arguments cannot be fully traversed', async () => {
+    it('fails closed when Pi continuation arguments cannot be fully traversed', async () => {
       requestConfigOverrides = {
         filters: {
           toolArguments: {
@@ -2331,26 +2049,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         current.nested = {};
         current = current.nested;
       }
-      Object.defineProperty(deepArguments, 'toJSON', {
-        value: () => {
-          throw new Error('cannot serialize');
-        },
+      const history = makeCompletedPiToolHistoryStep({
+        id: 'pi-deep-args-history',
+        name: 'lookup',
+        args: deepArguments,
+        index: 0,
       });
-      const job = makeToolApprovalJob();
+      const { job, continuation, args } = makePiToolApprovalJob({}, { stepIndex: 1 });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [
-              {
-                role: 'assistant',
-                content: '',
-                tool_calls: [{ name: 'lookup', args: deepArguments }],
-              },
-            ],
-          },
-        },
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [history.content],
+        runSteps: [history.runStep],
       });
 
       const res = await post(approveBody());
@@ -2367,7 +2079,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
     });
 
-    it('allows incomplete checkpoint arguments when only tool output is selected', async () => {
+    it('allows deep Pi arguments when only tool output is selected', async () => {
       requestConfigOverrides = {
         filters: {
           toolArguments: {
@@ -2384,26 +2096,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         current.nested = {};
         current = current.nested;
       }
-      Object.defineProperty(deepArguments, 'toJSON', {
-        value: () => {
-          throw new Error('cannot serialize');
-        },
+      const history = makeCompletedPiToolHistoryStep({
+        id: 'pi-deep-args-history',
+        name: 'lookup',
+        args: deepArguments,
+        index: 0,
       });
-      const job = makeToolApprovalJob();
+      const { job, continuation, args } = makePiToolApprovalJob({}, { stepIndex: 1 });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockCheckpointGetTuple.mockResolvedValue({
-        checkpoint: {
-          channel_values: {
-            messages: [
-              {
-                role: 'assistant',
-                content: '',
-                tool_calls: [{ name: 'lookup', args: deepArguments }],
-              },
-            ],
-          },
-        },
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [history.content],
+        runSteps: [history.runStep],
       });
 
       const res = await post(approveBody());
@@ -2414,7 +2120,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockInitializeClient).toHaveBeenCalledTimes(1);
     });
 
-    it('blocks legacy seed tool content before initializeClient', async () => {
+    it('blocks protected output in Pi host history before initializeClient', async () => {
       requestConfigOverrides = {
         filters: {
           toolArguments: {
@@ -2425,11 +2131,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const history = makeCompletedPiToolHistoryStep({
+        id: 'pi-history-call',
+        name: 'lookup',
+        args: {},
+        output: 'sk-pi-seed-secret',
+      });
+      const { job, continuation, args } = makePiToolApprovalJob({}, { stepIndex: 1 });
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [makeToolCallContent({ output: 'sk-legacy-seed-secret' })],
+      setPiApprovalResumeHistory({
+        continuation,
+        args,
+        content: [history.content],
+        runSteps: [history.runStep],
       });
 
       const res = await post(approveBody());
@@ -2464,11 +2179,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['approve', 'respond'] }).job;
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'respond'] },
-      ];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
 
       const res = await post(
@@ -2507,11 +2219,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['approve', 'edit'] }).job;
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'edit'] },
-      ];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
 
       const res = await post(
@@ -2520,7 +2229,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
             {
               tool_call_id: 'tc1',
               decision: 'edit',
-              editedArguments: { token: 'sk-user-edited-secret' },
+              editedArguments: { query: 'sk-user-edited-secret' },
             },
           ],
         }),
@@ -2542,7 +2251,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('MCP request-context lifecycle', () => {
     it('pre-seeds the run-scoped MCP context before initializeClient and tears it down after', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody());
       expect(res.status).toBe(200);
       await settled; // the controller's finally has run
@@ -2561,7 +2270,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('marks the exact resumed provider segment drained only after request cleanup', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody());
       expect(res.status).toBe(200);
       await settled;
@@ -2632,10 +2341,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       mockGetConvo.mockResolvedValue(projectConversation);
       mockGetChatProject.mockResolvedValue(projectRecord(contextRevision));
       mockGetProjectFiles.mockResolvedValue([projectResource]);
-      mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
-          metadata: { pendingAction: { projectContextKey: pendingKey } },
-        }),
+      const { job, continuation, args } = makePiToolApprovalJob({
+        metadata: { pendingAction: { projectContextKey: pendingKey } },
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
       );
     };
 
@@ -2814,7 +2525,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('403 when the job belongs to another user', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { userId: 'someone-else' } }),
+        makePiToolApprovalJob({ metadata: { userId: 'someone-else' } }).job,
       );
       const res = await post(approveBody());
       expect(res.status).toBe(403);
@@ -2823,7 +2534,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('fails closed when the stored job owner is missing', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { userId: undefined } }),
+        makePiToolApprovalJob({ metadata: { userId: undefined } }).job,
       );
 
       const res = await post(approveBody());
@@ -2835,35 +2546,35 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('403 on a tenant mismatch', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { tenantId: 'other-tenant' } }),
+        makePiToolApprovalJob({ metadata: { tenantId: 'other-tenant' } }).job,
       );
       const res = await post(approveBody());
       expect(res.status).toBe(403);
     });
 
     it('403 when the resume omits the paused agent_id', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ agent_id: undefined }));
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/different agent/i);
     });
 
     it('403 when the resume claims a different agent_id', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ agent_id: 'agent-other' }));
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/different agent/i);
     });
 
     it('403 when the resume claims a different endpoint', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ endpoint: 'bedrock' }));
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/different endpoint/i);
     });
 
     it('403 when the resume OMITS the paused endpoint (no fall-through to ephemeral)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ endpoint: undefined }));
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/different endpoint/i);
@@ -2871,7 +2582,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('409s a resume targeting a replaced generation before claiming the action', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody({ generationCreatedAt: 999 }));
 
@@ -3194,7 +2905,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('409 when the job is not in requires_action (already terminal; no expire)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob({ status: 'running' }));
+      const { job } = makePiToolApprovalJob({ status: 'running' });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
       expect(res.status).toBe(409);
       expect(res.body.error).toMatch(/no live pending action/i);
@@ -3203,7 +2915,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('409 AND drives expiry when the pending action has expired (stale)', async () => {
-      const job = makeToolApprovalJob();
+      const { job } = makePiToolApprovalJob();
       job.metadata.pendingAction.expiresAt = Date.now() - 1_000;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
@@ -3219,20 +2931,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when actionId is missing', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ actionId: undefined }));
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/actionId is required/i);
     });
 
     it('409 when actionId targets a stale action', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       const res = await post(approveBody({ actionId: 'stale-action' }));
       expect(res.status).toBe(409);
       expect(res.body.error).toMatch(/stale action/i);
     });
 
-    it('400 when a tool call is left undecided', async () => {
+    it('fails closed when a legacy pending action contains calls outside the Pi continuation', async () => {
       const job = makeToolApprovalJob();
       job.metadata.pendingAction.payload.action_requests = [
         { tool_call_id: 'tc1' },
@@ -3244,13 +2956,13 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       ];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody()); // only decides tc1
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/must be decided/i);
-      expect(res.body.undecided).toEqual(['tc2']);
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
-    it('400 when a persisted approval payload aliases two calls to the same id', async () => {
+    it('fails closed when a persisted legacy approval payload aliases tool calls', async () => {
       const job = makeToolApprovalJob();
       job.metadata.pendingAction.payload.action_requests = [
         { tool_call_id: 'tc1', name: 'write', arguments: { value: 'hidden' } },
@@ -3264,13 +2976,26 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
       const res = await post(approveBody());
 
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/invalid tool approval payload/i);
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
+    });
+
+    it('400 when a single Pi tool continuation is left without a decision', async () => {
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
+
+      const res = await post(approveBody({ decisions: [] }));
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/must be decided/i);
+      expect(res.body.undecided).toEqual(['tc1']);
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
     it('400 when the client submits duplicate decisions for one tool-call id', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(
         approveBody({
@@ -3287,7 +3012,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when the client submits a malformed decision entry', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
 
       const res = await post(approveBody({ decisions: [null] }));
 
@@ -3297,11 +3022,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('403 when a decision is not permitted by the tool policy', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['reject'] }).job;
       // Policy restricts tc1 to reject only; an `approve` must be refused.
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['reject'] },
-      ];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
       expect(res.status).toBe(403);
@@ -3310,10 +3032,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when an edit decision omits editedArguments', async () => {
-      const job = makeToolApprovalJob();
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'edit'] },
-      ];
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['approve', 'edit'] }).job;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(
         approveBody({ decisions: [{ tool_call_id: 'tc1', decision: 'edit' }] }),
@@ -3325,10 +3044,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when a respond decision omits responseText', async () => {
-      const job = makeToolApprovalJob();
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'respond'] },
-      ];
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['approve', 'respond'] }).job;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(
         approveBody({ decisions: [{ tool_call_id: 'tc1', decision: 'respond' }] }),
@@ -3338,14 +3054,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('accepts a complete edit decision (editedArguments present)', async () => {
-      const job = makeToolApprovalJob();
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['approve', 'edit'] },
-      ];
+      const job = makePiToolApprovalJob({}, { allowedDecisions: ['approve', 'edit'] }).job;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(
         approveBody({
-          decisions: [{ tool_call_id: 'tc1', decision: 'edit', editedArguments: { q: 'x' } }],
+          decisions: [{ tool_call_id: 'tc1', decision: 'edit', editedArguments: { query: 'x' } }],
         }),
       );
       expect(res.status).toBe(200);
@@ -3354,7 +3067,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('403 when the resume request fingerprint does not match the paused config', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob().job;
       job.metadata.pendingAction.requestFingerprint = 'fingerprint-of-a-different-config';
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
@@ -3365,7 +3078,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('proceeds when the resume request fingerprint matches the paused config', async () => {
       const { computeAgentRequestFingerprint } = jest.requireActual('@librechat/api');
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob().job;
       job.metadata.pendingAction.requestFingerprint = computeAgentRequestFingerprint({
         endpoint: 'agents',
         agent_id: AGENT_ID,
@@ -3377,7 +3090,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
         }),
@@ -3396,7 +3109,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         codeEnvironmentMode: 'attached',
         codeWorkspaces: [{ environmentId: 'machine-a', workspaceId: 'project-a' }],
       };
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob().job;
       job.metadata.pendingAction.requestFingerprint =
         computeLegacyAgentRequestFingerprint(pausedBody);
       job.metadata.pendingAction.requestFingerprintV2 = computeAgentRequestFingerprint(pausedBody);
@@ -3416,7 +3129,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('403 when the resume sends a different promptPrefix than the paused config', async () => {
       const { computeAgentRequestFingerprint } = jest.requireActual('@librechat/api');
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJob().job;
       // Ephemeral instructions come from promptPrefix, so it's part of the fingerprint.
       job.metadata.pendingAction.requestFingerprint = computeAgentRequestFingerprint({
         endpoint: 'agents',
@@ -3431,7 +3144,10 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when an ask_user_question resume carries no answer', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiAskUserQuestionJob([{ id: 'question', question: 'What should I name the file?' }])
+          .job,
+      );
       const res = await post({
         conversationId: CONVO_ID,
         actionId: ACTION_ID,
@@ -3439,17 +3155,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         endpoint: 'agents',
       });
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/answer is required/i);
+      expect(res.body.error).toMatch(/answers are required/i);
     });
 
     it('400 when an ask_user_question answer exceeds the length cap', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiAskUserQuestionJob([{ id: 'question', question: 'What should I name the file?' }])
+          .job,
+      );
       const res = await post({
         conversationId: CONVO_ID,
         actionId: ACTION_ID,
         agent_id: AGENT_ID,
         endpoint: 'agents',
-        answer: 'x'.repeat(16_001),
+        answers: { question: 'x'.repeat(16_001) },
       });
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/maximum length/i);
@@ -3457,7 +3176,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('400 when a batched answer omits a question or includes an unknown id', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserBatchJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiAskUserQuestionJob([
+          { id: 'environment', question: 'Which environment?' },
+          { id: 'window', question: 'Which time window?' },
+        ]).job,
+      );
       const missing = await post({
         conversationId: CONVO_ID,
         actionId: ACTION_ID,
@@ -3468,7 +3192,12 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(missing.status).toBe(400);
       expect(missing.body.error).toMatch(/every question/i);
 
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserBatchJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiAskUserQuestionJob([
+          { id: 'environment', question: 'Which environment?' },
+          { id: 'window', question: 'Which time window?' },
+        ]).job,
+      );
       const extra = await post({
         conversationId: CONVO_ID,
         actionId: ACTION_ID,
@@ -3480,39 +3209,29 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(extra.body.error).toMatch(/unknown question id/i);
     });
 
-    it('400 on an unsupported pending-action type', async () => {
+    it('fails closed when a paused legacy job has an unsupported pending-action type', async () => {
       const job = makeToolApprovalJob();
       job.metadata.pendingAction.payload = { type: 'totally_unknown' };
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/unsupported pending action/i);
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
       expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
-    it('proceeds (does not 403) for a pre-multi-tenancy job with no tenantId', async () => {
-      // hasTenantMismatch only blocks when the job carries a tenantId that differs;
-      // an untenanted (legacy) job must still resume once the userId check passes.
+    it('fails closed for a legacy job without a tenantId or Pi runtime identity', async () => {
       const job = makeToolApprovalJob({ metadata: { tenantId: undefined } });
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       const res = await post(approveBody());
-      expect(res.status).toBe(200);
-      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
-        CONVO_ID,
-        ACTION_ID,
-        expect.objectContaining({
-          preemptCapable: true,
-          providerExecutionId: expect.any(String),
-          providerDrained: true,
-        }),
-        1000,
-      );
-      await settled;
-      await flush();
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
     it('429 when the concurrency gate rejects the resume', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       mockCheckAndIncrementPendingRequest.mockResolvedValue({ allowed: false });
       const res = await post(approveBody());
       expect(res.status).toBe(429);
@@ -3520,7 +3239,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('consumes a checkpoint-snapshot rejection on the 429 early-return path', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       mockCheckAndIncrementPendingRequest.mockResolvedValue({ allowed: false });
       mockCaptureAgentCheckpointGeneration.mockRejectedValue(new Error('mongo down'));
 
@@ -3535,7 +3254,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('409 and releases the slot when the action was already claimed (single-winner)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       mockGenerationJobManager.approvals.resolve.mockResolvedValue(false);
       const res = await post(approveBody());
       expect(res.status).toBe(409);
@@ -3544,7 +3263,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
         }),
@@ -3555,10 +3274,10 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('409s RUN_REPLACED when the generation changes before the resume CAS', async () => {
-      const original = makeToolApprovalJob();
+      const original = makePiToolApprovalJob().job;
       mockGenerationJobManager.getJob
         .mockResolvedValueOnce(original)
-        .mockResolvedValueOnce(makeToolApprovalJob({ createdAt: 2000 }));
+        .mockResolvedValueOnce(makePiToolApprovalJob({ createdAt: 2000 }).job);
       mockGenerationJobManager.approvals.resolve.mockResolvedValue(false);
 
       const res = await post(approveBody({ generationCreatedAt: 1000 }));
@@ -3569,7 +3288,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
         }),
@@ -3583,7 +3302,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       // The increment happens before the claim, which runs before the run's own
       // try/finally — a store error here must still release the slot or a retry of the
       // still-paused approval gets spuriously 429'd until the counter TTL expires.
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJob().job);
       mockGenerationJobManager.approvals.resolve.mockRejectedValue(new Error('redis down'));
       const res = await post(approveBody());
       expect(res.status).toBe(500);
@@ -3594,14 +3313,18 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('remembered tool approvals', () => {
     it('stores the approved tool only after the resume fences pass', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(makeToolApprovalJob()));
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(job));
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
       const res = await post(allowAlwaysBody());
       await settled;
       expect(res.status).toBe(200);
       expect(mockAddConvoToolApprovalAllows).toHaveBeenCalledWith({
         user: USER_ID,
         conversationId: CONVO_ID,
-        toolNames: ['search_mcp_github'],
+        toolNames: [Tools.file_search],
         max: 64,
       });
       expect(mockInitializeClient.mock.invocationCallOrder[0]).toBeLessThan(
@@ -3614,14 +3337,18 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const hasToolApprovalHooks = jest.fn(() => true);
       setPluginHookSource({ hasHooks: () => true, hasToolApprovalHooks, register: () => 0 });
       try {
-        mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(makeToolApprovalJob()));
+        const { job, continuation, args } = makePiToolApprovalJob();
+        mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(job));
+        mockGenerationJobManager.getResumeState.mockResolvedValue(
+          makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+        );
         const client = makeClient();
         mockInitializeClient.mockResolvedValue({ client, userMCPAuthMap: {} });
         const res = await post(allowAlwaysBody());
         await settled;
         await flush();
         expect(res.status).toBe(200);
-        expect(hasToolApprovalHooks).toHaveBeenCalledWith(['search_mcp_github']);
+        expect(hasToolApprovalHooks).toHaveBeenCalledWith([Tools.file_search]);
         expect(mockAddConvoToolApprovalAllows).not.toHaveBeenCalled();
         expect(client.resumeCompletion).toHaveBeenCalledTimes(1);
       } finally {
@@ -3630,7 +3357,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('still resumes once when storing the remembered tool fails', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(makeToolApprovalJob()));
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(withAllowAlways(job));
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
       mockAddConvoToolApprovalAllows.mockRejectedValue(new Error('db down'));
       const client = makeClient();
       mockInitializeClient.mockResolvedValue({ client, userMCPAuthMap: {} });
@@ -3662,7 +3393,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const agent = statefulCodeAgent('worker-a');
       const codeExecutionBinding = captureCodeExecutionApprovalBinding([agent]);
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { pendingAction: { codeExecutionBinding } } }),
+        makePiToolApprovalJobRecord({ metadata: { pendingAction: { codeExecutionBinding } } }),
       );
       const resumedClient = makeClient({
         options: { agent },
@@ -3720,7 +3451,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const pausedAgent = statefulCodeAgent('worker-a');
       const codeExecutionBinding = captureCodeExecutionApprovalBinding([pausedAgent]);
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { pendingAction: { codeExecutionBinding } } }),
+        makePiToolApprovalJobRecord({ metadata: { pendingAction: { codeExecutionBinding } } }),
       );
       const resumedClient = makeClient({
         options: { agent: statefulCodeAgent('worker-b') },
@@ -3743,29 +3474,21 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       expect(mockDisposeClient).toHaveBeenCalledWith(resumedClient);
     });
 
-    it('seals the exact paused legacy-event fence only after resumed history persists', async () => {
+    it('fails closed for a legacy event pause that has only a history token', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
         makeToolApprovalJob({ metadata: { agentEventLegacyTurnToken: 'legacy-hitl-token' } }),
       );
 
       const res = await post(approveBody());
-      expect(res.status).toBe(200);
-      await settled;
-      await flush();
-
-      expect(mockCompleteAgentEventActorLegacyTurn).toHaveBeenCalledWith({
-        user: USER_ID,
-        tenantId: TENANT_ID,
-        conversationId: CONVO_ID,
-        token: 'legacy-hitl-token',
-      });
-      expect(mockSaveMessage.mock.invocationCallOrder[0]).toBeLessThan(
-        mockCompleteAgentEventActorLegacyTurn.mock.invocationCallOrder[0],
-      );
+      expect(res.status).toBe(503);
+      expect(res.body).toMatchObject({ code: 'AGENT_RUNTIME_UNAVAILABLE' });
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockCompleteAgentEventActorLegacyTurn).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
     it('ACKs immediately and claims the action atomically with the submitted actionId', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       const res = await post(approveBody());
       expect(res.status).toBe(200);
       expect(res.body).toEqual({
@@ -3781,7 +3504,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
         }),
@@ -3796,7 +3519,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('preserves and exactly echoes a paused generation protocol v2 marker', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { generationProtocolVersion: 2 } }),
+        makePiToolApprovalJobRecord({ metadata: { generationProtocolVersion: 2 } }),
       );
 
       const res = await post(approveBody({ generationProtocolVersion: 2 }));
@@ -3827,9 +3550,10 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         ],
       };
-      mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { compactionSemanticIndex } }),
-      );
+      const { job, continuation, args } = makePiToolApprovalJob({
+        metadata: { compactionSemanticIndex },
+      });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       await post(approveBody());
       await settled;
       await flush();
@@ -3848,7 +3572,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const client = await mockInitializeClient.mock.results[0].value.then((r) => r.client);
       expect(client.resumeCompletion).toHaveBeenCalledWith(
         expect.objectContaining({
-          resumeValue: { tc1: { type: 'approve' } },
+          piApprovalContinuation: continuation,
+          piApprovalDecision: { kind: 'execute', args },
           userMCPAuthMap: { server1: { token: 't' } },
           compactionSemanticIndex,
         }),
@@ -3866,7 +3591,9 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         },
       };
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { pendingAction: { toolApprovalBindings: bindings } } }),
+        makePiToolApprovalJobRecord({
+          metadata: { pendingAction: { toolApprovalBindings: bindings } },
+        }),
       );
       await post(approveBody({ toolApprovalBindings: { tc1: { binding: 'forged' } } }));
       await settled;
@@ -3889,7 +3616,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         fading: { v: 1, budgetTokens: 50_000, masked: true },
       };
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { contextMeta } }),
+        makePiToolApprovalJobRecord({ metadata: { contextMeta } }),
       );
       await post(approveBody());
       await settled;
@@ -3909,7 +3636,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         parentMessageId: RESPONSE_MSG_ID,
       };
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { mcpRequestBody: persistedMCPRequestBody } }),
+        makePiToolApprovalJobRecord({ metadata: { mcpRequestBody: persistedMCPRequestBody } }),
       );
 
       await post(approveBody());
@@ -3921,7 +3648,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('reuses the persisted generation checkpoint namespace and keeps legacy fallback explicit', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { checkpointNamespace: 'generation-1000' } }),
+        makePiToolApprovalJobRecord({ metadata: { checkpointNamespace: 'generation-1000' } }),
       );
       await post(approveBody());
       await settled;
@@ -3950,18 +3677,23 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           usage: null,
         },
       ];
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [],
-        runSteps,
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      const resumeState = makePiApprovalResumeState({
+        args,
+        stepIdentity: continuation.stepIdentity,
       });
+      resumeState.runSteps.push(...runSteps);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
 
       await post(approveBody());
       await settled;
       await flush();
 
       const client = await mockInitializeClient.mock.results[0].value.then((r) => r.client);
-      expect(client.resumeCompletion).toHaveBeenCalledWith(expect.objectContaining({ runSteps }));
+      expect(client.resumeCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({ runSteps: expect.arrayContaining(runSteps) }),
+      );
     });
 
     it('restores authored skills only from the claimed generation metadata', async () => {
@@ -3969,7 +3701,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         { agentId: 'agent-1', name: 'new-skill', id: '507f1f77bcf86cd799439011', primed: true },
       ];
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { authoredSkills } }),
+        makePiToolApprovalJobRecord({ metadata: { authoredSkills } }),
       );
       await post({ ...approveBody(), authoredSkills: [{ name: 'untrusted' }] });
       await settled;
@@ -3981,28 +3713,27 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('reapplies retained ask answers before resuming a later tool approval', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
-          metadata: {
-            resolvedAskUserQuestions: [
-              {
-                request: 'Which environment?',
-                output: 'staging',
-                toolCallId: 'ask-1',
-              },
-            ],
-          },
-        }),
-      );
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [
-          {
-            type: 'tool_call',
-            tool_call: { id: 'ask-1', name: 'ask_user_question', args: '' },
-          },
-        ],
-        runSteps: [],
+      const { job, continuation, args } = makePiToolApprovalJob({
+        metadata: {
+          resolvedAskUserQuestions: [
+            {
+              request: 'Which environment?',
+              output: 'staging',
+              toolCallId: 'ask-1',
+            },
+          ],
+        },
       });
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      const resumeState = makePiApprovalResumeState({
+        args,
+        stepIdentity: continuation.stepIdentity,
+      });
+      resumeState.aggregatedContent.unshift({
+        type: 'tool_call',
+        tool_call: { id: 'ask-1', name: 'ask_user_question', args: '' },
+      });
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
 
       await post(approveBody());
       await settled;
@@ -4011,7 +3742,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const client = await mockInitializeClient.mock.results[0].value.then((r) => r.client);
       expect(client.resumeCompletion).toHaveBeenCalledWith(
         expect.objectContaining({
-          seedContent: [
+          seedContent: expect.arrayContaining([
             expect.objectContaining({
               tool_call: expect.objectContaining({
                 id: 'ask-1',
@@ -4020,14 +3751,14 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
                 progress: 1,
               }),
             }),
-          ],
+          ]),
         }),
       );
       expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
         }),
@@ -4036,7 +3767,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('restores the paused user message files before reconstruction (execute-code files)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       // The resume body carries no files; the controller must source them from the
       // persisted user message so an approved code/read-file tool keeps its uploads.
       mockGetMessages.mockResolvedValue([{ files: [{ file_id: 'f1' }] }]);
@@ -4056,7 +3787,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           temporaryChatRetention: 1,
         };
         mockGenerationJobManager.getJob.mockResolvedValue(
-          makeToolApprovalJob({ metadata: { isTemporary: false } }),
+          makePiToolApprovalJobRecord({ metadata: { isTemporary: false } }),
         );
         mockSaveMessage.mockImplementation(async (_ctx, message) => message);
         if (rePause) {
@@ -4111,13 +3842,13 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       },
     );
 
-    it('converts a pre-policy paused chat that re-pauses without new output', async () => {
+    it('persists Pi host-call progress when a pre-policy pause re-pauses without new streamed output', async () => {
       requestConfigOverrides.interfaceConfig = {
         retentionMode: 'ephemeral',
         temporaryChatRetention: 1,
       };
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { isTemporary: false } }),
+        makePiToolApprovalJobRecord({ metadata: { isTemporary: false } }),
       );
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ pendingApproval: { actionId: NEXT_ACTION_ID }, contentParts: [] }),
@@ -4129,7 +3860,28 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       await settled;
       await flush();
 
-      expect(mockSaveMessage).not.toHaveBeenCalled();
+      expect(mockSaveMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ isTemporary: true }),
+        expect.objectContaining({
+          messageId: RESPONSE_MSG_ID,
+          content: expect.arrayContaining([
+            expect.objectContaining({
+              type: 'tool_call',
+              tool_call: expect.objectContaining({
+                id: 'tc1',
+                name: Tools.file_search,
+              }),
+            }),
+          ]),
+          unfinished: true,
+        }),
+        expect.objectContaining({
+          context: 'api/server/controllers/agents/resume.js - re-pause progress persist',
+        }),
+      );
+      expect(mockSaveMessage.mock.invocationCallOrder[0]).toBeLessThan(
+        mockGenerationJobManager.approvals.finishPausePersistence.mock.invocationCallOrder[0],
+      );
       expect(mockStampForcedRetention).toHaveBeenCalledWith(
         { userId: USER_ID, interfaceConfig: requestConfigOverrides.interfaceConfig },
         { conversationId: CONVO_ID, messageIds: [] },
@@ -4139,7 +3891,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     it.each([false, true])('preserves the job deadline when re-pause=%s', async (rePause) => {
       const expiredAt = new Date('2030-01-01T00:00:00.000Z');
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
+        makePiToolApprovalJobRecord({
           metadata: { isTemporary: true, retentionExpiresAt: expiredAt.toISOString() },
         }),
       );
@@ -4171,7 +3923,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       'restores authoritative isTemporary=$stored before reconstruction',
       async ({ stored, supplied, expected }) => {
         mockGenerationJobManager.getJob.mockResolvedValue(
-          makeToolApprovalJob({ metadata: { isTemporary: stored } }),
+          makePiToolApprovalJobRecord({ metadata: { isTemporary: stored } }),
         );
 
         const res = await post(approveBody({ isTemporary: supplied }));
@@ -4183,7 +3935,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     );
 
     it('ignores client-supplied resume files, sourcing from the paused job (security)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       // The paused turn's authoritative files (DB row); a crafted client tries to swap them.
       mockGetMessages.mockResolvedValue([{ files: [{ file_id: 'paused' }] }]);
 
@@ -4196,7 +3948,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('clears client-supplied resume files when the paused turn had none (security)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockGetMessages.mockResolvedValue([{ files: [] }]); // the paused turn had no files
 
       await post(approveBody({ files: [{ file_id: 'attacker-supplied' }] }));
@@ -4208,7 +3960,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('prefers job-metadata files over both the client body and the DB row', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
+        makePiToolApprovalJobRecord({
           metadata: {
             userMessage: {
               messageId: USER_MSG_ID,
@@ -4229,7 +3981,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('carries the restored files onto the final requestMessage (user bubble keeps attachments)', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       // job.metadata.userMessage is persisted without files; the final SSE must still
       // carry the restored uploads or the user bubble loses its attachments on resume.
       mockGetMessages.mockResolvedValue([{ files: [{ file_id: 'f1', filename: 'a.pdf' }] }]);
@@ -4247,7 +3999,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('persists the response, claims terminal ownership, emits done, finishes, and prunes', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       await post(approveBody());
       await settled;
       await flush();
@@ -4316,7 +4068,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('publishes reconciliation instead of a normal FINAL when the resumed response save returns no row', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockGenerationJobManager.completeJob.mockResolvedValue(false);
       mockSaveMessage.mockResolvedValue(undefined);
 
@@ -4337,7 +4089,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('degrades a failed checkpoint snapshot to scoped no-op cleanup', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockCaptureAgentCheckpointGeneration.mockRejectedValue(new Error('mongo down'));
 
       await post(approveBody());
@@ -4355,7 +4107,9 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       // The paused job has createdAt 1000; a concurrent request reused this conversationId,
       // so the live job now has a different createdAt — finalizing would clobber the newer
       // turn's job. The finally still runs (slot release), so `settled` resolves.
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob({ createdAt: 1000 }));
+      mockGenerationJobManager.getJob.mockResolvedValue(
+        makePiToolApprovalJobRecord({ createdAt: 1000 }),
+      );
       mockJobStore.getJob.mockResolvedValue({
         tokenUsage: null,
         contextUsage: null,
@@ -4372,7 +4126,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('does not write a completed response when a pause or abort wins the terminal claim', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJobRecord();
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       let signalResumeBoundary;
       const resumeBoundary = new Promise((resolve) => {
@@ -4415,7 +4169,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('finishes a winning terminal claim even when FINAL publication throws', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockGenerationJobManager.publishTerminalClaim.mockRejectedValue(new Error('transport down'));
 
       await post(approveBody());
@@ -4432,7 +4186,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('does not release the slot in the finally when the client already released it on pause', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       // Simulate handleRunInterrupt having released the concurrency slot on a re-pause.
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ pendingRequestReleased: true }),
@@ -4453,7 +4207,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('persists tool artifacts produced by the resumed continuation as attachments', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       const artifact = { type: 'image', file_id: 'img-1' };
       // The lean resume path bypasses BaseClient.sendMessage's artifact await, so the
       // controller must await client.artifactPromises itself (and drop null results).
@@ -4476,16 +4230,20 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('falls back to the aggregated store content when the live client content is empty', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       // No live content on the rebuilt client → the saved response must use the
       // pre-pause aggregated content from the store, not an empty array.
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ contentParts: [] }),
         userMCPAuthMap: {},
       });
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [{ type: 'text', text: 'from-store' }],
+      const resumeState = makePiApprovalResumeState({
+        args,
+        stepIdentity: continuation.stepIdentity,
       });
+      resumeState.aggregatedContent.push({ type: 'text', text: 'from-store' });
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
 
       await post(approveBody());
       await settled;
@@ -4493,13 +4251,15 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
       expect(mockSaveMessage).toHaveBeenCalledWith(
         expect.anything(),
-        expect.objectContaining({ content: [{ type: 'text', text: 'from-store' }] }),
+        expect.objectContaining({
+          content: expect.arrayContaining([{ type: 'text', text: 'from-store' }]),
+        }),
         expect.anything(),
       );
     });
 
     it('strips malformed tool_call parts from the saved content', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           contentParts: [
@@ -4524,7 +4284,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     it('merges previously persisted attachments with the resumed segment artifacts', async () => {
       const priorArtifact = { type: 'image', file_id: 'prior-1' };
       const newArtifact = { type: 'image', file_id: 'new-1' };
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       // An earlier pause segment already saved an attachment on the response row.
       mockGetMessages.mockResolvedValue([{ attachments: [priorArtifact] }]);
       mockInitializeClient.mockResolvedValue({
@@ -4544,7 +4304,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('persists the resumed run context calibration (contextMeta) onto the saved response', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       const contextMeta = { calibrationRatio: 0.8 };
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ contextMeta }),
@@ -4564,7 +4324,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('unsets the paused row context meta when the resumed run completes neutrally', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({
+        makePiToolApprovalJobRecord({
           metadata: {
             contextMeta: {
               calibrationRatio: 1.2,
@@ -4591,7 +4351,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('carries manualSkills/alwaysAppliedSkills onto the resumed requestMessage', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJobRecord();
       job.metadata.userMessage.manualSkills = ['skill-a'];
       job.metadata.userMessage.alwaysAppliedSkills = ['skill-b'];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
@@ -4608,7 +4368,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('attaches client response metadata to the saved message when present', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       const contextUsage = { tokenCount: 1234 };
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ buildResponseMetadata: jest.fn(() => ({ contextUsage })) }),
@@ -4626,25 +4386,34 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       );
     });
 
-    it('resumes an ask_user_question with the free-form answer', async () => {
-      const job = makeAskUserJob();
+    it('resumes a Pi ask_user_question with answers keyed by question id', async () => {
+      const questions = [{ id: 'file_name', question: 'What should I name the file?' }];
+      const { job, continuation } = makePiAskUserQuestionJob(questions);
+      const answers = { file_name: 'call it report.pdf' };
+      const output = JSON.stringify({ answers });
       const olderAsk = {
         type: 'tool_call',
         tool_call: { id: 'older-ask', name: 'ask_user_question', args: '' },
       };
       const currentAsk = {
         type: 'tool_call',
-        tool_call: { id: 'current-ask', name: 'ask_user_question', args: '' },
+        tool_call: {
+          id: continuation.hostToolCallId,
+          stepId: continuation.stepIdentity.id,
+          name: continuation.toolName,
+          args: JSON.stringify(continuation.args),
+        },
       };
       const answeredPart = makeToolCallContent({
-        id: 'current-ask',
+        id: continuation.hostToolCallId,
         name: 'ask_user_question',
-        output: 'call it report.pdf',
+        args: JSON.stringify(continuation.args),
+        output,
       });
+      const resumeState = makePiAskUserQuestionResumeState(continuation);
+      resumeState.aggregatedContent = [olderAsk, currentAsk];
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [olderAsk, currentAsk],
-      });
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           contentParts: [olderAsk, answeredPart, { type: 'text', text: 'Done' }],
@@ -4656,7 +4425,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         actionId: ACTION_ID,
         agent_id: AGENT_ID,
         endpoint: 'agents',
-        answer: 'call it report.pdf',
+        answers,
       });
       expect(res.status).toBe(200);
       await settled;
@@ -4664,20 +4433,23 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
       const client = await mockInitializeClient.mock.results[0].value.then((r) => r.client);
       expect(client.resumeCompletion).toHaveBeenCalledWith(
-        expect.objectContaining({ resumeValue: { answer: 'call it report.pdf' } }),
+        expect.objectContaining({
+          piAskUserQuestionContinuation: continuation,
+          piAskUserQuestionAnswer: { answers },
+        }),
       );
       expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
           resolvedAskUserQuestions: [
             {
-              request: 'What should I name the file?',
-              output: 'call it report.pdf',
-              contentIndex: 1,
+              request: { questions },
+              output,
+              toolCallId: continuation.hostToolCallId,
             },
           ],
         }),
@@ -4705,10 +4477,13 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       );
     });
 
-    it('retains an ID-less answer when earlier text exists but the ask part is missing', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserJob());
+    it('fails closed when the persisted Pi ask host state is missing its pending tool call', async () => {
+      const questions = [{ id: 'file_name', question: 'What should I name the file?' }];
+      const { job } = makePiAskUserQuestionJob(questions);
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       mockGenerationJobManager.getResumeState.mockResolvedValue({
         aggregatedContent: [{ type: 'text', text: 'Let me check.' }],
+        runSteps: [],
       });
 
       const res = await post({
@@ -4716,44 +4491,35 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         actionId: ACTION_ID,
         agent_id: AGENT_ID,
         endpoint: 'agents',
-        answer: 'call it report.pdf',
+        answers: { file_name: 'call it report.pdf' },
       });
 
-      expect(res.status).toBe(200);
-      await settled;
-      await flush();
-      expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
-        CONVO_ID,
-        ACTION_ID,
-        expect.objectContaining({
-          preemptCapable: true,
-          providerExecutionId: expect.any(String),
-          providerDrained: true,
-          resolvedAskUserQuestions: [
-            {
-              request: 'What should I name the file?',
-              output: 'call it report.pdf',
-              contentMissing: true,
-            },
-          ],
-        }),
-        1000,
-      );
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ code: 'PI_CONTINUATION_STALE' });
+      expect(mockGenerationJobManager.approvals.resolve).not.toHaveBeenCalled();
+      expect(mockInitializeClient).not.toHaveBeenCalled();
     });
 
     it('resumes a batched ask_user_question with answers keyed by question id', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeAskUserBatchJob());
+      const questions = [
+        { id: 'environment', question: 'Which environment?' },
+        { id: 'window', question: 'Which time window?' },
+      ];
+      const { job, continuation } = makePiAskUserQuestionJob(questions);
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
       const answers = { environment: 'staging', window: '7d' };
       const output = JSON.stringify({ answers });
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [
-          makeToolCallContent({ id: 'tc1', name: 'ask_user_question', args: '', output: '' }),
-        ],
-      });
+      const resumeState = makePiAskUserQuestionResumeState(continuation);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           contentParts: [
-            makeToolCallContent({ id: 'tc1', name: 'ask_user_question', output }),
+            makeToolCallContent({
+              id: continuation.hostToolCallId,
+              name: 'ask_user_question',
+              args: JSON.stringify(continuation.args),
+              output,
+            }),
             { type: 'text', text: 'Done' },
           ],
         }),
@@ -4772,20 +4538,23 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
       const client = await mockInitializeClient.mock.results[0].value.then((r) => r.client);
       expect(client.resumeCompletion).toHaveBeenCalledWith(
-        expect.objectContaining({ resumeValue: { answers } }),
+        expect.objectContaining({
+          piAskUserQuestionContinuation: continuation,
+          piAskUserQuestionAnswer: { answers },
+        }),
       );
       expect(mockGenerationJobManager.approvals.resolve).toHaveBeenCalledWith(
         CONVO_ID,
         ACTION_ID,
         expect.objectContaining({
-          preemptCapable: true,
+          preemptCapable: false,
           providerExecutionId: expect.any(String),
           providerDrained: true,
           resolvedAskUserQuestions: [
             {
               request: { questions: expect.any(Array) },
               output,
-              toolCallId: 'tc1',
+              toolCallId: continuation.hostToolCallId,
             },
           ],
         }),
@@ -4801,12 +4570,16 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('persists answer provenance for the payload tool_call_id in a multi-ask turn', async () => {
-      const job = makeAskUserJob();
-      job.metadata.pendingAction.payload.tool_call_id = 'ask-first';
+      const questions = [{ id: 'first', question: 'Which asset?' }];
+      const { job, continuation } = makePiAskUserQuestionJob(questions, {
+        hostToolCallId: 'ask-first',
+      });
+      const answers = { first: 'Asset 1' };
+      const output = JSON.stringify({ answers });
       const firstAsk = makeToolCallContent({
         id: 'ask-first',
         name: 'ask_user_question',
-        args: '',
+        args: JSON.stringify(continuation.args),
         output: '',
       });
       const secondAsk = makeToolCallContent({
@@ -4816,16 +4589,17 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         output: '',
       });
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [firstAsk, secondAsk],
-      });
+      const resumeState = makePiAskUserQuestionResumeState(continuation);
+      resumeState.aggregatedContent = [firstAsk, secondAsk];
+      mockGenerationJobManager.getResumeState.mockResolvedValue(resumeState);
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           contentParts: [
             makeToolCallContent({
               id: 'ask-first',
               name: 'ask_user_question',
-              output: 'first answer',
+              args: JSON.stringify(continuation.args),
+              output,
             }),
             secondAsk,
           ],
@@ -4838,7 +4612,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         actionId: ACTION_ID,
         agent_id: AGENT_ID,
         endpoint: 'agents',
-        answer: 'first answer',
+        answers,
       });
       expect(res.status).toBe(200);
       await settled;
@@ -4870,25 +4644,25 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       },
       {
         name: 'edited arguments',
-        resolution: { tool_call_id: 'tc1', decision: 'edit', editedArguments: { q: 'human edit' } },
-        finalToolCall: { args: '{"q":"human edit"}' },
+        resolution: {
+          tool_call_id: 'tc1',
+          decision: 'edit',
+          editedArguments: { query: 'human edit' },
+        },
+        finalToolCall: { args: '{"query":"human edit"}' },
         expectedPath: '/content/0/tool_call/args',
         expectedField: undefined,
       },
     ])(
       'persists exact provenance for $name',
       async ({ resolution, finalToolCall, expectedPath, expectedField }) => {
-        const job = makeToolApprovalJob();
-        job.metadata.pendingAction.payload.review_configs = [
+        const job = makePiToolApprovalJobRecord(
+          {},
           {
-            tool_call_id: 'tc1',
-            allowed_decisions: ['approve', resolution.decision],
+            allowedDecisions: ['approve', resolution.decision],
           },
-        ];
+        );
         mockGenerationJobManager.getJob.mockResolvedValue(job);
-        mockGenerationJobManager.getResumeState.mockResolvedValue({
-          aggregatedContent: [makeToolCallContent()],
-        });
         mockInitializeClient.mockResolvedValue({
           client: makeClient({
             contentParts: [makeToolCallContent(finalToolCall), { type: 'text', text: 'Done' }],
@@ -4922,10 +4696,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     );
 
     it('does not mark approve-only HITL content as user-submitted', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [makeToolCallContent()],
-      });
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({ contentParts: [makeToolCallContent({ output: 'tool result' })] }),
         userMCPAuthMap: {},
@@ -4946,7 +4717,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('generates a title for a first-turn pause before completing the stream', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJobRecord();
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       mockGetConvo.mockResolvedValue({ title: 'New Chat' });
@@ -4970,7 +4741,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('still finalizes the turn when first-turn title generation throws', async () => {
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJobRecord();
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       mockGetConvo.mockResolvedValue({ title: 'New Chat' });
@@ -4993,7 +4764,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
   describe('non-finalizing outcomes', () => {
     it('re-pause: does not finalize when the run pauses again', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       const exposePendingApproval = jest.fn().mockResolvedValue(undefined);
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
@@ -5038,7 +4809,11 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('re-pause: persists the segment content (unfinished) so an expiring re-pause keeps it', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      const { job, continuation, args } = makePiToolApprovalJob();
+      mockGenerationJobManager.getJob.mockResolvedValue(job);
+      mockGenerationJobManager.getResumeState.mockResolvedValue(
+        makePiApprovalResumeState({ args, stepIdentity: continuation.stepIdentity }),
+      );
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5067,14 +4842,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('re-pause: preserves HITL response provenance on the unfinished row', async () => {
-      const job = makeToolApprovalJob();
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['respond'] },
-      ];
+      const job = makePiToolApprovalJobRecord({}, { allowedDecisions: ['respond'] });
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [makeToolCallContent()],
-      });
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: true,
@@ -5105,7 +4874,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('re-pause: persists artifacts produced before pausing again (unfinished)', async () => {
       const artifact = { type: 'image', file_id: 'seg-1' };
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5145,7 +4914,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         await saveGate;
         return {};
       });
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5182,7 +4951,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('re-pause: terminalizes instead of exposing the next action when persistence fails', async () => {
       mockSaveMessage.mockRejectedValue(new Error('re-pause save failed'));
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5218,7 +4987,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
       const checkpointError = new Error('checkpoint delete unavailable');
       mockSaveMessage.mockRejectedValue(new Error('re-pause save failed'));
       mockDeleteAgentCheckpoint.mockRejectedValue(checkpointError);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5245,7 +5014,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     it('re-pause: leaves a replacement checkpoint untouched when exact persistence failure loses ownership', async () => {
       mockSaveMessage.mockResolvedValue(undefined);
       mockGenerationJobManager.failPausePersistence.mockResolvedValue(false);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           pendingApproval: { actionId: NEXT_ACTION_ID },
@@ -5271,14 +5040,8 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('abort-during-resume: lets the abort route finalize, does not double-save', async () => {
-      const job = makeToolApprovalJob();
-      job.metadata.pendingAction.payload.review_configs = [
-        { tool_call_id: 'tc1', allowed_decisions: ['respond'] },
-      ];
+      const job = makePiToolApprovalJobRecord({}, { allowedDecisions: ['respond'] });
       mockGenerationJobManager.getJob.mockResolvedValue(job);
-      mockGenerationJobManager.getResumeState.mockResolvedValue({
-        aggregatedContent: [makeToolCallContent()],
-      });
       mockInitializeClient.mockImplementation(async () => {
         job.abortController.abort();
         return { client: makeClient(), userMCPAuthMap: {} };
@@ -5306,7 +5069,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('resume failure delegates safe single-winner error publication and prunes the checkpoint', async () => {
       const rawValue = 'PRIVATE-RESUME-PROVIDER-ECHO';
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           resumeCompletion: jest.fn().mockRejectedValue(new Error(`Provider echoed ${rawValue}`)),
@@ -5338,7 +5101,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     it('uses a normalized resume error when protection is active', async () => {
       const rawValue = 'PRIVATE-RESUME-PROVIDER-ECHO';
       requestConfigOverrides = { filters: { messages: { pii: {} } } };
-      const job = makeToolApprovalJob();
+      const job = makePiToolApprovalJobRecord();
       job.metadata.userMessage.parentMessageId = Constants.NO_PARENT;
       mockGenerationJobManager.getJob.mockResolvedValue(job);
       mockInitializeClient.mockResolvedValue({
@@ -5377,7 +5140,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
           },
         },
       };
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           resumeCompletion: jest.fn().mockRejectedValue(new Error(rawValue)),
@@ -5399,7 +5162,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     it('contains checkpoint deletion failure after winning ordinary resume-error finalization', async () => {
       const checkpointError = new Error('checkpoint delete unavailable');
       mockDeleteAgentCheckpoint.mockRejectedValue(checkpointError);
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           resumeCompletion: jest.fn().mockRejectedValue(new Error('boom')),
@@ -5423,7 +5186,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
 
     it('keeps a re-pause checkpoint when failed-resume terminal ownership is lost', async () => {
       mockGenerationJobManager.getJob.mockResolvedValue(
-        makeToolApprovalJob({ metadata: { checkpointNamespace: 'generation-1000' } }),
+        makePiToolApprovalJobRecord({ metadata: { checkpointNamespace: 'generation-1000' } }),
       );
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
@@ -5444,7 +5207,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     });
 
     it('does not overwrite the job when guarded error finalization itself fails', async () => {
-      mockGenerationJobManager.getJob.mockResolvedValue(makeToolApprovalJob());
+      mockGenerationJobManager.getJob.mockResolvedValue(makePiToolApprovalJobRecord());
       mockInitializeClient.mockResolvedValue({
         client: makeClient({
           resumeCompletion: jest.fn().mockRejectedValue(new Error('boom')),

@@ -1,4 +1,5 @@
 import { useEffect } from 'react';
+import '~/components/Chat/Messages/Content/register';
 import { RecoilRoot } from 'recoil';
 import { DndProvider } from 'react-dnd';
 import { RouterProvider } from 'react-router-dom';

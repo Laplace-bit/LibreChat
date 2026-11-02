@@ -50,6 +50,7 @@ describe('AgentClient.addImageURLs - image detail', () => {
       provider: 'openai',
       endpoint: 'agents',
       imageDetail: 'low',
+      requireInlineData: true,
     });
   });
 });

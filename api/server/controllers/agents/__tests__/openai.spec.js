@@ -972,7 +972,7 @@ describe('OpenAIChatCompletionController', () => {
 
     expect(res.status).toHaveBeenCalledWith(503);
     expect(api.createErrorResponse).toHaveBeenCalledWith(
-      'The selected agent runtime is not available on this server.',
+      'The Pi agent runtime is not available on this server.',
       'server_error',
       'AGENT_RUNTIME_UNAVAILABLE',
     );
@@ -1418,11 +1418,16 @@ describe('OpenAIChatCompletionController', () => {
         },
       });
       req.config.filters = { messages: { pii: {} } };
-      mockProcessStream.mockRejectedValueOnce(
-        new Error('Pi provider failed', { cause: providerError }),
-      );
+      mockExecuteRemotePiGeneration.mockImplementationOnce(async ({ onModelProviderError }) => {
+        onModelProviderError?.(providerError);
+        throw new Error('Pi provider failed', { cause: providerError });
+      });
 
       await OpenAIChatCompletionController(req, res);
+
+      expect(mockExecuteRemotePiGeneration.mock.calls[0][0].onModelProviderError).toEqual(
+        expect.any(Function),
+      );
 
       const errorLog = logger.error.mock.calls.find(
         ([message]) => message === '[OpenAI API] Upstream model error',
@@ -1464,9 +1469,16 @@ describe('OpenAIChatCompletionController', () => {
       res.flushHeaders.mockImplementationOnce(() => {
         res.headersSent = true;
       });
-      mockProcessStream.mockRejectedValueOnce(providerError);
+      mockExecuteRemotePiGeneration.mockImplementationOnce(async ({ onModelProviderError }) => {
+        onModelProviderError?.(providerError);
+        throw providerError;
+      });
 
       await OpenAIChatCompletionController(req, res);
+
+      expect(mockExecuteRemotePiGeneration.mock.calls[0][0].onModelProviderError).toEqual(
+        expect.any(Function),
+      );
 
       expect(api.createChunk).toHaveBeenCalledWith(
         expect.any(Object),

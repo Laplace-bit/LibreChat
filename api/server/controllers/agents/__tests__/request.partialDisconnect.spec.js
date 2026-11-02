@@ -60,6 +60,10 @@ jest.mock('@librechat/api', () => ({
   AgentRuntimeUnavailableError: jest.requireActual('@librechat/api').AgentRuntimeUnavailableError,
   assertAgentRuntimeCompatibleGraph: (...args) =>
     jest.requireActual('@librechat/api').assertAgentRuntimeCompatibleGraph(...args),
+  isPiOrdinaryTriggerCandidate: (...args) =>
+    jest.requireActual('@librechat/api').isPiOrdinaryTriggerCandidate(...args),
+  isPiRegenerationRequest: (...args) =>
+    jest.requireActual('@librechat/api').isPiRegenerationRequest(...args),
   selectAgentRuntimeForAgent: (...args) =>
     jest.requireActual('@librechat/api').selectAgentRuntimeForAgent(...args),
   applyForcedTemporaryRequest: jest.fn(),

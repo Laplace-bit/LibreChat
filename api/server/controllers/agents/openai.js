@@ -1126,6 +1126,7 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
           toolExecuteHandler: handlers.on_tool_execute,
           initialSessions,
           usageAttribution: { provider: primaryConfig.provider },
+          onModelProviderError: terminalRunError.modelCallback.handleLLMError,
         });
         collectedUsage.push(...outcome.usage);
 

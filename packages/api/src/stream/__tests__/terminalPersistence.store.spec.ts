@@ -1,4 +1,6 @@
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
+import { PI_PROVIDER_OWNER_LOST_ERROR } from '../interfaces/IJobStore';
+import { PINNED_PI_AGENT_RUNTIME } from '~/agents/runtime/selection';
 
 describe('InMemoryJobStore terminal persistence leases', () => {
   let store: InMemoryJobStore;
@@ -141,5 +143,78 @@ describe('InMemoryJobStore terminal persistence leases', () => {
         '{"event":"legacy-owner"}',
       ),
     ).resolves.toBe(true);
+  });
+
+  it('finalizes a confirmed Pi owner-loss recovery without waiting for the generic timeout', async () => {
+    const streamId = `pi-owner-loss-${nextStreamId++}`;
+    const job = await store.createJob(streamId, 'user-1', streamId, undefined, {
+      agentRuntime: PINNED_PI_AGENT_RUNTIME,
+      providerExecutionId: 'pi-execution-1',
+    });
+    const owner = await store.acquirePiProviderOwner(
+      streamId,
+      job.createdAt,
+      'pi-execution-1',
+      'pi-owner-1',
+      1_000,
+    );
+    expect(owner).not.toBe(false);
+    if (owner === false) return;
+
+    jest.setSystemTime(Date.now() + 1_001);
+    await expect(store.claimExpiredPiProviderOwner(owner)).resolves.toBe(true);
+    await expect(
+      store.recoverExpiredTerminalPersistence(
+        streamId,
+        job.createdAt,
+        '{"event":"owner-lost-reconcile"}',
+        `terminal:${job.createdAt}`,
+        30_000,
+      ),
+    ).resolves.toBe(true);
+
+    await expect(store.getJob(streamId)).resolves.toMatchObject({
+      status: 'error',
+      providerRecoveryId: `pi-owner-lost:${job.createdAt}:${owner.fence}`,
+      providerRecoveryOutcome: 'outcome_unknown',
+      providerDrained: false,
+      terminalPersistencePending: false,
+      finalEvent: '{"event":"owner-lost-reconcile"}',
+    });
+  });
+
+  it('does not trust forged Pi owner-loss markers on a generic job', async () => {
+    const streamId = `generic-owner-loss-${nextStreamId++}`;
+    const job = await store.createJob(streamId, 'user-1', streamId);
+    const ownerLostAt = Date.now();
+    await expect(
+      store.transitionStatus(streamId, {
+        from: 'running',
+        to: 'error',
+        expectCreatedAt: job.createdAt,
+        patch: {
+          completedAt: ownerLostAt,
+          error: PI_PROVIDER_OWNER_LOST_ERROR,
+          providerDrained: false,
+          providerRecoveryOutcome: 'outcome_unknown',
+          providerRecoveryId: `pi-owner-lost:${job.createdAt}:1`,
+          providerRecoveryFence: 1,
+          providerOwnerLostAt: ownerLostAt,
+          providerRecoveryErrorCode: 'PI_PROVIDER_OWNER_LOST',
+          terminalPersistencePending: true,
+          terminalPersistenceStartedAt: ownerLostAt,
+        },
+      }),
+    ).resolves.toBe(true);
+
+    await expect(
+      store.recoverExpiredTerminalPersistence(
+        streamId,
+        job.createdAt,
+        '{"event":"must-wait"}',
+        `terminal:${job.createdAt}`,
+        30_000,
+      ),
+    ).resolves.toBe(false);
   });
 });

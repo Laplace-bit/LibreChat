@@ -12606,6 +12606,48 @@ describe('AgentClient - resumeCompletion content protection', () => {
     expect(input.resumeToolResult.continuation.actionId).toBe('resume-action');
   });
 
+  it('resumes a bound Pi history Event Actor only with the server admission marker', async () => {
+    const context = makeContext(undefined);
+    Object.assign(context.options.req, {
+      _isAgentTrigger: true,
+      _agentEventBindingId: 'binding-1',
+      _agentEventBindingParentConversationId: 'parent-conversation',
+      _piEventActorHistoryResumeEligible: true,
+    });
+
+    await resumeWithPi(context);
+
+    expect(mockExecutePiGeneration).toHaveBeenCalledTimes(1);
+    expect(mockExecutePiGeneration.mock.calls[0][0].resumeToolResult.continuation.actionId).toBe(
+      'resume-action',
+    );
+    expect(mockCreateRun).not.toHaveBeenCalled();
+  });
+
+  it('rejects a bound Pi resume when only the request body claims Event Actor admission', async () => {
+    const context = makeContext(undefined);
+    Object.assign(context.options.req, {
+      _isAgentTrigger: true,
+      _agentEventBindingId: 'binding-1',
+      _agentEventBindingParentConversationId: 'parent-conversation',
+      body: { _piEventActorHistoryResumeEligible: true },
+    });
+
+    await expectPiResumeToFailClosed(context);
+  });
+
+  it('does not let history admission bypass an Event Actor checkpoint continuation', async () => {
+    const context = makeContext(undefined);
+    Object.assign(context.options.req, {
+      _agentEventBindingId: 'binding-1',
+      _agentEventBindingParentConversationId: 'parent-conversation',
+      _piEventActorHistoryResumeEligible: true,
+    });
+    context.eventActorContinuation = 'warm';
+
+    await expectPiResumeToFailClosed(context);
+  });
+
   it('resumes a Pi tool with a lazy foreground target even when subagent task context exists', async () => {
     const childDescriptor = {
       id: 'agent-child',

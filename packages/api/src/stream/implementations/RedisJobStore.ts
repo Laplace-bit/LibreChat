@@ -968,10 +968,34 @@ const RECOVER_EXPIRED_TERMINAL_PERSISTENCE_LUA =
   'if not leaseUntil or leaseUntil ~= leaseUntil or leaseUntil <= 0 ' +
   'or leaseUntil > 9007199254740991 or leaseUntil > nowMs then return 0 end ' +
   'elseif (not ownerToken or ownerToken == "") and not leaseRaw then ' +
+  'local ownerLostAt = tonumber(redis.call("HGET", KEYS[1], "providerOwnerLostAt") or "") ' +
   'local startedAt = tonumber(redis.call("HGET", KEYS[1], "terminalPersistenceStartedAt") ' +
   'or redis.call("HGET", KEYS[1], "completedAt") or redis.call("HGET", KEYS[1], "createdAt")) ' +
-  'if not startedAt or startedAt ~= startedAt or startedAt < 0 or startedAt > 9007199254740991 ' +
-  'or nowMs - startedAt < tonumber(ARGV[4]) then return 0 end ' +
+  'local completedAt = tonumber(redis.call("HGET", KEYS[1], "completedAt") or "") ' +
+  'local recoveryFenceRaw = redis.call("HGET", KEYS[1], "providerRecoveryFence") ' +
+  'local recoveryFence = tonumber(recoveryFenceRaw or "") ' +
+  'local runtimeRaw = redis.call("HGET", KEYS[1], "agentRuntime") ' +
+  'local runtimeOk, runtime = pcall(cjson.decode, runtimeRaw or "") ' +
+  'local runtimeKeyCount = 0 if runtimeOk and type(runtime) == "table" then ' +
+  'for key in pairs(runtime) do runtimeKeyCount = runtimeKeyCount + 1 end end ' +
+  'local confirmedPiOwnerLoss = status == "error" and runtimeOk and type(runtime) == "table" ' +
+  'and runtime.engine == "pi" and runtime.sdkVersion == "1.4.0" and runtimeKeyCount == 2 ' +
+  'and redis.call("HGET", KEYS[1], "error") == ' +
+  '"Agent run stopped after its provider owner lease expired. Tool outcome is unknown; no work was automatically retried." ' +
+  'and redis.call("HGET", KEYS[1], "providerDrained") == "0" ' +
+  'and redis.call("HGET", KEYS[1], "providerRecoveryOutcome") == "outcome_unknown" ' +
+  'and redis.call("HGET", KEYS[1], "providerRecoveryErrorCode") == "PI_PROVIDER_OWNER_LOST" ' +
+  'and ownerLostAt and ownerLostAt > 0 and ownerLostAt <= 9007199254740991 ' +
+  'and ownerLostAt % 1 == 0 and startedAt == ownerLostAt and completedAt == ownerLostAt ' +
+  'and recoveryFence and recoveryFence > 0 and recoveryFence <= 9007199254740991 ' +
+  'and recoveryFence % 1 == 0 ' +
+  'and recoveryFenceRaw and string.match(recoveryFenceRaw, "^[1-9]%d*$") ' +
+  'and redis.call("HGET", KEYS[1], "providerRecoveryId") == ' +
+  '"pi-owner-lost:" .. ARGV[1] .. ":" .. recoveryFenceRaw ' +
+  'and not redis.call("HGET", KEYS[1], "providerOwnerId") ' +
+  'and not redis.call("HGET", KEYS[1], "providerLeaseExpiresAt") ' +
+  'if not confirmedPiOwnerLoss and (not startedAt or startedAt ~= startedAt or startedAt < 0 ' +
+  'or startedAt > 9007199254740991 or nowMs - startedAt < tonumber(ARGV[4])) then return 0 end ' +
   'else return 0 end ' +
   'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0", "finalEvent", ARGV[2], ' +
   '"terminalPublicationId", ARGV[3]) ' +

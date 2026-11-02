@@ -19,6 +19,7 @@ import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { AuthoredSkillBinding } from '~/agents/authored';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
+import { resolveStoredAgentRuntime } from '~/agents/runtime/selection';
 
 /**
  * Detached Event Actor execution guarantee advertised by a generation store.
@@ -791,6 +792,40 @@ export const PI_PROVIDER_LEASE_MS = 45_000;
 export const PI_PROVIDER_HEARTBEAT_MS = 10_000;
 export const PI_PROVIDER_OWNER_LOST_ERROR =
   'Agent run stopped after its provider owner lease expired. Tool outcome is unknown; no work was automatically retried.';
+
+/** A provider-owner-loss CAS is already authoritative proof that the Pi
+ * executor is gone. Its durable terminal outbox can be finalized immediately,
+ * unlike an unowned legacy terminal write that still needs the stale timeout. */
+export function isConfirmedPiProviderOwnerLoss(
+  job: Pick<
+    SerializableJobData,
+    | 'agentRuntime'
+    | 'status'
+    | 'createdAt'
+    | 'error'
+    | 'providerDrained'
+    | 'providerRecoveryOutcome'
+    | 'providerRecoveryId'
+    | 'providerRecoveryFence'
+    | 'providerOwnerLostAt'
+    | 'providerRecoveryErrorCode'
+  >,
+): boolean {
+  const fence = job.providerRecoveryFence;
+  return (
+    resolveStoredAgentRuntime(job.agentRuntime).status === 'resolved' &&
+    job.status === 'error' &&
+    job.error === PI_PROVIDER_OWNER_LOST_ERROR &&
+    job.providerDrained === false &&
+    job.providerRecoveryOutcome === 'outcome_unknown' &&
+    job.providerRecoveryErrorCode === 'PI_PROVIDER_OWNER_LOST' &&
+    Number.isSafeInteger(fence) &&
+    fence! > 0 &&
+    Number.isSafeInteger(job.providerOwnerLostAt) &&
+    job.providerOwnerLostAt! > 0 &&
+    job.providerRecoveryId === `pi-owner-lost:${job.createdAt}:${fence}`
+  );
+}
 
 /** Value stored under an idempotency claim: the stream a retried request should attach to. */
 export interface IdempotencyClaimValue {

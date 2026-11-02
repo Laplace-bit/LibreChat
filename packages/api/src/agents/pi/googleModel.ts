@@ -378,6 +378,26 @@ const ALLOWED_STREAM_OPTION_KEYS = new Set([
   'fetch',
 ]);
 
+const ALLOWED_AGENT_LOOP_OPTION_KEYS = new Set([
+  'model',
+  'toolExecution',
+  'beforeToolCall',
+  'afterToolCall',
+  'finishTurn',
+  'prepareRequest',
+  'prepareNextTurn',
+  'convertToLlm',
+  'transformContext',
+  'getApiKey',
+  'getSteeringMessages',
+  'getFollowUpMessages',
+]);
+
+const ALLOWED_INCOMING_STREAM_OPTION_KEYS = new Set([
+  ...ALLOWED_STREAM_OPTION_KEYS,
+  ...ALLOWED_AGENT_LOOP_OPTION_KEYS,
+]);
+
 const ALLOWED_GOOGLE_PAYLOAD_KEYS = new Set(['model', 'contents', 'config']);
 const ALLOWED_GOOGLE_CONFIG_KEYS = new Set([
   'maxOutputTokens',
@@ -388,6 +408,38 @@ const ALLOWED_GOOGLE_CONFIG_KEYS = new Set([
   'thinkingConfig',
   'abortSignal',
 ]);
+const ALLOWED_GOOGLE_THINKING_LEVELS = new Set([
+  'THINKING_LEVEL_UNSPECIFIED',
+  'MINIMAL',
+  'LOW',
+  'MEDIUM',
+  'HIGH',
+]);
+
+function isValidGoogleThinkingConfig(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, new Set(['includeThoughts', 'thinkingBudget', 'thinkingLevel'])) ||
+    (value.includeThoughts !== undefined && typeof value.includeThoughts !== 'boolean')
+  ) {
+    return false;
+  }
+
+  const hasBudget = value.thinkingBudget !== undefined;
+  const hasLevel = value.thinkingLevel !== undefined;
+  return (
+    !(hasBudget && hasLevel) &&
+    (value.includeThoughts !== undefined || hasBudget || hasLevel) &&
+    (!hasBudget ||
+      (typeof value.thinkingBudget === 'number' &&
+        Number.isSafeInteger(value.thinkingBudget) &&
+        value.thinkingBudget >= -1 &&
+        value.thinkingBudget <= 65_536)) &&
+    (!hasLevel ||
+      (typeof value.thinkingLevel === 'string' &&
+        ALLOWED_GOOGLE_THINKING_LEVELS.has(value.thinkingLevel)))
+  );
+}
 
 function validateRequestOptions(
   model: Model<Api>,
@@ -400,24 +452,36 @@ function validateRequestOptions(
     return;
   }
   const unparsedOptions: unknown = options;
+  const agentModel = isRecord(unparsedOptions) ? unparsedOptions.model : undefined;
+  const hasAgentModel =
+    isRecord(unparsedOptions) && Object.prototype.hasOwnProperty.call(unparsedOptions, 'model');
+  const isAgentLoopRequest = hasAgentModel && matchesModelIdentity(agentModel, model);
+  const hasAgentLoopControlOptions =
+    isRecord(unparsedOptions) &&
+    Object.keys(unparsedOptions).some((key) => ALLOWED_AGENT_LOOP_OPTION_KEYS.has(key));
   if (
     !isRecord(unparsedOptions) ||
-    !hasOnlyKeys(unparsedOptions, ALLOWED_STREAM_OPTION_KEYS) ||
+    !hasOnlyKeys(unparsedOptions, ALLOWED_INCOMING_STREAM_OPTION_KEYS) ||
+    (hasAgentModel && !isAgentLoopRequest) ||
+    (!isAgentLoopRequest && hasAgentLoopControlOptions) ||
     options.apiKey !== gatewayApiKey ||
     hasEntries(options.headers) ||
     hasEntries(options.env) ||
     (options.samplingParams !== undefined && hasEntries(options.samplingParams)) ||
-    options.transport !== undefined ||
+    (!isAgentLoopRequest && options.transport !== undefined) ||
+    (isAgentLoopRequest &&
+      options.transport !== undefined &&
+      options.transport !== 'auto' &&
+      options.transport !== 'sse') ||
     options.cacheRetention !== undefined ||
-    options.sessionId !== undefined ||
-    options.timeoutMs !== undefined ||
+    (!isAgentLoopRequest && options.sessionId !== undefined) ||
+    (!isAgentLoopRequest && options.timeoutMs !== undefined) ||
     options.websocketConnectTimeoutMs !== undefined ||
     options.deferred !== undefined ||
     hasEntries(options.metadata) ||
     options.fetch !== undefined ||
-    options.onPayload !== undefined ||
     (options.maxRetries !== undefined && options.maxRetries !== 2) ||
-    options.maxRetryDelayMs !== undefined ||
+    (!isAgentLoopRequest && options.maxRetryDelayMs !== undefined) ||
     (options.temperature !== undefined &&
       options.temperature !== candidate.generation.temperature) ||
     (options.maxTokens !== undefined &&
@@ -426,7 +490,10 @@ function validateRequestOptions(
         options.maxTokens > candidate.generation.maxOutputTokens)) ||
     (options.reasoning !== undefined &&
       !isCompatibleReasoning(model, options.reasoning, candidate)) ||
-    (options.thinkingBudgets !== undefined && hasEntries(options.thinkingBudgets)) ||
+    (!isAgentLoopRequest && options.onPayload !== undefined) ||
+    (!isAgentLoopRequest &&
+      options.thinkingBudgets !== undefined &&
+      hasEntries(options.thinkingBudgets)) ||
     (options.toolChoice !== undefined && options.toolChoice !== 'auto') ||
     (options.signal !== undefined && !(options.signal instanceof AbortSignal)) ||
     !isBoundGoogleModel(model, PI_GOOGLE_PROVIDER_ID, gatewayBaseUrl)
@@ -435,17 +502,29 @@ function validateRequestOptions(
   }
 }
 
+function matchesModelIdentity(value: unknown, model: Model<Api>): boolean {
+  return (
+    isRecord(value) &&
+    value.id === model.id &&
+    value.api === model.api &&
+    value.provider === model.provider &&
+    value.baseUrl === model.baseUrl
+  );
+}
+
 function isCompatibleReasoning(
   model: Model<Api>,
   reasoning: NonNullable<SimpleStreamOptions['reasoning']>,
   candidate: AuthorizedPiGoogleModelCandidate,
 ): boolean {
   const expectedLevel = candidate.generation.thinkingConfig?.thinkingLevel;
+  const mappedLevel = model.thinkingLevelMap?.[reasoning] ?? reasoning;
   if (expectedLevel === undefined) {
-    return false;
+    // A server-configured Google thinking shape remains authoritative. Without
+    // one, pi-ai maps the selected reasoning level for this model.
+    return candidate.generation.thinkingConfig !== undefined || model.reasoning;
   }
   // Don't silently downgrade an unsupported level to a different model setting.
-  const mappedLevel = model.thinkingLevelMap?.[reasoning] ?? reasoning;
   return (
     mappedLevel !== 'off' &&
     typeof mappedLevel === 'string' &&
@@ -480,7 +559,6 @@ function mapGooglePayload(
   }
 
   const config: Record<string, unknown> = { ...payload.config };
-  delete config.thinkingConfig;
   delete config.topP;
   delete config.topK;
   delete config.stopSequences;
@@ -488,6 +566,11 @@ function mapGooglePayload(
 
   if (candidate.generation.thinkingConfig !== undefined) {
     config.thinkingConfig = { ...candidate.generation.thinkingConfig };
+  } else if (
+    config.thinkingConfig !== undefined &&
+    !isValidGoogleThinkingConfig(config.thinkingConfig)
+  ) {
+    throw new PiGoogleModelBindingError('UNSUPPORTED_MODEL');
   }
   if (candidate.generation.topP !== undefined) {
     config.topP = candidate.generation.topP;
@@ -641,6 +724,14 @@ export async function createPiGoogleModelBinding(
           ...(candidate.generation.temperature === undefined
             ? {}
             : { temperature: candidate.generation.temperature }),
+          ...(candidate.generation.thinkingConfig !== undefined ||
+          incomingOptions.reasoning === undefined
+            ? {}
+            : { reasoning: incomingOptions.reasoning }),
+          ...(candidate.generation.thinkingConfig !== undefined ||
+          incomingOptions.thinkingBudgets === undefined
+            ? {}
+            : { thinkingBudgets: incomingOptions.thinkingBudgets }),
           ...(incomingOptions.toolChoice === undefined
             ? {}
             : { toolChoice: incomingOptions.toolChoice }),
@@ -656,6 +747,9 @@ export async function createPiGoogleModelBinding(
             ? {}
             : { onProviderStreamEvent: incomingOptions.onProviderStreamEvent }),
           maxRetries: 2,
+          // The Pi Agent loop forwards internal callbacks, including onPayload.
+          // This binding owns payload validation and does not expose that callback
+          // to the provider transport.
           onPayload: async (payload, payloadModel) => {
             if (payloadModel.id !== candidate.modelId || payloadModel.baseUrl !== gateway.baseUrl) {
               throw new PiGoogleModelBindingError('UNSUPPORTED_MODEL');

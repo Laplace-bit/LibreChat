@@ -1,5 +1,7 @@
-import { UsageEvents } from 'librechat-data-provider';
+import { GraphEvents } from '@librechat/agents';
 import { connect as connectTcp, type AddressInfo } from 'node:net';
+import { StepTypes, Tools, UsageEvents } from 'librechat-data-provider';
+import { HumanMessage, SystemMessage } from '@librechat/agents/langchain/messages';
 import {
   Agent,
   createServer,
@@ -9,6 +11,7 @@ import {
   type ServerResponse,
 } from 'node:http';
 import type { ModelRuntime } from '@earendil-works/pi-coding-agent';
+import type { LCTool } from '@librechat/agents';
 import type { Duplex } from 'node:stream';
 import {
   createPiGoogleModelBinding,
@@ -17,8 +20,13 @@ import {
   PI_GOOGLE_PROVIDER_ID,
   type AuthorizedPiGoogleModelCandidate,
 } from './googleModel';
-import { createPiContentEventTranslator, type PiMessageStepIdentity } from './events';
+import {
+  createPiContentEventTranslator,
+  type PiHostEvent,
+  type PiMessageStepIdentity,
+} from './events';
 import { PI_GOOGLE_MAX_REQUEST_BODY_BYTES } from './googleGateway';
+import { executePiGeneration } from './dispatch';
 
 const MODEL_ID = 'gemini-2.5-flash';
 const FIRST_KEY = 'AIza-server-admin-first-key';
@@ -98,6 +106,27 @@ function googleResponse(text: string): string {
       candidatesTokenCount: 2,
       thoughtsTokenCount: 1,
       totalTokenCount: 13,
+    },
+  })}\n\n`;
+}
+
+function googleFunctionCallsResponse(
+  calls: readonly { readonly name: string; readonly args: Record<string, unknown> }[],
+): string {
+  return `data: ${JSON.stringify({
+    candidates: [
+      {
+        content: {
+          role: 'model',
+          parts: calls.map((functionCall) => ({ functionCall })),
+        },
+        finishReason: 'STOP',
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: 10,
+      candidatesTokenCount: 2,
+      totalTokenCount: 12,
     },
   })}\n\n`;
 }
@@ -188,6 +217,95 @@ async function createBinding(
       return new URL(`${url.pathname}${url.search}`, upstream.url);
     },
   });
+}
+
+const fileSearchDefinition: LCTool = {
+  name: Tools.file_search,
+  description: 'Search agent files.',
+  parameters: {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  },
+};
+
+async function executeGoogleToolCalls(
+  calls: readonly { readonly name: string; readonly args: Record<string, unknown> }[],
+  candidate = createCandidate(),
+) {
+  const upstream = await startUpstream((_request, response) => {
+    response.writeHead(200, { 'content-type': 'text/event-stream' });
+    response.end(googleFunctionCallsResponse(calls));
+  });
+  let bindingDisposals = 0;
+  let gateCalls = 0;
+  let hostToolCalls = 0;
+  let createBindingCalls = 0;
+  const hostEvents: PiHostEvent[] = [];
+  try {
+    const outcome = await executePiGeneration({
+      messages: [
+        new SystemMessage('Use the configured test provider.'),
+        new HumanMessage('Search the agent files.'),
+      ],
+      createModelBinding: async () => {
+        createBindingCalls += 1;
+        const binding = await createBinding(upstream, candidate);
+        return {
+          ...binding,
+          async dispose() {
+            bindingDisposals += 1;
+            await binding.dispose();
+          },
+        };
+      },
+      toolDefinitions: [fileSearchDefinition],
+      executeHostToolCall: async () => {
+        hostToolCalls += 1;
+        return {
+          toolCallId: 'host-google-call',
+          status: 'success',
+          content: 'This result must not be produced before approval.',
+        };
+      },
+      createToolStepIdentity: () => ({
+        id: 'google-tool-step',
+        index: 0,
+        messageId: 'google-response',
+        runId: 'google-run',
+        agentId: 'google-agent',
+      }),
+      createToolCallId: () => 'host-google-call',
+      toolExecutionGate: async (call) => {
+        gateCalls += 1;
+        expect(call.name).toBe(Tools.file_search);
+        expect(call.args).toEqual({ query: 'authorized query' });
+        return { kind: 'pause', allowedDecisions: ['approve', 'reject'] };
+      },
+      createStepIdentity: () => ({
+        id: 'google-content-step',
+        index: 0,
+        messageId: 'google-response',
+        runId: 'google-run',
+        agentId: 'google-agent',
+      }),
+      handleHostEvent: (event) => {
+        hostEvents.push(event);
+      },
+    });
+
+    return {
+      outcome,
+      bindingDisposals,
+      createBindingCalls,
+      gateCalls,
+      hostToolCalls,
+      hostEvents,
+      requests: upstream.requests,
+    };
+  } finally {
+    await closeServer(upstream.server);
+  }
 }
 
 async function getGatewayApiKey(runtime: ModelRuntime): Promise<string> {
@@ -756,6 +874,89 @@ describe('createPiGoogleModelBinding', () => {
       await binding?.dispose();
       await closeServer(upstream.server);
     }
+  });
+
+  it('routes one Gemini function call through the host approval boundary', async () => {
+    const result = await executeGoogleToolCalls([
+      { name: Tools.file_search, args: { query: 'authorized query' } },
+    ]);
+
+    expect(result.outcome.status).toBe('paused');
+    if (result.outcome.status !== 'paused') {
+      throw new Error('Expected the Gemini host tool call to pause for approval.');
+    }
+    expect(result.outcome.signal.kind).toBe('tool_approval');
+    if (result.outcome.signal.kind !== 'tool_approval') {
+      throw new Error('Expected a Gemini tool approval signal.');
+    }
+    expect(result.outcome.signal.toolCall.name).toBe(Tools.file_search);
+    expect(result.outcome.signal.toolCall.args).toEqual({ query: 'authorized query' });
+    expect(result.outcome.signal.toolCall.toolCallId).toEqual(expect.any(String));
+    expect(result.createBindingCalls).toBe(1);
+    expect(result.bindingDisposals).toBe(1);
+    expect(result.gateCalls).toBe(1);
+    expect(result.hostToolCalls).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(JSON.parse(result.requests[0]?.body ?? '{}').tools).toEqual([
+      expect.objectContaining({
+        functionDeclarations: [expect.objectContaining({ name: Tools.file_search })],
+      }),
+    ]);
+    expect(
+      result.hostEvents.some(
+        (event) =>
+          event.event === GraphEvents.ON_RUN_STEP_COMPLETED ||
+          (event.event === GraphEvents.ON_RUN_STEP_CLOSED &&
+            event.data.type === StepTypes.TOOL_CALLS),
+      ),
+    ).toBe(false);
+  });
+
+  it('maps Pi reasoning when the server has no fixed Google thinking config', async () => {
+    const configuredCandidate = createCandidate();
+    const generation = { ...configuredCandidate.generation };
+    delete generation.thinkingConfig;
+    const candidate = { ...configuredCandidate, generation };
+    const result = await executeGoogleToolCalls(
+      [{ name: Tools.file_search, args: { query: 'authorized query' } }],
+      candidate,
+    );
+
+    expect(result.outcome.status).toBe('paused');
+    expect(result.gateCalls).toBe(1);
+    expect(result.hostToolCalls).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(JSON.parse(result.requests[0]?.body ?? '{}')).toMatchObject({
+      generationConfig: {
+        thinkingConfig: { includeThoughts: true },
+      },
+    });
+  });
+
+  it('rejects a Gemini function-call batch before approval or host effects', async () => {
+    const result = await executeGoogleToolCalls([
+      { name: Tools.file_search, args: { query: 'authorized query' } },
+      { name: Tools.file_search, args: { query: 'sibling query' } },
+    ]);
+
+    expect(result.outcome.status).toBe('unsupported');
+    if (result.outcome.status !== 'unsupported') {
+      throw new Error('Expected the Gemini multi-tool batch to fail closed.');
+    }
+    expect(result.outcome.reason).toBe('multiple_tool_calls');
+    expect(result.createBindingCalls).toBe(1);
+    expect(result.bindingDisposals).toBe(1);
+    expect(result.gateCalls).toBe(0);
+    expect(result.hostToolCalls).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    expect(
+      result.hostEvents.some(
+        (event) =>
+          (event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS) ||
+          (event.event === GraphEvents.ON_RUN_STEP_CLOSED &&
+            event.data.type === StepTypes.TOOL_CALLS),
+      ),
+    ).toBe(false);
   });
 
   it('accepts a 20 MiB request body and rejects the first byte above the bound', async () => {

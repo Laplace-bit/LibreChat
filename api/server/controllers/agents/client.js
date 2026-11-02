@@ -239,6 +239,7 @@ const {
   revalidatePiMcpApprovalArguments,
   revalidatePiActionApprovalArguments,
   executePiGeneration,
+  createPiHistoryPruningOptions,
   createPiSubagentPlan,
   createPiSubagentToolDefinition,
   resolvePiSubagentTarget,
@@ -6022,6 +6023,19 @@ class AgentClient extends BaseClient {
         } else if (piSystemPrompt.length > 0) {
           piMessages = [new SystemMessage(piSystemPrompt), ...messages];
         }
+        const piContextPruning =
+          !isCompactionTurn && indexTokenCountMap != null
+            ? createPiHistoryPruningOptions({
+                indexTokenCountMap,
+                systemPrefixCount: piSystemPrompt.length > 0 ? 1 : 0,
+                maxContextTokens: effectiveMaxContextTokens,
+                reserveRatio: summarizationConfig?.reserveRatio,
+                calibrationRatio,
+                ...(this.options.agent.maxToolResultChars == null
+                  ? {}
+                  : { maxToolResultChars: this.options.agent.maxToolResultChars }),
+              })
+            : undefined;
         const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
         const sharedAttachmentFiles =
           this.turnSharedAttachmentFiles ?? this.modelBoundCurrentFiles ?? [];
@@ -6219,6 +6233,7 @@ class AgentClient extends BaseClient {
               calibrationRatio,
               summaryTokens: continuationSummary?.tokenCount,
             },
+            ...(piContextPruning == null ? {} : { contextPruning: piContextPruning }),
             ...(piCompactionSettings == null
               ? {}
               : {

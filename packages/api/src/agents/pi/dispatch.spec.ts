@@ -1,10 +1,12 @@
-import { Tools } from 'librechat-data-provider';
-import { HumanMessage } from '@librechat/agents/langchain/messages';
+import { Tools, UsageEvents } from 'librechat-data-provider';
+import { AIMessage, HumanMessage, ToolMessage } from '@librechat/agents/langchain/messages';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { LCTool } from '@librechat/agents';
 import type { PiGenerationExecutorInput } from './execution';
 import type { PiGenerationDispatchInput } from './dispatch';
 import type { PiModelBinding } from './session';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
+import { PiContextBudgetExceededError } from './contextUsage';
 import { createPiGenerationDispatcher } from './dispatch';
 import { ASK_USER_QUESTION_TOOL_NAME } from './toolNames';
 
@@ -230,6 +232,149 @@ describe('createPiGenerationDispatcher approval continuation', () => {
       ),
     ).rejects.toBeInstanceOf(AgentRuntimeUnavailableError);
     expect(executeApprovedTool).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+  });
+});
+
+describe('createPiGenerationDispatcher context pruning', () => {
+  it('executes and reports context usage from the same pruned provider history', async () => {
+    const messages = [
+      new HumanMessage('Earlier question'),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call-1', name: 'lookup', args: { query: 'machine status' } }],
+      }),
+      new ToolMessage({
+        content: 'authorized result '.repeat(120),
+        name: 'lookup',
+        tool_call_id: 'call-1',
+      }),
+      new HumanMessage('What should I do next?'),
+    ];
+    const tokenCounter = (message: BaseMessage) =>
+      JSON.stringify({
+        content: message.content,
+        toolCalls: AIMessage.isInstance(message) ? message.tool_calls : undefined,
+      }).length;
+    const indexTokenCountMap = Object.fromEntries(
+      messages.map((message, index) => [index, tokenCounter(message)]),
+    );
+    const events: Array<{ event: string; data: unknown }> = [];
+    const execute = jest.fn(async (value: PiGenerationExecutorInput) => {
+      const toolResult = value.history?.find((message) => message.role === 'toolResult');
+      expect(toolResult).toBeDefined();
+      expect(JSON.stringify(toolResult?.content).length).toBeLessThan(
+        JSON.stringify(messages[2].content).length,
+      );
+      return { status: 'completed' as const };
+    });
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages,
+          createModelBinding: async () => ({
+            model: {
+              api: 'openai-responses',
+              provider: 'librechat-openai',
+              id: 'gpt-4o-mini',
+              contextWindow: 4_096,
+              maxTokens: 4_096,
+            } as PiModelBinding['model'],
+            modelRuntime: {} as PiModelBinding['modelRuntime'],
+            dispose: jest.fn(),
+          }),
+          handleHostEvent: async (event) => {
+            events.push(event);
+          },
+          contextUsage: {
+            tokenCounter,
+            runId: 'run-1',
+            agentId: 'agent-1',
+            maxContextTokens: 10_000,
+            reserveRatio: 0,
+            calibrationRatio: 1,
+          },
+          contextPruning: {
+            indexTokenCountMap,
+            maxContextTokens: 10_000,
+            reserveRatio: 0,
+            calibrationRatio: 1,
+            maxToolResultChars: 100,
+          },
+        }),
+      ),
+    ).resolves.toMatchObject({ status: 'completed' });
+
+    const contextEvent = events.find((event) => event.event === UsageEvents.ON_CONTEXT_USAGE);
+    expect(contextEvent).toBeDefined();
+    expect(
+      (contextEvent?.data as { breakdown: { messageTokens: number } }).breakdown.messageTokens,
+    ).toBeLessThan(messages.reduce((total, message) => total + tokenCounter(message), 0));
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when fitting the budget would require dropping host history', async () => {
+    const messages = [
+      new HumanMessage('Earlier question '.repeat(8)),
+      new AIMessage({
+        content: '',
+        tool_calls: [{ id: 'call-1', name: 'lookup', args: { query: 'machine status' } }],
+      }),
+      new ToolMessage({
+        content: 'authorized result '.repeat(30),
+        name: 'lookup',
+        tool_call_id: 'call-1',
+      }),
+      new HumanMessage('What should I do next? '.repeat(8)),
+    ];
+    const tokenCounter = (message: BaseMessage) =>
+      JSON.stringify({
+        content: message.content,
+        toolCalls: AIMessage.isInstance(message) ? message.tool_calls : undefined,
+      }).length;
+    const indexTokenCountMap = Object.fromEntries(
+      messages.map((message, index) => [index, tokenCounter(message)]),
+    );
+    const execute = jest.fn(async (_input: PiGenerationExecutorInput) => ({
+      status: 'completed' as const,
+    }));
+    const dispatch = createPiGenerationDispatcher({ execute });
+
+    await expect(
+      dispatch(
+        input({
+          messages,
+          createModelBinding: async () => ({
+            model: {
+              api: 'openai-responses',
+              provider: 'librechat-openai',
+              id: 'gpt-4o-mini',
+              contextWindow: 4_096,
+              maxTokens: 4_096,
+            } as PiModelBinding['model'],
+            modelRuntime: {} as PiModelBinding['modelRuntime'],
+            dispose: jest.fn(),
+          }),
+          contextUsage: {
+            tokenCounter,
+            runId: 'run-1',
+            agentId: 'agent-1',
+            maxContextTokens: 80,
+            reserveRatio: 0,
+            calibrationRatio: 1,
+          },
+          contextPruning: {
+            indexTokenCountMap,
+            maxContextTokens: 80,
+            reserveRatio: 0,
+            calibrationRatio: 1,
+            maxToolResultChars: 50,
+          },
+        }),
+      ),
+    ).rejects.toBeInstanceOf(PiContextBudgetExceededError);
     expect(execute).not.toHaveBeenCalled();
   });
 });

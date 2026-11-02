@@ -12,6 +12,7 @@ import type { PiGenerationExecutorInput } from './execution';
 import type { PiToolExecutionGate } from './toolExecution';
 import type { PiCodeSessionSnapshot } from './codeSession';
 import type { PiMcpToolSchemaRegistry } from './mcpSchema';
+import type { PiHistoryPruningOptions } from './pruning';
 import type { PiToolResultContinuation } from './resume';
 import type { PiHostToolCall } from './toolExecution';
 import type { PiMessageStepIdentity } from './events';
@@ -37,6 +38,7 @@ import { convertLibreChatHistoryToPi } from './history';
 import { projectPiContextUsage } from './contextUsage';
 import { createPiHostEventSequencer } from './bridge';
 import { createPiPauseController } from './pause';
+import { projectPiHistory } from './pruning';
 
 export class PiContextUsageUnavailableError extends Error {
   readonly code = 'PI_CONTEXT_USAGE_UNAVAILABLE';
@@ -89,6 +91,8 @@ export interface PiGenerationDispatchInput {
   onModelProviderError?: PiContentEventTranslatorOptions['onModelProviderError'];
   /** Host tokenizer and identifiers for the pre-invoke context snapshot. */
   contextUsage?: Omit<PiContextUsageProjectionInput, 'messages' | 'model' | 'provider'>;
+  /** Existing host tool-result caps for an ordinary, non-resumed provider projection. */
+  contextPruning?: PiHistoryPruningOptions;
   /** Exact approved tool exchange to continue without replaying the user prompt. */
   resumeToolResult?: {
     continuation: PiToolResultContinuation;
@@ -260,10 +264,26 @@ export function createPiGenerationDispatcher(
         return { status: 'cancelled', usage };
       }
 
-      const conversion = convertLibreChatHistoryToPi({
-        messages: input.messages,
-        model: modelBinding.model,
-      });
+      const historyProjection =
+        input.contextPruning != null &&
+        input.contextUsage != null &&
+        input.summaryOnly == null &&
+        input.resumeToolResult == null
+          ? projectPiHistory({
+              messages: input.messages,
+              model: modelBinding.model,
+              tokenCounter: input.contextUsage.tokenCounter,
+              pruning: input.contextPruning,
+            })
+          : {
+              messages: input.messages,
+              conversion: convertLibreChatHistoryToPi({
+                messages: input.messages,
+                model: modelBinding.model,
+              }),
+              pruned: false,
+            };
+      const { conversion } = historyProjection;
       const translateEvent = createPiContentEventTranslator({
         createStepIdentity: input.createStepIdentity,
         supportedToolNames: tools.map(({ name }) => name),
@@ -290,7 +310,7 @@ export function createPiGenerationDispatcher(
       });
       if (input.contextUsage != null) {
         const contextUsage = projectPiContextUsage({
-          messages: input.messages,
+          messages: historyProjection.messages,
           model: modelBinding.model,
           ...input.contextUsage,
           provider: input.usageAttribution?.provider,

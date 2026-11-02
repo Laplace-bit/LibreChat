@@ -285,6 +285,8 @@ describe('AgentClient retained answers', () => {
       expect(input.messages.map(contentText).join('\n')).toContain(LATEST_TEXT);
       expect(mockRuntimeCounter).toHaveBeenCalledTimes(1);
       expect(input.contextUsage.tokenCounter).toBe(mockRuntimeCounter.mock.results[0].value);
+      expect(input.contextPruning.maxContextTokens).toBe(4096);
+      expect(input.contextPruning.indexTokenCountMap).not.toHaveProperty('0');
       const retainedMessage = input.messages.find((message) =>
         message.additional_kwargs?.librechat_retained_answers?.includes(ANSWER_LINE),
       );

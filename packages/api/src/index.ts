@@ -147,6 +147,7 @@ export * from './agents/pi/approval';
 export * from './agents/pi/hostToolBatch';
 export * from './agents/pi/dispatch';
 export * from './agents/pi/contextUsage';
+export * from './agents/pi/pruning';
 export * from './agents/pi/prompt';
 export * from './agents/pi/compaction';
 export * from './agents/pi/regeneration';

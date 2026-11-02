@@ -1,6 +1,18 @@
-export const PI_TOOL_BATCH_EVENT_APIS = ['openai-completions', 'openai-responses'] as const;
+export const PI_TOOL_BATCH_EVENT_APIS = [
+  'openai-completions',
+  'openai-responses',
+  'azure-openai-responses',
+  'anthropic-messages',
+] as const;
 
 export type PiToolBatchEventApi = (typeof PI_TOOL_BATCH_EVENT_APIS)[number];
+
+export const PI_HOST_TOOL_GATE_APIS: readonly [...PiToolBatchEventApi[], 'google-generative-ai'] = [
+  ...PI_TOOL_BATCH_EVENT_APIS,
+  'google-generative-ai',
+];
+
+export type PiHostToolGateApi = (typeof PI_HOST_TOOL_GATE_APIS)[number];
 
 export type PiProviderEventFailure =
   | {
@@ -58,6 +70,10 @@ export interface PiProviderEventObserver {
 
 export function isPiToolBatchEventApi(api: string): api is PiToolBatchEventApi {
   return PI_TOOL_BATCH_EVENT_APIS.some((supportedApi) => supportedApi === api);
+}
+
+export function isPiHostToolGateApi(api: string): api is PiHostToolGateApi {
+  return PI_HOST_TOOL_GATE_APIS.some((supportedApi) => supportedApi === api);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -220,7 +236,10 @@ export function createPiProviderEventObserver(): PiProviderEventObserver {
     return undefined;
   };
 
-  const observeResponses = (event: unknown): PiProviderEventFailure | undefined => {
+  const observeResponses = (
+    api: 'openai-responses' | 'azure-openai-responses',
+    event: unknown,
+  ): PiProviderEventFailure | undefined => {
     if (!isRecord(event) || typeof event.type !== 'string') {
       return undefined;
     }
@@ -228,11 +247,13 @@ export function createPiProviderEventObserver(): PiProviderEventObserver {
     if (event.type === 'response.created') {
       const response = isRecord(event.response) ? event.response : undefined;
       activeResponsesId = readNonEmptyString(response?.id);
+      if (activeResponsesId == null) {
+        return { kind: 'missing_response_id', api };
+      }
     }
 
-    const responseId =
-      readNonEmptyString(event.response_id) ?? activeResponsesId ?? 'response-without-id';
-    let callIndexes = responseCallsByResponse.get(responseId);
+    const responseId = readNonEmptyString(event.response_id) ?? activeResponsesId;
+    let callIndexes = responseId == null ? undefined : responseCallsByResponse.get(responseId);
 
     if (event.type === 'response.output_item.added' || event.type === 'response.output_item.done') {
       const item = isRecord(event.item) ? event.item : undefined;
@@ -240,20 +261,18 @@ export function createPiProviderEventObserver(): PiProviderEventObserver {
       const isCallableItem = item?.type === 'function_call' || item?.type === 'custom_tool_call';
       const callId = readNonEmptyString(item?.call_id);
       if (isCallableItem && outputIndex == null) {
-        return { kind: 'missing_tool_call_index', api: 'openai-responses', callId };
+        return { kind: 'missing_tool_call_index', api, callId };
       }
       if (isCallableItem && outputIndex != null && callId == null) {
-        return { kind: 'missing_tool_call_id', api: 'openai-responses', index: outputIndex };
+        return { kind: 'missing_tool_call_id', api, index: outputIndex };
       }
       if (isCallableItem && outputIndex != null && callId != null) {
+        if (responseId == null) {
+          return { kind: 'missing_response_id', api };
+        }
         callIndexes ??= createToolCallIndexes();
         responseCallsByResponse.set(responseId, callIndexes);
-        const failure = recordToolCallIdentity(
-          'openai-responses',
-          callIndexes,
-          outputIndex,
-          callId,
-        );
+        const failure = recordToolCallIdentity(api, callIndexes, outputIndex, callId);
         if (failure != null) {
           return failure;
         }
@@ -261,9 +280,10 @@ export function createPiProviderEventObserver(): PiProviderEventObserver {
     }
 
     if (
-      event.type === 'response.completed' ||
-      event.type === 'response.incomplete' ||
-      event.type === 'response.failed'
+      responseId != null &&
+      (event.type === 'response.completed' ||
+        event.type === 'response.incomplete' ||
+        event.type === 'response.failed')
     ) {
       responseCallsByResponse.delete(responseId);
       if (responseId === activeResponsesId) {
@@ -273,13 +293,66 @@ export function createPiProviderEventObserver(): PiProviderEventObserver {
     return undefined;
   };
 
+  const anthropicCalls = new Map<string, ToolCallIndexes>();
+  let activeAnthropicResponseId: string | undefined;
+  const observeAnthropic = (event: unknown): PiProviderEventFailure | undefined => {
+    if (!isRecord(event) || typeof event.type !== 'string') {
+      return undefined;
+    }
+    if (event.type === 'message_start') {
+      const message = isRecord(event.message) ? event.message : undefined;
+      const responseId = readNonEmptyString(message?.id);
+      if (responseId == null) {
+        activeAnthropicResponseId = undefined;
+        return { kind: 'missing_response_id', api: 'anthropic-messages' };
+      }
+      activeAnthropicResponseId = responseId;
+      anthropicCalls.set(responseId, createToolCallIndexes());
+      return undefined;
+    }
+    if (event.type === 'message_stop') {
+      if (activeAnthropicResponseId != null) {
+        anthropicCalls.delete(activeAnthropicResponseId);
+      }
+      activeAnthropicResponseId = undefined;
+      return undefined;
+    }
+    if (event.type !== 'content_block_start') {
+      return undefined;
+    }
+
+    const block = isRecord(event.content_block) ? event.content_block : undefined;
+    if (block?.type !== 'tool_use') {
+      return undefined;
+    }
+    const index = readIndex(event.index);
+    const callId = readNonEmptyString(block.id);
+    if (index == null) {
+      return { kind: 'missing_tool_call_index', api: 'anthropic-messages', callId };
+    }
+    if (callId == null) {
+      return { kind: 'missing_tool_call_id', api: 'anthropic-messages', index };
+    }
+    if (activeAnthropicResponseId == null) {
+      return { kind: 'missing_response_id', api: 'anthropic-messages' };
+    }
+    const indexes = anthropicCalls.get(activeAnthropicResponseId);
+    if (indexes == null) {
+      return { kind: 'missing_response_id', api: 'anthropic-messages' };
+    }
+    return recordToolCallIdentity('anthropic-messages', indexes, index, callId);
+  };
+
   return {
     observe(api, event) {
       switch (api) {
         case 'openai-completions':
           return observeCompletions(event);
         case 'openai-responses':
-          return observeResponses(event);
+        case 'azure-openai-responses':
+          return observeResponses(api, event);
+        case 'anthropic-messages':
+          return observeAnthropic(event);
         default: {
           const exhaustive: never = api;
           return { kind: 'unsupported_api', api: exhaustive };

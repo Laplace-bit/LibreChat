@@ -8,7 +8,11 @@ import type {
 import type { PiContentPart, PiHistoryMessage } from './history';
 import type { PiPauseController } from './pause';
 import type { PiToolDefinition } from './tools';
-import { createPiProviderEventObserver, isPiToolBatchEventApi } from './providerEvents';
+import {
+  createPiProviderEventObserver,
+  isPiHostToolGateApi,
+  isPiToolBatchEventApi,
+} from './providerEvents';
 import { AgentRuntimeUnavailableError } from '../runtime/selection';
 
 type PiAgentMessage = Extract<AgentSessionEvent, { type: 'message_start' }>['message'];
@@ -197,7 +201,7 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
   };
 
   try {
-    if (options.toolBatchPolicy != null && !isPiToolBatchEventApi(modelBinding.model.api)) {
+    if (options.toolBatchPolicy != null && !isPiHostToolGateApi(modelBinding.model.api)) {
       throw new AgentRuntimeUnavailableError();
     }
     if (options.signal?.aborted) {
@@ -271,13 +275,13 @@ export async function createHostPiSession(options: HostPiSessionOptions): Promis
       const previousProviderStreamEvent = session.agent.onProviderStreamEvent;
       const providerEventObserver = createPiProviderEventObserver();
       session.agent.onProviderStreamEvent = async (event, model) => {
-        if (!isPiToolBatchEventApi(model.api)) {
+        if (!isPiHostToolGateApi(model.api)) {
           options.toolBatchPolicy?.controller.rejectProviderEvent({
             kind: 'unsupported_api',
             api: model.api,
           });
           abort();
-        } else {
+        } else if (isPiToolBatchEventApi(model.api)) {
           const providerFailure = providerEventObserver.observe(model.api, event);
           if (providerFailure != null) {
             options.toolBatchPolicy?.controller.rejectProviderEvent(providerFailure);

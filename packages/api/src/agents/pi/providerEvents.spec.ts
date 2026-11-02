@@ -1,4 +1,8 @@
-import { createPiProviderEventObserver, isPiToolBatchEventApi } from './providerEvents';
+import {
+  createPiProviderEventObserver,
+  isPiHostToolGateApi,
+  isPiToolBatchEventApi,
+} from './providerEvents';
 
 describe('Pi raw provider event observer', () => {
   it('rejects a repeated Completions call ID before Pi can merge it by ID', () => {
@@ -201,9 +205,103 @@ describe('Pi raw provider event observer', () => {
     });
   });
 
-  it('only reports raw events for explicitly covered provider APIs', () => {
+  it('rejects Responses tool calls without a response identity', () => {
+    const observer = createPiProviderEventObserver();
+
+    expect(
+      observer.observe('openai-responses', {
+        type: 'response.output_item.added',
+        output_index: 0,
+        item: { id: 'item-1', type: 'function_call', call_id: 'call-1' },
+      }),
+    ).toEqual({ kind: 'missing_response_id', api: 'openai-responses' });
+  });
+
+  it('rejects Responses creation events without a response identity', () => {
+    const observer = createPiProviderEventObserver();
+
+    expect(
+      observer.observe('openai-responses', {
+        type: 'response.created',
+        response: {},
+      }),
+    ).toEqual({ kind: 'missing_response_id', api: 'openai-responses' });
+  });
+
+  it('rejects duplicate Azure Responses call IDs before dispatch', () => {
+    const observer = createPiProviderEventObserver();
+
+    expect(
+      observer.observe('azure-openai-responses', {
+        type: 'response.output_item.added',
+        response_id: 'response-1',
+        output_index: 0,
+        item: { id: 'item-1', type: 'function_call', call_id: 'call-reused' },
+      }),
+    ).toBeUndefined();
+    expect(
+      observer.observe('azure-openai-responses', {
+        type: 'response.output_item.added',
+        response_id: 'response-1',
+        output_index: 1,
+        item: { id: 'item-2', type: 'function_call', call_id: 'call-reused' },
+      }),
+    ).toEqual({
+      kind: 'repeated_call_id',
+      api: 'azure-openai-responses',
+      callId: 'call-reused',
+      firstIndex: 0,
+      repeatedIndex: 1,
+    });
+  });
+
+  it('rejects duplicate Anthropic tool-use IDs before dispatch', () => {
+    const observer = createPiProviderEventObserver();
+
+    expect(
+      observer.observe('anthropic-messages', {
+        type: 'message_start',
+        message: { id: 'message-1' },
+      }),
+    ).toBeUndefined();
+    expect(
+      observer.observe('anthropic-messages', {
+        type: 'content_block_start',
+        index: 0,
+        content_block: { type: 'tool_use', id: 'toolu-reused' },
+      }),
+    ).toBeUndefined();
+    expect(
+      observer.observe('anthropic-messages', {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'toolu-reused' },
+      }),
+    ).toEqual({
+      kind: 'repeated_call_id',
+      api: 'anthropic-messages',
+      callId: 'toolu-reused',
+      firstIndex: 0,
+      repeatedIndex: 1,
+    });
+  });
+
+  it('separates provider raw-event validators from supported host tool-gate APIs', () => {
     expect(isPiToolBatchEventApi('openai-completions')).toBe(true);
     expect(isPiToolBatchEventApi('openai-responses')).toBe(true);
-    expect(isPiToolBatchEventApi('anthropic-messages')).toBe(false);
+    expect(isPiToolBatchEventApi('azure-openai-responses')).toBe(true);
+    expect(isPiToolBatchEventApi('anthropic-messages')).toBe(true);
+    expect(isPiToolBatchEventApi('google-generative-ai')).toBe(false);
+
+    for (const api of [
+      'openai-completions',
+      'openai-responses',
+      'azure-openai-responses',
+      'anthropic-messages',
+      'google-generative-ai',
+    ]) {
+      expect(isPiHostToolGateApi(api)).toBe(true);
+    }
+    expect(isPiHostToolGateApi('unreviewed-api')).toBe(false);
   });
 });

@@ -5,8 +5,8 @@ import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { InMemoryCredentialStore } from '@earendil-works/pi-ai';
-import { StepTypes, SteerEvents, Tools, UsageEvents } from 'librechat-data-provider';
 import { createContentAggregator, GraphEvents } from '@librechat/agents';
+import { StepTypes, SteerEvents, Tools, UsageEvents } from 'librechat-data-provider';
 import {
   AIMessage,
   HumanMessage,
@@ -98,6 +98,118 @@ async function createFakeOpenAIModelBinding(baseUrl, onDispose, api = 'openai-co
   const model = modelRuntime.getModel('pi-integration-test', 'echo-test');
   assert.ok(model, 'the per-run provider model is registered');
   return { model, modelRuntime, dispose: onDispose };
+}
+
+async function createFakeAnthropicModelBinding(baseUrl, onDispose) {
+  const modelRuntime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
+    modelsPath: null,
+    allowModelNetwork: false,
+    refreshOnCreate: false,
+  });
+  modelRuntime.registerProvider('pi-anthropic-integration-test', {
+    name: 'Pi Anthropic integration test provider',
+    baseUrl,
+    api: 'anthropic-messages',
+    apiKey: 'integration-test-key',
+    models: [
+      {
+        id: 'echo-test',
+        name: 'Echo test model',
+        reasoning: false,
+        input: ['text', 'image'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 8192,
+        maxTokens: 128,
+      },
+    ],
+  });
+  const model = modelRuntime.getModel('pi-anthropic-integration-test', 'echo-test');
+  assert.ok(model, 'the per-run Anthropic model is registered');
+  return { model, modelRuntime, dispose: onDispose };
+}
+
+async function createFakeAnthropicServer({ siblingToolCall = false } = {}) {
+  let requestCount = 0;
+  const requestBodies = [];
+  const server = createServer((request, response) => {
+    let body = '';
+    request.on('data', (chunk) => {
+      body += chunk;
+    });
+    request.on('end', () => {
+      requestCount += 1;
+      requestBodies.push(JSON.parse(body));
+      response.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        connection: 'close',
+      });
+      const send = (type, value) => {
+        response.write(`event: ${type}\ndata: ${JSON.stringify(value)}\n\n`);
+      };
+      const sendToolUse = (index, id, query) => {
+        send('content_block_start', {
+          type: 'content_block_start',
+          index,
+          content_block: {
+            type: 'tool_use',
+            id,
+            name: Tools.file_search,
+            input: {},
+          },
+        });
+        send('content_block_delta', {
+          type: 'content_block_delta',
+          index,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify({ query }) },
+        });
+        send('content_block_stop', { type: 'content_block_stop', index });
+      };
+      send('message_start', {
+        type: 'message_start',
+        message: {
+          id: `msg-${requestCount}`,
+          type: 'message',
+          role: 'assistant',
+          model: 'echo-test',
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      });
+      sendToolUse(0, 'toolu-1', 'authorized');
+      if (siblingToolCall) {
+        sendToolUse(1, 'toolu-2', 'other query');
+      }
+      send('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'tool_use', stop_sequence: null },
+        usage: { output_tokens: 5 },
+      });
+      send('message_stop', { type: 'message_stop' });
+      response.end();
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    getRequestCount: () => requestCount,
+    getRequestBodies: () => requestBodies,
+    close: () =>
+      new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+        server.closeAllConnections();
+      }),
+  };
 }
 
 async function createFakeChatServer({
@@ -1303,7 +1415,151 @@ for (const [scenario, siblingToolCallId, expectedReason] of [
   });
 }
 
-test('Pi tool gate fails closed before provider invocation for uncovered APIs', async () => {
+test('Pi tool gate supports one Anthropic tool call through the host approval boundary', async () => {
+  const fakeProvider = await createFakeAnthropicServer();
+  const hostEvents = [];
+  let bindingDisposals = 0;
+  let gateCalls = 0;
+  let hostToolCalls = 0;
+
+  try {
+    const outcome = await withTimeout(
+      executePiGeneration({
+        messages: [
+          new SystemMessage('Use the configured test provider.'),
+          new HumanMessage('Search the agent files.'),
+        ],
+        createModelBinding: () =>
+          createFakeAnthropicModelBinding(fakeProvider.baseUrl, () => {
+            bindingDisposals += 1;
+          }),
+        toolDefinitions: [
+          {
+            name: Tools.file_search,
+            description: 'Search agent files.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query'],
+            },
+          },
+        ],
+        executeHostToolCall: async () => {
+          hostToolCalls += 1;
+          return { toolCallId: 'host-anthropic-call', status: 'success', content: 'unexpected' };
+        },
+        createToolStepIdentity: () => ({
+          id: 'anthropic-tool-step',
+          index: 0,
+          messageId: 'anthropic-response',
+          runId: 'anthropic-run',
+          agentId: 'anthropic-agent',
+        }),
+        createToolCallId: () => 'host-anthropic-call',
+        toolExecutionGate: async (call) => {
+          gateCalls += 1;
+          assert.equal(call.name, Tools.file_search);
+          assert.deepEqual(call.args, { query: 'authorized' });
+          return { kind: 'pause', allowedDecisions: ['approve', 'reject'] };
+        },
+        createStepIdentity: () => ({
+          id: 'anthropic-content-step',
+          index: 0,
+          messageId: 'anthropic-response',
+          runId: 'anthropic-run',
+          agentId: 'anthropic-agent',
+        }),
+        handleHostEvent: (event) => hostEvents.push(event),
+      }),
+      5_000,
+      'Anthropic tool approval did not settle',
+    );
+
+    assert.equal(outcome.status, 'paused');
+    assert.equal(outcome.signal.kind, 'tool_approval');
+    assert.equal(outcome.signal.toolCall.toolCallId, 'toolu-1');
+    assert.equal(fakeProvider.getRequestCount(), 1);
+    assert.equal(gateCalls, 1);
+    assert.equal(hostToolCalls, 0, 'the tool cannot execute before approval');
+    assert.equal(bindingDisposals, 1);
+    assert.ok(hostEvents.some((event) => event.event === GraphEvents.ON_RUN_STEP));
+  } finally {
+    await fakeProvider.close();
+  }
+});
+
+test('Pi tool gate rejects an Anthropic tool batch before gate evaluation or host effects', async () => {
+  const fakeProvider = await createFakeAnthropicServer({ siblingToolCall: true });
+  let gateCalls = 0;
+  let hostToolCalls = 0;
+  const hostEvents = [];
+
+  try {
+    const outcome = await withTimeout(
+      executePiGeneration({
+        messages: [
+          new SystemMessage('Use the configured test provider.'),
+          new HumanMessage('Search for two things.'),
+        ],
+        createModelBinding: () => createFakeAnthropicModelBinding(fakeProvider.baseUrl, () => {}),
+        toolDefinitions: [
+          {
+            name: Tools.file_search,
+            description: 'Search agent files.',
+            parameters: {
+              type: 'object',
+              properties: { query: { type: 'string' } },
+              required: ['query'],
+            },
+          },
+        ],
+        executeHostToolCall: async () => {
+          hostToolCalls += 1;
+          return { toolCallId: 'host-anthropic-call', status: 'success', content: 'unexpected' };
+        },
+        createToolStepIdentity: () => ({
+          id: 'anthropic-batch-step',
+          index: 0,
+          messageId: 'anthropic-response',
+          runId: 'anthropic-run',
+          agentId: 'anthropic-agent',
+        }),
+        createToolCallId: () => 'host-anthropic-call',
+        toolExecutionGate: async () => {
+          gateCalls += 1;
+          return { kind: 'execute' };
+        },
+        createStepIdentity: () => ({
+          id: 'anthropic-batch-content-step',
+          index: 0,
+          messageId: 'anthropic-response',
+          runId: 'anthropic-run',
+          agentId: 'anthropic-agent',
+        }),
+        handleHostEvent: (event) => hostEvents.push(event),
+      }),
+      5_000,
+      'Anthropic multi-tool output did not fail closed',
+    );
+
+    assert.equal(outcome.status, 'unsupported');
+    assert.equal(outcome.reason, 'multiple_tool_calls');
+    assert.equal(fakeProvider.getRequestCount(), 1);
+    assert.equal(gateCalls, 0, 'the whole batch is rejected before per-tool decisions');
+    assert.equal(hostToolCalls, 0, 'no sibling reaches the host handler');
+    assert.equal(
+      hostEvents.some(
+        (event) =>
+          event.event === GraphEvents.ON_RUN_STEP && event.data.type === StepTypes.TOOL_CALLS,
+      ),
+      false,
+    );
+  } finally {
+    await fakeProvider.close();
+  }
+});
+
+test('Pi tool gate fails closed before provider invocation for unreviewed APIs', async () => {
   const fakeProvider = await createFakeChatServer();
   let bindingDisposals = 0;
   let gateCalls = 0;
@@ -1322,7 +1578,7 @@ test('Pi tool gate fails closed before provider invocation for uncovered APIs', 
             () => {
               bindingDisposals += 1;
             },
-            'anthropic-messages',
+            'unreviewed-model-api',
           ),
         toolExecutionGate: async () => {
           gateCalls += 1;
